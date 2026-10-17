@@ -61,3 +61,41 @@ test('component deployment retains other tools and fences unrelated source and p
     assert.equal(existsSync(path.join(releases, 'tools', git(repository, 'rev-parse', 'HEAD'))), false);
   } finally { rmSync(temporary, {recursive: true, force: true}); }
 });
+
+test('an unavailable selected source deploys only over installed bytes equal to an ancestor component tree', () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'workspace-deploy-content-'));
+  try {
+    const repository = path.join(temporary, 'source');
+    mkdirSync(path.join(repository, 'tools'), {recursive: true});
+    mkdirSync(path.join(repository, 'deploy'));
+    cpSync(tool, path.join(repository, 'tools/agent-workspace'), {recursive: true});
+    for (const name of ['lib', 'release-checkout']) cpSync(path.join(source, 'deploy', name), path.join(repository, 'deploy', name));
+    git(repository, 'init', '-b', 'main');
+    git(repository, 'config', 'user.name', 'Test');
+    git(repository, 'config', 'user.email', 'test@example.invalid');
+    git(repository, 'add', '.');
+    git(repository, 'commit', '-m', 'public projection');
+    const unavailable = 'f'.repeat(40);
+    const releases = path.join(temporary, 'releases');
+    const selected = path.join(releases, 'tools', unavailable);
+    mkdirSync(selected, {recursive: true});
+    cpSync(path.join(repository, 'tools/agent-workspace'), path.join(selected, 'agent-workspace'), {recursive: true});
+    rmSync(path.join(selected, 'agent-workspace/deploy'));
+    writeFileSync(path.join(selected, 'agent-workspace/.component-release.json'), JSON.stringify({sourceCommit: unavailable}) + '\n');
+    writeFileSync(path.join(selected, '.pi-stack-commit'), unavailable + '\n');
+    const destination = path.join(temporary, 'tools');
+    symlinkSync(selected, destination);
+    writeFileSync(path.join(repository, 'tools/agent-workspace/README.md'), readFileSync(path.join(repository, 'tools/agent-workspace/README.md'), 'utf8') + '\nComponent candidate.\n');
+    git(repository, 'commit', '-am', 'component repair');
+    const environment = {...process.env, PI_STACK_TOOLS_DEST: destination, PI_STACK_RELEASES_ROOT: releases,
+      PI_STACK_HOST_LOCK_PATH: path.join(temporary, 'host.lock'), PI_STACK_DEPLOY_NO_SUDO: '1'};
+    for (const key of ['PI_STACK_HOST_LOCK_HELD', 'PI_STACK_DEPLOY_LOCK_HELD', 'PI_STACK_DEPLOY_DEADLINE_ACTIVE', 'PI_STACK_PUBLICATION_REQUEST']) delete environment[key];
+    const deploy = () => execFileSync(path.join(repository, 'tools/agent-workspace/deploy'), [], {env: environment, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe']});
+    writeFileSync(path.join(selected, 'agent-workspace/workspace.mjs'), '// installed bytes no ancestor has\n');
+    assert.throws(deploy);
+    assert.equal(readlinkSync(destination), selected);
+    cpSync(path.join(tool, 'workspace.mjs'), path.join(selected, 'agent-workspace/workspace.mjs'));
+    assert.match(deploy(), /no services or workspace records changed/);
+    assert.equal(readlinkSync(destination), path.join(releases, 'tools', git(repository, 'rev-parse', 'HEAD')));
+  } finally { rmSync(temporary, {recursive: true, force: true}); }
+});
