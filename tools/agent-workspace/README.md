@@ -28,27 +28,13 @@ Before dropping any single/group writing lease, ordinary release atomically reco
 
 An explicit ordinary release transfers source intent to its durable Git/task custody; every single/group physical inspection keeps that resource scope. Actual reserved tools, native executions, unknown operations, FD/cwd readers and Git borrowers still retain the checkout. Dirty/unpublished source remains protected.
 
-Canonical queue observation requires an absolute `deadline` and retains the 4000ms PostgreSQL statement cap. Its client process uses a hard-kill timeout bounded by that deadline and at most6000ms. Output uses private regular descriptors so a descendant's inherited pipe cannot extend the wait; failed commands terminate their owned process group. A failed/late observation returns unknown safety, never an empty authoritative queue.
+Kenan Stack queue observation (`cache-queue.mjs`) reads every installed channel: each `/srv/kenan/CHANNEL` with a `source-commit` maps to database `kenan_CHANNEL` on the `kenan-postgres` socket `/run/kenan/pg`. It connects as the invoking Unix user through peer authentication; that role needs membership in `kenan_workspace_observer`, which has only `SELECT` on `agent` and `message`. A running tool call (`message` role `tool`, state `streaming`) whose arguments name the checkout is a physical consumer. In source scope, a live worker (non-archived, not stopped) whose conversation names the checkout is source intent. Finished tool history and manager transcripts are not consumers. The caller's own tool call is excluded: when a Kenan Stack server is a process ancestor, running bash tool calls that invoke `agent-workspace` with every one of this invocation's arguments are the operator, and their worker conversation is excluded from source intent. Observation requires an absolute `deadline` and retains the 4000ms PostgreSQL statement cap. Its client process uses a hard-kill timeout bounded by that deadline and at most6000ms. Output uses private regular descriptors so a descendant's inherited pipe cannot extend the wait; failed commands terminate their owned process group. A missing channel inventory, missing role/grant, schema change or failed/late observation returns unknown safety, never an empty authoritative queue. `node tools/agent-workspace/queue-installed-check.mjs` checks the installed observer against the live stack.
 
 `retire-growth --id ID --path PATH` requires both bindings. `release (--id ID|--path PATH) --end-retention` requires exactly one selector. Shared CLI contracts drive selector validation and these help forms. A `future-growth-not-retired` error supplies executable measurement/status commands, the explicit owner-disposition schema, and command templates with named unset file/hash inputs; no disposition or owner evidence is invented.
 
 Cache deleting continuations retain the original journal/request/stage/manifest. After fresh native/queue/Git authorization, checked removal pins directory FDs, validates inode/type/content against that manifest, and visits only actual remaining names. Unknown names and replaced directories refuse; symlinks unlink without traversal. It does not repeatedly snapshot all already-removed leaves. Deadline expiry retains pending/deleting and actual partial progress for the same request. The35s operation budget remains unchanged.
 
 Owned read-only staged directories (including0500 package payloads) are handled by the owning engine: after all normal authorization and manifest/name/inode checks, an already pinned directory FD may gain only its owner-write bit when its numeric UID equals the executing UID. No source directory, unlisted inode, symlink target or foreign-owned directory gains permissions. The same checked-removal primitive serves qualified source materializations. A permission failure outside that case retains the original pending journal. An administrator can deliberately execute the SAME CLI/request under a finite UID-preserving CAP_DAC_OVERRIDE unit, preserving original HOME, registry, Git trust and native guards; changing to root instead can invalidate linked-worktree Git trust and is not a substitute for those checks.
-
-## Terminal uncertain tools and queue observation
-
-An immutable uncertain operation remains uncertain. It stops counting as a potential executing workspace consumer only after the supported terminal tool projection, exact original operation/run binding, matching ceased-owner receipt/proof and a complete zero-admitted-child observation agree. Both the retained-original and terminal-projected operation-result forms are recognized. Live, queued, missing-proof, changed-binding, known/unknown child and genuine source-intent references remain protected.
-
-The explicit known-applied-file terminal variant preserves an unknown original model run and the immutable uncertain operation. Its original agent run/provider call/cessation, exact requested path/content SHA, durable-file effect binding and terminal no-replay/no-child proof must agree. Unknown phases and mismatched evidence remain protected. Native Bash admission copies its parent's relational assignment/conversation in the same guarded insert. Child observation uses those owning columns before inspecting known Bash specs: direct operation matches always remain; same assignment OR conversation, absent scope, and every other/unknown kind remain eligible for complete relationship inspection. This removes unrelated historical Bash payload decoding. It never filters native executions by a guessed path or clock interval. Exact declared-child proof also checks canonical parent/child assignment and conversation equality.
-
-Child observation first materializes at most65 matching IDs using PostgreSQL's native JSON relationship predicate, then fetches only those payloads. It covers operation/parent-run/parent-job/provider-call edges without running JSON record-expansion functions on every historical row. Both reads retain the4000ms cap.
-
-A different provider call under the same old agent run is not this tool's child. Its runtime row can be discounted only with an explicit distinct provider, nonmatching operation, supported native tool kind, terminal state and exact own cgroup-empty/ownership receipt. Live, unknown, missing/mismatched cessation, unspecified provider and exact-operation/provider children all remain protected. An existing generic terminal projection may also declare exactly one completed original Bash child. It is consumed only when the canonical operation/provider/parent identities, child state/result/process exit0 (result payload fetched only for the exact operation, never unrelated siblings), exact ownership/cgroup-empty evidence, retained declaration and `completed-original-bash-child` known material all agree. Missing, live, mismatched, undeclared or additional unknown children remain protected. The operation stays uncertain, with original interrupted owner/run and command unchanged; no original success receipt or effect replay is inferred.
-
-Physical queue observation uses the canonical relational job kind before fetching payloads: agent-run job specs need not repeat that discriminator. Physical scope selects only reserved tool IDs; completed current-run tools retain source scope. This removes unnecessary completed-tool and resident-agent payload work without dropping native execution or unknown-kind consumers.
-
-The queue query selects reserved/current-run tool-call IDs before fetching their payloads. A serialized exact-string prefilter precedes recursive JSON path matching; it never substitutes for that match. Terminal-tool evidence is fetched for the bounded returned operation IDs in a separate read-only query and classified once as data, rather than repeatedly joining full JSON receipts against every historical job. Child lookup still covers operation, parent-run, parent-job and provider-call bindings. Both reads keep the4000ms SQL cap and the original whole-operation deadline; incomplete/failed evidence is unknown safety. No database index/configuration or runtime mutation is needed.
 
 ## Checks
 
@@ -418,11 +404,11 @@ converted into implicit capacity credit. Recreated output is not removed by a
 completed-operation replay. A new output needs a new request and operation ID.
 
 Fresh all-UID read/write-FD, process, native/container/systemd, Legacy queued-thread
-and current Stack PostgreSQL queued/uncertain/tool-call reference observations
-protect every cache-removal consumer, including release/reconcile and source
-materialization. A canonical queue error is a protected typed result, never an
-empty queue. Physical operator exemption is derived from its exact cgroup job and
-indexed original-operation/parent-job custody, not a caller-selected exclusion.
+and Kenan Stack running-tool/live-worker reference observations protect every
+cache-removal consumer, including release/reconcile and source materialization.
+A queue error is a protected typed result, never an empty queue. The operator's
+own tool call is identified from its process ancestry and exact arguments, not a
+caller-selected exclusion.
 
 Each operation has a35s observation/lock budget and1000000-entry inventory limit;
 limit or safety failures retain the request/journal for an explicit same-operation
@@ -434,10 +420,9 @@ runs a disposable native read-FD refusal then cache-only preservation proof.
 `cache-safety --id ID --path PATH --owner OWNER --cache RELATIVE --json` is the read-only current
 borrower observation. It reports exact IDs/kinds and unknowns, without cache
 classification, inode qualification or retirement. Reference errors retain those
-same identifiers rather than a generic denial. Canonical text inputs/deliveries
-and completed tool history are source intent; actual admitted native jobs,
-reserved tool calls, uncertain native operations and unclassified operations
-remain physical consumers. No canonical task/input/history is changed.
+same identifiers rather than a generic denial. Live worker conversations and
+completed tool history are source intent; running tool calls remain physical
+consumers. No Kenan Stack conversation or agent state is changed.
 
 An explicit owner `release` separates lease completion from physical disposition.
 Its JSON includes `leaseRelease` and `physicalDisposition`. Durable/pushed source
@@ -482,11 +467,5 @@ boundary. A previously completed rename does not trigger another native verdict.
 A planned rename retains its separate boundary authorization. Source retirement
 keeps its initial authorization. This removes repeated no-effect observation
 cost without relaxing the35s budget or physical/reference/replacement checks.
-
-### Canonical terminal proof variants
-
-Known-applied file observations have two closed wire forms: originalAgentRunId plus explicit unknown originalModelRun and exported-file custody; or originalRunId plus explicit exact UTF8 byte count and original-target/durable-Git custody. Both require exact provider, operation, request target/hash, ceased owner, original interruption and no-replay/no-original-completion claims. Mixed metadata is rejected, not defaulted.
-
-Completed native Bash declarations have explicit inline-result custody or canonical bash_job result-reference custody. A reference is resolved from the same bounded canonical query, requiring exact child/operation/provider/parent/assignment/conversation, completed process0 and matching cgroup-empty owner proof. Missing, mixed, unknown, live or mismatched declarations are protected. Neither variant rewrites original operation uncertainty.
 
 Component public-source publication pushes its immutable projected object directly; it does not manufacture a local workspace branch. Existing branches remain preserved in their independent durable repositories. This removes unnecessary local-only public projection refs that otherwise honestly prevent ordinary source release.

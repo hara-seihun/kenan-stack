@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 const {retireWorkspaceCache,cacheStagingRoots}=await import(process.env.CACHE_RETIREMENT_MODULE || './cache-retirement.mjs');
-import {currentStackQueueReferences,queueReferenceSql,operatorJobFromCgroup,isSourceOnlyRead} from './cache-queue.mjs';
+import {queueReferenceSql,isSourceOnlyRead} from './cache-queue.mjs';
 import {main,workspaceTesting} from './workspace.mjs';
 import {retireGeneratedOnly} from './generated-retirement.mjs';
 import {cacheGeneratedRequest} from './cache-retirement.mjs';
@@ -48,14 +48,6 @@ test('symlinks unlink without following and shared hardlinks never claim physica
 test('staged interruption resumes same operation without deleting recreated or source bytes',()=>fixture(f=>{
  f.c.afterRename=()=>{throw new Error('injected cessation');};assert.equal(retireWorkspaceCache(f.c,f.r).ok,false);assert.equal(fs.existsSync(f.cache),false);delete f.c.afterRename;assert.equal(retireWorkspaceCache(f.c,f.r).ok,true);assert.equal(fs.readFileSync(path.join(f.root,'source.ts'),'utf8'),'dirty irreplaceable');
 }));
-test('current canonical queue inventory includes reserved tools/escaped JSON/uncertain custody and fails honestly',()=>{
- const read=p=>p.endsWith('host.json')?{hostId:'host',installationId:'one'}:p.endsWith('registry.json')?{installationId:'one',domains:[{id:'hara',hostId:'host',unixUser:'pi2-hara'}]}:{domainId:'hara',database:'stack'};
- const result=currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,read,execute:(_name,args)=>{const sql=args.at(-1);assert.match(sql,/tool_call/);assert.match(sql,/tc.result IS NULL/);assert.match(sql,/jsonb_path_exists/);assert.match(sql,/cessation_evidence IS NULL/);assert.match(sql,/uncertain/);return {status:0,stdout:'[{"kind":"tool_call","id":"reserved","state":"unfinished"}]'};}});
- assert.equal(result.references[0].id,'reserved');assert.equal(currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,read,execute:()=>({status:2,stdout:''})}).errors.length,1);
- assert.equal(operatorJobFromCgroup('0::/pi-stack-next.slice/pi-stack-next-job-11111111-2222-3333-4444-555555555555-1.service'),'11111111-2222-3333-4444-555555555555');
- assert.match(queueReferenceSql("/source/'quoted",null,"source"),/''quoted/);
-});
-
 test('same current queued borrower protects ordinary release/reconcile/group paths before runtime reaping',()=>fixture(f=>{
  const prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
  try{
@@ -86,7 +78,7 @@ test('known source read differs from cache read, aliased target and unresolved B
 
 
 test('literal JSON path lookup and old pending cache staging identity remain exact',()=>fixture(f=>{
- const sql=queueReferenceSql('/source/a.[x]\\b',null,'generated-cache');assert.match(sql,/flag \"q\"/);assert.doesNotMatch(sql,/Memoize|body::text|jsonb_path_query/);
+ const sql=queueReferenceSql('/source/a.[x]\\b',null,'generated-cache');assert.match(sql,/flag \"q\"/);assert.doesNotMatch(sql,/Memoize|jsonb_path_query/);
  const request={...f.r,operationId:'caption-build-f4b1-58b-1040',cachePath:'.converge-cache'};
  assert.equal(path.basename(cacheStagingRoots(request,f.base)[0]),'9d2e97ab18ff9c33fc9970608c2b566f575a64055e3dc197c9f9d3a02c3de235');
 }));
