@@ -30,6 +30,12 @@ for(const channel of channels){
   if(database!==channelDatabase(channel)||host!==KENAN_PG_SOCKET_DIR)failures.push(`${channel} serves database ${database} on ${host}; observer expects ${channelDatabase(channel)} on ${KENAN_PG_SOCKET_DIR}`);
  }catch(error){failures.push(`${channel} configuration: ${String(error.message).trim()}`);}
 }
+// Without this partial index every observation scans the whole message table and can exhaust its deadline.
+for(const channel of channels){
+ const index=boundedCommand('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--dbname',channelDatabase(channel),'--command',"SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND tablename='message' AND indexname='message_streaming'"],{encoding:'utf8',timeout:5000,maxBuffer:65536});
+ if(index.status!==0)failures.push(`${channel} index inspection failed: ${String(index.error?.code??index.stderr).trim().slice(0,300)}`);
+ else if(!/WHERE \(state = 'streaming'::text\)/.test(index.stdout))failures.push(`${channel}: partial index message_streaming is missing; create it with CREATE INDEX CONCURRENTLY IF NOT EXISTS message_streaming ON message (conversation_id) WHERE state = 'streaming'`);
+}
 const probe='/nonexistent/agent-workspace-queue-check/'+process.pid;
 for(const resourceKind of channels.length?['physical-checkout','source']:[]){
  const result=currentStackQueueReferences([probe],{resourceKind,deadline:Date.now()+15000});
