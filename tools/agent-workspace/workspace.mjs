@@ -834,6 +834,45 @@ function systemdReferences(workspacePath, snapshot = systemdSnapshot()) {
   };
 }
 
+// A linked worktree whose repository was deleted has no object store, so nothing can depend on it.
+function orphanedWorktree(workspacePath) {
+  const pointer = /^gitdir: (.+)$/m.exec(readFileSync(path.join(workspacePath, ".git"), "utf8"));
+  return pointer !== null && !existsSync(path.resolve(workspacePath, pointer[1].trim()));
+}
+
+// Installed files that name a checkout path: a bundle under /opt whose __dirname points into an
+// agent clone's node_modules, a /srv release built in place, a unit under /etc/systemd running from
+// it. 2026-10-19 (converge-kenan): the Slack sender installed at /opt/converge-slack-sender/8fe1fe50
+// from checkout limmy-independent-83fd broke when that checkout was released a minute later.
+// Depth-bounded; node_modules and .git are skipped. Same scan as /usr/local/bin/liveuse.
+const INSTALLED_REFERENCE_ROOTS = ["/opt", "/srv", "/etc/systemd"];
+const INSTALLED_REFERENCE_DEPTH = 4;
+function installedReferenceSnapshot(roots = INSTALLED_REFERENCE_ROOTS) {
+  const references = [];
+  const pattern = /\/home\/[A-Za-z0-9._@+-]+\/[A-Za-z0-9._\/@+-]+/gu;
+  const walk = (directory, depth) => {
+    let entries;
+    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < INSTALLED_REFERENCE_DEPTH - 1 && entry.name !== "node_modules" && entry.name !== ".git") walk(candidate, depth + 1);
+      } else if (entry.isFile()) {
+        let data;
+        try { if (statSync(candidate).size > 32 << 20) continue; data = readFileSync(candidate); } catch { continue; }
+        if (data.subarray(0, 8192).includes(0)) continue;
+        for (const match of data.toString("latin1").matchAll(pattern)) references.push({ file: candidate, path: match[0] });
+      }
+    }
+  };
+  for (const root of roots) walk(root, 0);
+  return references;
+}
+
+function installedReferences(workspacePath, snapshot = []) {
+  return snapshot.filter((reference) => within(workspacePath, reference.path));
+}
+
 function gitDependencySnapshot(database) {
   const alternates = [];
   const linkedWorktrees = [];
@@ -845,6 +884,7 @@ function gitDependencySnapshot(database) {
     let commonDirectory = path.join(record.path, ".git");
     if (record.checkoutType === "worktree") {
       const common = command("git", ["-C", record.path, "rev-parse", "--git-common-dir"]);
+      if (common.status !== 0 && orphanedWorktree(record.path)) continue;
       if (common.status !== 0) fail(`cannot inspect linked worktree ${record.path}: ${common.stderr || common.error?.message || `exit ${common.status}`}`);
       commonDirectory = path.resolve(record.path, common.stdout);
       linkedWorktrees.push({ recordId: record.id, workspacePath: record.path, commonDirectory });
@@ -927,6 +967,7 @@ function safetySnapshot(database) {
     threads: isolated && !process.env.PI_THREAD_DATABASE ? [] : threadSnapshot(),
     gitAlternates: gitDependencies.alternates,
     linkedWorktrees: gitDependencies.linkedWorktrees,
+    installed: isolated ? [] : installedReferenceSnapshot(),
   };
 }
 
@@ -1222,6 +1263,12 @@ function inspectRecord(record, options = {}) {
   if (threads.length > 0) {
     return { classification: "referenced", reason: `${threads.length} thread(s) with unfinished custody use this checkout: ${threads.map((thread) => thread.id).join(", ")}`,
       threads, processes: [], containers: [], systemdUnits: [] };
+  }
+  const installed = installedReferences(record.path, options.safety?.installed);
+  if (installed.length > 0) {
+    const files = [...new Set(installed.map((reference) => reference.file))];
+    return { classification: "referenced", reason: `${files.length} installed file(s) under /opt, /srv or /etc/systemd name this checkout: ${files.slice(0, 4).join(", ")}`,
+      installed, processes: [], containers: [], systemdUnits: [] };
   }
   const processes = processReferences(record.path, options.safety?.processes);
   const docker = dockerReferences(record.path, options.safety?.docker);
@@ -3928,7 +3975,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if (argv[0] === "materialization-process-snapshot") {
