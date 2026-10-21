@@ -39,13 +39,15 @@ import { DatabaseSync } from "node:sqlite";
 import * as census from "./safety-census.mjs";
 import { CensusFailure, withCensusDeadline, processAncestry, readLink, within } from "./safety-census.mjs";
 import { pathToFileURL } from "node:url";
-import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourceJob, sourceJobId } from "./source-job.mjs";
+import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourceJob, sourceJobId, abandonSourceJob } from "./source-job.mjs";
 import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError } from "./cache-retirement.mjs";
 import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
 import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction, validateRetainedHeadroom } from "./growth-lifecycle.mjs";
+
+import {readPermit,authenticatedAbandonCaller,validateAbandonPermit,sourceJobCgroupSnapshot,sha,refuse} from './source-job-abandon.mjs';
 
 class SourcePreparationRequired extends Error {}
 let sourcePreparationMode = null;
@@ -2529,6 +2531,7 @@ function prepareCreationSource(database, args, input) {
     command: [process.execPath, new URL(import.meta.url).pathname, "source-prepare"], env: {}, waitMs: 2000, restartInterrupted: true });
   const accepted = job => {
     if (job.jobId && pointer.jobId !== job.jobId) writePreparationReceipt(pointerPath, { ...pointer, jobId: job.jobId });
+    if (job.state === "abandoned") fail("source job explicitly ABANDONED; historical effects UNKNOWN_RETAINED; automatic retry prohibited");
     if (job.state === "failed" || job.state === "interrupted") fail(`source preparation ${job.state}: ${job.error?.code}: ${job.error?.message}; job ${pointer.jobId}; progress ${job.progressPath ?? path.join(directory, "jobs", pointer.jobId, "progress.json")}${job.error?.detail ? `; lock detail ${JSON.stringify(job.error.detail)}` : ""}`);
     return job;
   };
@@ -4066,6 +4069,7 @@ function help() {
                          [--intent source-only|budgeted --headroom-gib N --growth-mib N]
   agent-workspace job-status --job-id SHA256 [--json]
   agent-workspace source-status --job-id SHA256 [--json]
+  agent-workspace source-job-abandon --job-id SHA256 --owner OWNER --permit-sha256 SHA256 --json
   agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--retained | --lease-seconds N]
   agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
   agent-workspace custody-status --id ID --path PATH --json
@@ -4116,6 +4120,45 @@ Records outlive the directory, so status explains what became of a checkout that
 export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
+  if(argv[0]==='source-job-abandon-permit') {
+    if(process.getuid?.()!==0)refuse('abandon-permit-unsafe','root permit reader required');
+    const args=parseArgs(argv.slice(1));assertOnly(args,['job-id']);print(readPermit(required(args,'job-id')),true);return;
+  }
+  if(argv[0]==='source-job-cgroup-snapshot') {
+    const args=parseArgs(argv.slice(1));assertOnly(args,['unit']);print(sourceJobCgroupSnapshot(required(args,'unit')),true);return;
+  }
+  if(argv[0]==='source-job-abandon') {
+    const args=parseArgs(argv.slice(1));assertOnly(args,['job-id','owner','permit-sha256','json']);
+    try {
+      const jobId=required(args,'job-id');if(!/^[a-f0-9]{64}$/.test(jobId))refuse('abandon-invalid-job','full job SHA required');
+      const permitRead=command('sudo',['-n',process.execPath,new URL(import.meta.url).pathname,'source-job-abandon-permit','--job-id',jobId],{timeout:5000});
+      if(permitRead.status!==0)refuse('abandon-permit-unknown','trusted root permit reader failed');
+      const {permit,permitSha256}=JSON.parse(permitRead.stdout);
+      if(permitSha256!==required(args,'permit-sha256')||permit.owner!==required(args,'owner'))refuse('abandon-permit-changed','permit or applying owner mismatch');
+      const caller=authenticatedAbandonCaller(permit),database=openRegistry(statePath);
+      try {
+        const r=recordBy(database,{id:permit.workspaceId});
+        const result=withWorkspaceLock(database,r.path,()=>abandonSourceJob({directory:path.join(path.dirname(statePath),'source-preparations','jobs',jobId),jobId,
+          requestSha256:permit.requestSha256,attemptSha256:permit.attemptSha256,
+          validate:(request,attempt)=>{
+            const record=recordBy(database,{id:permit.workspaceId});record.capacity=recordedCapacity(database,record.id);
+            const transfer=database.prepare('SELECT * FROM workspace_reassignment WHERE workspace_id=? ORDER BY sequence DESC LIMIT 1').get(record.id);
+            const head=git(record.path,['rev-parse','HEAD']);
+            validateAbandonPermit(permit,{jobId,requestSha256:permit.requestSha256,attemptSha256:permit.attemptSha256,request,record,transfer,head,unit:attempt.unit,caller});
+            const evidence=readFileSync(permit.priorTerminalEvidence.path);if(sha(evidence)!==permit.priorTerminalEvidence.sha256)refuse('abandon-evidence-changed','retained original terminal custody bytes changed');
+            const parsed=JSON.parse(evidence);if(!/MainPID=0/.test(parsed.unitObservation)||!/ActiveState=inactive/.test(parsed.unitObservation)||!/ControlGroup=\n/.test(parsed.unitObservation))refuse('abandon-cessation-unknown','retained terminal witness changed');
+            return {permitSha256,caller,workspaceId:record.id,owner:record.owner,adoptionSequence:transfer.sequence,head};
+          },observe:unit=>{
+            const safety=terminalSafety(database,r,Date.now()+25000);
+            const read=command('sudo',['-n',process.execPath,new URL(import.meta.url).pathname,'source-job-cgroup-snapshot','--unit',unit],{timeout:10000});
+            if(read.status!==0)refuse('abandon-cessation-unknown','privileged original-unit census failed');
+            return {...safety,cgroup:JSON.parse(read.stdout)};
+          }}),r.groupId);
+        print(result,true);if(!result.ok)process.exitCode=2;
+      }finally{database.close();}
+    }catch(error){print({ok:false,error:{code:error.code??'abandon-failed',message:error.message}},true);process.exitCode=2;}
+    return;
+  }
   if (argv[0] === "materialization-process-snapshot") {
     if (process.getuid?.() !== 0) throw new MaterializationError("materialization-safety-unknown", "all-FD observation requires root");
     const args = parseArgs(argv.slice(1)); assertOnly(args, ["path"]);
