@@ -2302,6 +2302,7 @@ test("a released checkout stays until its owner's input, execution, wait and can
     assert.equal(JSON.parse(run(["release", "--id", created.id, "--json"], env)).inspection.classification, "referenced");
     db.prepare("UPDATE thread_execution SET ended_at=1").run();
     const setMetadata = db.prepare("UPDATE thread SET metadata=? WHERE id='resubmitted-worker'");
+    writeFileSync(path.join(created.path,".git/info/exclude"),"node_modules/\n");
     const cache = path.join(created.path, "node_modules", "needed");
     mkdirSync(path.dirname(cache));
     writeFileSync(cache, "unfinished continuation needs this cache\n");
@@ -2332,7 +2333,8 @@ test("a released checkout stays until its owner's input, execution, wait and can
     assert.match(unknown.inspection.reason,/file is not a database/);
     rmSync(path.join(f.root,"invalid-threads.sqlite3"));
     assert.equal(existsSync(created.path), true);
-    assert.equal(JSON.parse(run(["release", "--id", created.id, "--json"], env)).action, "released");
+    const terminal=JSON.parse(run(["release", "--id", created.id, "--json"], env));
+    assert.equal(terminal.action,"released",JSON.stringify(terminal));
     assert.equal(existsSync(created.path), false);
     db.close();
   } finally { f.close(); }
