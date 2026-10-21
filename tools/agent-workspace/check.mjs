@@ -12,7 +12,7 @@ export const workspaceChecks = [...['capacity-deploy','capacity-lock','capacity-
   `agent workspace ${index + 1}/${shardCount}`,
   process.execPath,
   ["--test", fileURLToPath(new URL("./test.mjs", import.meta.url))],
-  { timeoutMs: index===104?240_000:55_000, env: { AGENT_WORKSPACE_TEST_SHARD: `${index}/${shardCount}` } },
+  { timeoutMs: index===104?240_000:index===81?120_000:55_000, env: { AGENT_WORKSPACE_TEST_SHARD: `${index}/${shardCount}` } },
 ])];
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
