@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -85,13 +85,34 @@ test("cached observations are reused only while every file identity is unchanged
     census.installedReferenceSnapshot([installRoot], { cacheFile });
     const fresh = JSON.parse(readFileSync(cacheFile, "utf8"));
     assert.deepEqual(Object.keys(fresh.entries), [], "files changed within the racy window are never cached");
+    const racy = path.join(installRoot, "racy");
+    writeFileSync(racy, "exec /home/kenan/work/clones/first/main\n");
+    census.installedReferenceSnapshot([installRoot], { cacheFile });
+    writeFileSync(racy, "exec /home/kenan/work/clones/other/main\n");
+    assert.deepEqual(census.installedReferenceSnapshot([installRoot], { cacheFile }).map((reference) => reference.path),
+      ["/home/kenan/work/clones/other/main"], "the production window re-reads a same-tick same-length rewrite");
+    rmSync(racy);
     writeFileSync(path.join(installRoot, "launcher-a"), "exec /home/kenan/work/clones/first/main\n");
     const first = census.installedReferenceSnapshot([installRoot], { cacheFile, racyWindowNs: -60_000_000_000n });
     assert.deepEqual(first.map((reference) => reference.path), ["/home/kenan/work/clones/first/main"]);
     assert.ok(Object.keys(JSON.parse(readFileSync(cacheFile, "utf8")).entries).length > 0);
-    writeFileSync(path.join(installRoot, "launcher-a"), "exec /home/kenan/work/clones/other/main\n");
-    const second = census.installedReferenceSnapshot([installRoot], { cacheFile, racyWindowNs: -60_000_000_000n });
-    assert.deepEqual(second.map((reference) => reference.path), ["/home/kenan/work/clones/other/main"]);
+    // A forged cached result proves an unchanged identity is served from the cache.
+    const launcher = path.join(installRoot, "launcher-a"), cached = JSON.parse(readFileSync(cacheFile, "utf8"));
+    cached.entries[launcher][1] = ["/home/kenan/work/clones/cached/main"];
+    writeFileSync(cacheFile, JSON.stringify(cached));
+    assert.deepEqual(census.installedReferenceSnapshot([installRoot], { cacheFile, racyWindowNs: -60_000_000_000n }).map((reference) => reference.path),
+      ["/home/kenan/work/clones/cached/main"]);
+    // A same-length rewrite inside one timestamp tick keeps the whole stat identity on
+    // coarse-clock kernels (converge-kenan, Linux 6.12); only the racy window covers
+    // that, and this test disables it. Each rewrite here changes the identity itself.
+    writeFileSync(launcher, "exec /home/kenan/work/clones/other-checkout/main\n");
+    assert.deepEqual(census.installedReferenceSnapshot([installRoot], { cacheFile, racyWindowNs: -60_000_000_000n }).map((reference) => reference.path),
+      ["/home/kenan/work/clones/other-checkout/main"], "a size change is re-read");
+    const sameLength = statSync(launcher, { bigint: true });
+    writeFileSync(launcher, "exec /home/kenan/work/clones/second-checkou/main\n");
+    utimesSync(launcher, new Date(), new Date(Number(sameLength.mtimeNs / 1_000_000n) + 10_000));
+    assert.deepEqual(census.installedReferenceSnapshot([installRoot], { cacheFile, racyWindowNs: -60_000_000_000n }).map((reference) => reference.path),
+      ["/home/kenan/work/clones/second-checkou/main"], "a same-length rewrite with a new mtime is re-read");
 
     const file = threadDatabase(root), threadCache = path.join(root, "threads.json");
     assert.deepEqual(census.threadSnapshot([file], { cacheFile: threadCache, racyWindowNs: -60_000_000_000n }).map((row) => row.id), ["live"]);
