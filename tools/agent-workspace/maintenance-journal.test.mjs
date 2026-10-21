@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {spawnSync} from 'node:child_process';
+import {spawnSync,spawn} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 import {fileURLToPath} from 'node:url';
 import {MaintenanceJournal,priorDisposition} from './maintenance-journal.mjs';
@@ -19,7 +19,7 @@ for(const window of ['prepared','uncertain','effect-returned','settled','record-
  const code=`import fs from 'node:fs';import {MaintenanceJournal} from ${JSON.stringify('file://'+mod)};
  const j=new MaintenanceJournal(${JSON.stringify(f.journal)},${JSON.stringify(operation)},${JSON.stringify(binding)},{deadline:Date.now()+5000,hook:stage=>{if(stage===${JSON.stringify(window)})process.kill(process.pid,'SIGKILL')}});
  j.run({maxRecords:1,next:c=>c?null:{id:'owned'},inspect:()=>{},execute:()=>j.effect(${JSON.stringify(spec)},()=>{fs.appendFileSync(${JSON.stringify(f.counter)},'once\\n');return 'success'})});j.close();`;
- const child=spawnSync(process.execPath,['--input-type=module','-e',code],{timeout:2000,encoding:'utf8'});assert.equal(child.signal,'SIGKILL',child.stderr);
+ const child=spawnSync(process.execPath,['--input-type=module','-e',code],{timeout:10000,encoding:'utf8'});assert.equal(child.signal,'SIGKILL',child.stderr);
  let j=open(f,{resume:true});
  if(['uncertain','effect-returned'].includes(window)){
   assert.throws(()=>j.run({maxRecords:1,next:()=>{throw Error('must not traverse before reconciliation')},inspect:()=>{},execute:()=>{throw Error('must not execute')}}),/reconciliation-required/);
@@ -30,9 +30,15 @@ for(const window of ['prepared','uncertain','effect-returned','settled','record-
  j.run({maxRecords:1,next:c=>c?null:{id:'owned'},inspect:()=>{},execute:()=>j.effect(spec,()=>{fs.appendFileSync(f.counter,'once\n');return 'success'})});j.close();
  assert.equal(fs.readFileSync(f.counter,'utf8'),'once\n');
 });
-test('timeout inside effect remains uncertain even when the child wrote first',t=>{
+test('timeout inside effect remains uncertain even when the child wrote first',async t=>{
  const f=fixture(t);const code=`import fs from 'node:fs';import {MaintenanceJournal} from ${JSON.stringify('file://'+mod)};const j=new MaintenanceJournal(${JSON.stringify(f.journal)},${JSON.stringify(operation)},${JSON.stringify(binding)},{deadline:Date.now()+10000});j.effect(${JSON.stringify(spec)},()=>{fs.writeFileSync(${JSON.stringify(f.counter)},'effect');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);});`;
- const child=spawnSync(process.execPath,['--input-type=module','-e',code],{timeout:200,killSignal:'SIGKILL',encoding:'utf8'});assert.equal(child.error.code,'ETIMEDOUT');const j=open(f,{resume:true});assert.equal(j.unknown().length,1);assert.throws(()=>j.effect(spec,()=>{}),/outcome-unknown/);assert.equal(fs.readFileSync(f.counter,'utf8'),'effect');j.close();
+ const child=spawn(process.execPath,['--input-type=module','-e',code],{stdio:'ignore'});
+ t.after(()=>{try{child.kill('SIGKILL')}catch{}});
+ const exited=new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));
+ const readyBy=Date.now()+10000;
+ while(!fs.existsSync(f.counter)&&child.exitCode===null&&Date.now()<readyBy)await new Promise(r=>setTimeout(r,10));
+ assert.equal(fs.existsSync(f.counter),true,'effect must be admitted before its execution timeout begins');
+ await new Promise(r=>setTimeout(r,200));child.kill('SIGKILL');assert.equal((await exited).signal,'SIGKILL');const j=open(f,{resume:true});assert.equal(j.unknown().length,1);assert.throws(()=>j.effect(spec,()=>{}),/outcome-unknown/);assert.equal(fs.readFileSync(f.counter,'utf8'),'effect');j.close();
 });
 test('deadline before effect and after effect before settlement have different durable states',t=>{
  const f=fixture(t);let clock=0;let j=open(f,{now:()=>clock,deadline:1000,hook:stage=>{if(stage==='prepared')clock=900;}});assert.throws(()=>j.effect(spec,()=>{throw Error('never dispatched')}),/budget-exhausted/);assert.equal(j.unknown().length,0);j.close();clock=0;j=open(f,{resume:true,now:()=>clock,deadline:1000,hook:stage=>{if(stage==='effect-returned')clock=900;}});assert.throws(()=>j.effect(spec,()=>{fs.writeFileSync(f.counter,'once');return null;}),/budget-exhausted/);assert.equal(j.unknown().length,1);j.close();

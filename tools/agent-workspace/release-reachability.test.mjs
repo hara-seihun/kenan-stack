@@ -13,7 +13,7 @@ test('one bounded union walk matches per-branch reachability; refs and foreign w
   git(['init','-b','main']);git(['config','user.name','Fixture']);git(['config','user.email','fixture@example.invalid']);
   fs.writeFileSync(path.join(root,'proof'),'base');git(['add','.']);git(['commit','-m','base']);const base=git(['rev-parse','HEAD']);
   git(['commit','--allow-empty','-m','private']);const unique=git(['rev-parse','HEAD']);
-  const names=Array.from({length:256},(_,i)=>`branch-${i}`);for(const name of names)git(['branch',name,base]);
+  const names=Array.from({length:256},(_,i)=>`branch-${i}`);git(['update-ref','--stdin'],{input:names.map(name=>`create refs/heads/${name} ${base}\n`).join('')});
   git(['branch','foreign-work',unique]);git(['reset','--hard',base]);
   fs.writeFileSync(path.join(root,'foreign-dirty'),'preserve');
   const before=git(['show-ref'])+'\n'+git(['status','--porcelain']);let calls=0;

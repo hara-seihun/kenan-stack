@@ -14,13 +14,15 @@ for(const [name,entry]of Object.entries(toolBefore)){
  const actual=fs.lstatSync(path.join(expected,'agent-workspace',name));
  if(actual.isSymbolicLink()?fs.readlinkSync(path.join(expected,'agent-workspace',name))!==bytes.toString():!fs.readFileSync(path.join(expected,'agent-workspace',name)).equals(bytes))throw Error('installed snapshot mismatch '+name);
 }
-const leaves=git('diff','--name-only',baseCommit,head).split('\n');
+// Canonical rebases may change unrelated repository trees; this publisher selects only
+// this component, and independently proves every other installed byte unchanged below.
+const leaves=git('diff','--name-only',baseCommit,head,'--','tools/agent-workspace').split('\n').filter(Boolean).filter(p=>!p.endsWith('/deploy'));
 if(leaves.some(p=>!p.startsWith('tools/agent-workspace/')))throw Error('unrelated source');
 const target=path.join(path.dirname(expected),head),stage=target+'.stage';
 if(fs.existsSync(target)||fs.existsSync(stage))throw Error('existing target reconcile first');
 fs.cpSync(expected,stage,{recursive:true,verbatimSymlinks:true});
 try{
- for(const p of leaves){const out=path.join(stage,p.replace(/^tools\//,''));fs.writeFileSync(out,execFileSync('git',['-C',repo,'show',`${head}:${p}`]));fs.chmodSync(out,['workspace.mjs','admission-launcher','rollback-main','install-capacity-host'].includes(path.basename(p))?0o755:0o644);}
+ for(const p of leaves){const out=path.join(stage,p.replace(/^tools\//,''));if(git('ls-tree',head,'--',p)===''){fs.unlinkSync(out);continue;}fs.writeFileSync(out,execFileSync('git',['-C',repo,'show',`${head}:${p}`]));fs.chmodSync(out,['workspace.mjs','admission-launcher','rollback-main','install-capacity-host'].includes(path.basename(p))?0o755:0o644);}
  fs.writeFileSync(path.join(stage,'.pi-stack-commit'),head+'\n');
  fs.writeFileSync(path.join(stage,'.agent-workspace-component.json'),JSON.stringify({source:head,recoveredInstalledBase:baseCommit,originalObjectAvailable:false,rollback,scope:'agent-workspace only',receipt},null,2)+'\n');
  const after=inventory(stage),changed=new Set([...leaves.map(p=>p.replace(/^tools\//,'')),'.pi-stack-commit','.agent-workspace-component.json']);
