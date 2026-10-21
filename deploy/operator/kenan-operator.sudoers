@@ -1,0 +1,3 @@
+# Household operators (machine/user-access.md): root operations only through kenan-operator. The kenan-operators group
+# is the operator list; the host's kenan-user-grants reconciles its members.
+%kenan-operators ALL=(root) NOPASSWD: /usr/local/sbin/kenan-operator

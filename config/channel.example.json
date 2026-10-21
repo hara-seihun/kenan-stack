@@ -1,0 +1,50 @@
+{
+ "channel": "beta",
+ "listen": "/run/kenan/beta.sock",
+ "databaseUrl": "postgresql:///kenan_beta?host=/run/kenan/pg",
+ "dataDir": "/var/lib/kenan/beta",
+ "origins": ["https://beta.kenan.example.com"],
+ "sessionKeyPath": "/etc/kenan/session.key",
+ "verifierDir": "/etc/kenan/verifiers",
+ "modelsPath": "/etc/kenan/models.json",
+ "heartbeatMinutes": 30,
+ "webRoot": "/srv/kenan/beta/dist/web",
+ "parallelApiKeyPath": null,
+ "allowedProviders": ["anthropic"],
+ "people": [
+  {
+   "id": "alice",
+   "name": "Alice",
+   "unixUser": "alice",
+   "uid": 1001,
+   "gid": 1001,
+   "home": "/home/alice",
+   "brokerPort": 2465,
+   "heartbeatFile": "/home/alice/HEARTBEAT.md",
+   "extensionConfigPath": "/etc/kenan/domains/alice.json",
+   "extensions": ["browser", "mail", "calendar"],
+   "manager": {
+    "name": "Kenaznia",
+    "provider": "anthropic",
+    "model": "claude-opus-5-5",
+    "thinking": "medium",
+    "systemPrompt": "You are Kenan, Alice's assistant.",
+    "contextFiles": ["/home/alice/AGENTS.md"],
+    "refusalFallbackModels": []
+   },
+   "worker": {
+    "name": "Kenan",
+    "provider": "anthropic",
+    "model": "claude-opus-5-5",
+    "thinking": "high",
+    "systemPrompt": "You are Kenan, Alice's assistant.",
+    "contextFiles": ["/home/alice/AGENTS.md"],
+    "refusalFallbackModels": []
+   },
+   "alertDir": null,
+   "signalStore": null,
+   "pronouns": null,
+   "peers": []
+  }
+ ]
+}

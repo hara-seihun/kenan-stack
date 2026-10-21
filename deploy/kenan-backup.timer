@@ -1,0 +1,8 @@
+[Unit]
+Description=Hourly Kenan PostgreSQL recovery point
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=kenan-backup.service
+[Install]
+WantedBy=timers.target

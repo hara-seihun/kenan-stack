@@ -1,0 +1,9 @@
+#!/bin/bash
+# Independent system manager recovery. Disable a channel to keep it intentionally stopped.
+set -euo pipefail
+for channel in beta production; do
+ unit="kenan@$channel.service"
+ systemctl is-enabled --quiet "$unit" || continue
+ state=$(systemctl show "$unit" -p ActiveState --value)
+ case "$state" in inactive|failed) systemctl start "$unit";; esac
+done

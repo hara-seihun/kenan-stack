@@ -1,0 +1,16 @@
+[Unit]
+Description=Kenan PostgreSQL recovery point to existing B2 repository
+Requires=kenan-postgres.service
+After=kenan-postgres.service
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/pgbackrest --config=/etc/kenan/pgbackrest.conf --stanza=kenan --type=full --start-fast backup
+ExecStartPost=+/usr/local/sbin/kenan-backup-files
+TimeoutStartSec=30min
+UMask=0077
+Nice=10
+CPUWeight=20
+IOWeight=20
+IOSchedulingClass=idle

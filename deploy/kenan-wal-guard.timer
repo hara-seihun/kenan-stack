@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Kenan WAL archiving and disk headroom every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

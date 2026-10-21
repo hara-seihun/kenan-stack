@@ -1,0 +1,7 @@
+#!/bin/bash
+# Independent system-manager transaction: never bound to the caller's tool scope.
+set -euo pipefail
+channel=${1:?Usage: kenan-runtime-restart beta|production}
+[[ $channel == beta || $channel == production ]] && (( $# == 1 )) || exit 2
+if (( EUID != 0 )); then exec sudo -n /usr/local/sbin/kenan-runtime-restart "$channel"; fi
+exec /usr/bin/systemd-run --quiet --collect --unit="kenan-runtime-restart-${channel}-$(date +%s%N)" --property=Type=oneshot --property=TimeoutStartSec=60s --property="ExecStopPost=/usr/bin/systemctl start kenan@${channel}.service" /usr/bin/systemctl restart "kenan@${channel}.service"

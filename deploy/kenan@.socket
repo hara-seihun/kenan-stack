@@ -1,0 +1,13 @@
+[Unit]
+Description=Kenan %i listening socket
+# systemd holds the socket across app restarts and deploys: requests that arrive while the app is down wait in its queue
+# and are answered by the next process, instead of the entrance answering 502 with an HTML page (2026-10-21: a 50 s
+# shutdown left the app showing "is not valid JSON" until Alice cleared storage). Holding a channel stopped on purpose
+# means stopping and disabling this socket as well as the service, or a request starts it again.
+[Socket]
+ListenStream=/run/kenan/%i.sock
+SocketMode=0666
+DirectoryMode=0755
+Backlog=4096
+[Install]
+WantedBy=sockets.target

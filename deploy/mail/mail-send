@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""Compose or send owned Proton Bridge mail with local, durable SMTP receipts.
+
+Draft is the default. --send sends once per --request-id. Reuse that identity to
+inspect/retry a known pre-DATA failure; unknown outcomes require investigation.
+"""
+import argparse
+import base64
+import email.utils
+import fcntl
+import hashlib
+import imaplib
+import json
+import mimetypes
+import os
+from pathlib import Path
+import pwd
+import re
+import smtplib
+import sqlite3
+import ssl
+import subprocess
+import sys
+import time
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.policy import SMTP
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mail_identity import MailIdentityError, fetch_message, load_account, parse_reference, uidvalidity
+
+
+
+# Kenan Stack spawns tools with socket stdio, which cannot be reopened through /dev/stdin; read it once instead.
+BODY_CACHE = {}
+
+
+def read_body(path):
+    if path not in BODY_CACHE:
+        BODY_CACHE[path] = sys.stdin.read() if path in ('-', '/dev/stdin') else Path(path).read_text(encoding='utf-8')
+    return BODY_CACHE[path]
+
+
+class SenderError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(f'{code}: {message}')
+
+
+def parent_headers(folder, number, account):
+    connection = account.imap_connection()
+    try:
+        quoted = '"' + folder.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        status, _ = connection.select(quoted, readonly=True)
+        if status != 'OK':
+            raise ValueError('Cannot select reply folder')
+        content = fetch_message(connection, number, uidvalidity(connection),
+                                'BODY.PEEK[HEADER.FIELDS (MESSAGE-ID REFERENCES SUBJECT FROM REPLY-TO TO CC DELIVERED-TO X-ORIGINAL-TO)]')
+        header = email.message_from_bytes(content)
+        if not (header.get('Message-ID') or '').strip():
+            raise ValueError('Parent message has no Message-ID; cannot thread a reply')
+        return {'messageId': (header.get('Message-ID') or '').strip(),
+                'references': (header.get('References') or '').split(),
+                'subject': str(make_header(decode_header(header.get('Subject') or ''))),
+                'from': header.get('From', ''),
+                'replyTo': header.get('Reply-To', ''),
+                'to': header.get_all('To', []),
+                'cc': header.get_all('Cc', []),
+                'delivered': header.get_all('Delivered-To', []) + header.get_all('X-Original-To', [])}
+    finally:
+        try:
+            connection.logout()
+        except Exception:
+            pass
+
+
+def plain_addresses(values):
+    return [address.lower() for _, address in email.utils.getaddresses(values) if '@' in address]
+
+
+def choose_sender(explicit, parent, owned):
+    """The From address: explicit, else the address of ours the replied-to message reached; never an account default."""
+    if explicit:
+        try:
+            address = addresses([explicit])
+        except ValueError:
+            address = []
+        if len(address) != 1:
+            raise SenderError('sender-invalid', 'From needs exactly one email address')
+        if not owned(address[0]):
+            raise SenderError('sender-not-owned', f'{address[0]} is not an address this mailbox can send as')
+        return address[0], 'explicit'
+    if parent is None:
+        raise SenderError('sender-required', 'A new message needs an explicit From (--from-addr): one of the addresses this mailbox owns')
+    for basis, values in (('delivered-to', parent['delivered']), ('own-message', [parent['from']]), ('recipient', parent['to'] + parent['cc'])):
+        found = sorted({address for address in plain_addresses(values) if owned(address)})
+        if len(found) == 1:
+            return found[0], basis
+        if found:
+            raise SenderError('sender-ambiguous', f'The replied-to message reached several of our addresses ({", ".join(found)}); pass an explicit From')
+    raise SenderError('sender-required', 'The replied-to message was not addressed to any address this account owns; pass an explicit From (--from-addr)')
+
+
+def addresses(values):
+    result = [address.lower() for _, address in email.utils.getaddresses(values)]
+    if not result or any('@' not in address or any(c.isspace() or c in '<>\r\n' for c in address) for address in result):
+        raise ValueError('Recipients need explicit email addresses')
+    return sorted(set(result))
+
+
+def compose(args, account):
+    body = read_body(args.body_file)
+    if '\n' in args.from_name or '\r' in args.from_name:
+        raise ValueError('Invalid sender name')
+    if not args.from_addr and not args.reply_to:
+        choose_sender(None, None, None)
+    parent = None
+    if args.reply_to:
+        folder, separator, number = args.reply_to.rpartition('/')
+        if not separator or not folder:
+            raise ValueError('--reply-to needs FOLDER/UID or FOLDER/UIDVALIDITY:UID')
+        parse_reference(number)
+        parent = parent_headers(folder, number, account)
+    owned = account.ownership()
+    sender, basis = choose_sender(args.from_addr, parent, owned)
+    subject = args.subject if args.subject is not None else parent['subject'] if parent else None
+    if subject is None or '\n' in subject or '\r' in subject:
+        raise ValueError('A single-line subject is required')
+    if parent and not subject.lower().startswith('re:'):
+        subject = 'Re: ' + subject
+    if args.to or not parent:
+        to = args.to
+    elif basis == 'own-message':
+        to = parent['to']
+    else:
+        to = [parent['replyTo'] or parent['from']]
+    envelope = addresses(to + args.cc)
+    attachments = []
+    for path in args.attach:
+        data = Path(path).read_bytes()
+        mime = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+        attachments.append({'name': Path(path).name, 'mime': mime, 'data': data})
+    logical = {'sender': sender.lower(), 'fromName': args.from_name, 'to': to, 'cc': args.cc,
+               'subject': subject, 'body': body, 'parent': parent, 'intent': args.intent_key,
+               'attachments': [{'name': a['name'], 'mime': a['mime'], 'hash': hashlib.sha256(a['data']).hexdigest()} for a in attachments]}
+    fingerprint = hashlib.sha256(json.dumps(logical, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    message = EmailMessage(policy=SMTP)
+    message['From'] = email.utils.formataddr((args.from_name, sender))
+    message['To'] = ', '.join(to)
+    if args.cc:
+        message['Cc'] = ', '.join(args.cc)
+    message['Subject'] = subject
+    message['Date'] = email.utils.formatdate(localtime=True)
+    message['Message-ID'] = email.utils.make_msgid(domain=sender.split('@')[-1])
+    if parent and parent['messageId']:
+        message['In-Reply-To'] = parent['messageId']
+        message['References'] = ' '.join(parent['references'] + [parent['messageId']])
+    message.set_content(body)
+    for attachment in attachments:
+        major, minor = attachment['mime'].split('/', 1)
+        message.add_attachment(attachment['data'], maintype=major, subtype=minor, filename=attachment['name'])
+    return message, fingerprint, sender, basis, envelope
+
+
+def receipt_path():
+    configured = os.environ.get('PI_MAIL_RECEIPT_DB')
+    if configured:
+        return Path(configured)
+    home = os.environ.get('HOME') or pwd.getpwuid(os.getuid()).pw_dir
+    state = os.environ.get('XDG_STATE_HOME') or str(Path(home) / '.local' / 'state')
+    return Path(state) / 'pi-stack-next' / 'mail-send' / 'receipts.sqlite3'
+
+
+class Receipts:
+    def __enter__(self):
+        path = receipt_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.lock = os.open(str(path) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        if path.is_symlink():
+            raise ValueError('Receipt database must be an owned regular file')
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            if os.fstat(descriptor).st_uid != os.getuid():
+                raise ValueError('Receipt database belongs to another account')
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA foreign_keys=ON')
+        self.db.execute('PRAGMA synchronous=FULL')
+        self.db.execute('CREATE TABLE IF NOT EXISTS receipt (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, state TEXT NOT NULL, mime BLOB NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, result TEXT, updated_at INTEGER NOT NULL)')
+        self.db.execute("CREATE TABLE IF NOT EXISTS outbound_request (id TEXT PRIMARY KEY REFERENCES receipt(id), writer TEXT NOT NULL, thread TEXT NOT NULL, transition TEXT NOT NULL CHECK(transition IN ('start','continue','supersede','migration')), predecessor TEXT, reason TEXT, recorded_at INTEGER NOT NULL)")
+        for column in ('operation_id', 'dispatch_identity'):
+            if column not in {row[1] for row in self.db.execute('PRAGMA table_info(outbound_request)')}:
+                self.db.execute(f'ALTER TABLE outbound_request ADD COLUMN {column} TEXT')
+        self.db.execute('CREATE TABLE IF NOT EXISTS outbound_fence (recipient TEXT NOT NULL, thread TEXT NOT NULL, request_id TEXT NOT NULL REFERENCES outbound_request(id), PRIMARY KEY(recipient,thread))')
+        for row in self.db.execute('SELECT * FROM receipt WHERE id NOT IN (SELECT id FROM outbound_request) ORDER BY updated_at,id').fetchall():
+            message = email.message_from_bytes(row['mime'])
+            self.claim(row['id'], 'retained:' + row['id'], thread_identity(message),
+                       json.loads(row['recipients']), 'migration', None, 'Retained receipt predates writer attribution', row['updated_at'], thread_scopes(message))
+        self.db.commit()
+        return self
+
+    def __exit__(self, *_):
+        self.db.close()
+        os.close(self.lock)
+
+    def get(self, identity):
+        return self.db.execute('SELECT * FROM receipt WHERE id=?', (identity,)).fetchone()
+
+    def claim(self, identity, writer, thread, recipients, transition, predecessor, reason, at, scopes=()):
+        self.db.execute('INSERT INTO outbound_request (id,writer,thread,transition,predecessor,reason,recorded_at) VALUES(?,?,?,?,?,?,?)',
+                        (identity, writer, thread, transition, predecessor, reason, at))
+        for scope in set((thread, *scopes)):
+            for recipient in recipients:
+                self.db.execute('INSERT INTO outbound_fence VALUES(?,?,?) ON CONFLICT(recipient,thread) DO UPDATE SET request_id=excluded.request_id',
+                                (recipient.lower(), scope, identity))
+
+    def admit(self, identity, writer, message, recipients, continuing, superseding, reason):
+        thread = thread_identity(message)
+        existing = self.db.execute('SELECT * FROM outbound_request WHERE id=?', (identity,)).fetchone()
+        if existing is not None:
+            if existing['writer'] != writer and not existing['writer'].startswith('retained:'):
+                return {'ok': False, 'error': 'writer-conflict', 'requestId': identity, 'writer': existing['writer']}
+            stale = [dict(row) for recipient in recipients for scope in thread_scopes(message) for row in self.db.execute(
+                'SELECT request_id,recipient FROM outbound_fence WHERE recipient=? AND thread=? AND request_id<>?', (recipient, scope, identity))]
+            if stale:
+                return {'ok': False, 'error': 'request-superseded', 'requestId': identity, 'fences': stale}
+            return {'ok': True, 'existing': True}
+        heads = [dict(row) for recipient in recipients for scope in thread_scopes(message) for row in self.db.execute(
+            'SELECT f.recipient,f.request_id,r.writer,c.state FROM outbound_fence f JOIN outbound_request r ON r.id=f.request_id JOIN receipt c ON c.id=r.id WHERE f.recipient=? AND f.thread=?', (recipient, scope))]
+        supplied = continuing or superseding
+        predecessors = [supplied] if isinstance(supplied,str) else supplied or []
+        head_ids = {row['request_id'] for row in heads}
+        if heads and head_ids != set(predecessors):
+            return {'ok': False, 'error': 'thread-fenced', 'thread': thread, 'fences': heads,
+                    'message': 'Inspect the latest requests. Continue as the writer or explicitly supersede every current head with a reason; nothing was sent.'}
+        if predecessors and not heads:
+            return {'ok': False, 'error': 'invalid-predecessor', 'requestIds': predecessors}
+        for predecessor in predecessors:
+            prior = self.db.execute('SELECT r.*,c.state FROM outbound_request r JOIN receipt c ON c.id=r.id WHERE r.id=?', (predecessor,)).fetchone()
+            if prior is None:
+                return {'ok': False, 'error': 'invalid-predecessor', 'requestId': predecessor}
+            if continuing and prior['writer'] != writer:
+                return {'ok': False, 'error': 'writer-conflict', 'requestId': predecessor, 'writer': prior['writer']}
+            if continuing and prior['state'] != 'succeeded':
+                return {'ok': False, 'error': 'predecessor-unsettled', 'requestId': predecessor, 'state': prior['state'],
+                        'message': 'Retry the retained request after a known failure, or deliberately supersede with a recovery reason.'}
+        predecessor = predecessor_value(supplied)
+        return {'ok': True, 'existing': False, 'thread': thread,
+                'transition': 'continue' if continuing else 'supersede' if superseding else 'start', 'predecessor': predecessor, 'scopes': thread_scopes(message)}
+
+    def save(self, identity, state, result):
+        self.db.execute('UPDATE receipt SET state=?,result=?,updated_at=? WHERE id=?',
+                        (state, json.dumps(result), int(time.time() * 1000), identity))
+        self.db.commit()
+
+
+def predecessor_value(value):
+    if isinstance(value,list):
+        return value[0] if len(value)==1 else json.dumps(sorted(value), separators=(',',':'))
+    return value
+
+
+def thread_scopes(message):
+    references = re.findall(r'<[^<>\s]+>', message.get('References', ''))
+    parent = re.findall(r'<[^<>\s]+>', message.get('In-Reply-To', ''))
+    subject = str(make_header(decode_header(message.get('Subject', ''))))
+    subject = re.sub(r'^(?:(?:re|fw|fwd):\s*)+', '', subject.strip(), flags=re.I)
+    subject_scope = 'subject:' + ' '.join(subject.casefold().split())
+    return ['message:' + (references or parent)[0], subject_scope] if references or parent else [subject_scope]
+
+
+def thread_identity(message):
+    return thread_scopes(message)[0]
+
+
+def view(row):
+    return {'id': row['id'], 'state': row['state'], 'result': json.loads(row['result']) if row['result'] else None,
+            'updatedAt': row['updated_at']}
+
+
+def dispatch(store, row, account):
+    identity = row['id']
+    connection = None
+    entered_data = False
+    accepted, rejected = [], []
+    try:
+        connection = account.smtp_connection()
+        code, _ = connection.mail(row['sender'])
+        if code != 250:
+            raise smtplib.SMTPSenderRefused(code, b'Sender rejected', row['sender'])
+        for recipient in json.loads(row['recipients']):
+            code, _ = connection.rcpt(recipient)
+            (accepted if code in (250, 251) else rejected).append(recipient)
+        if not accepted:
+            raise smtplib.SMTPRecipientsRefused({address: (550, b'Recipient rejected') for address in rejected})
+        store.save(identity, 'dispatch-entered', {'acceptedEnvelope': accepted, 'rejected': rejected})
+        entered_data = True
+        code, _ = connection.data(row['mime'])
+        if code != 250:
+            raise smtplib.SMTPDataError(code, b'Message rejected')
+        store.save(identity, 'succeeded', {'messageId': email.message_from_bytes(row['mime'])['Message-ID'],
+                                         'accepted': accepted, 'rejected': rejected, 'delivery': 'unconfirmed'})
+    except Exception as error:
+        # Explicit SMTP rejection establishes non-acceptance, including after DATA.
+        rejected_by_smtp = isinstance(error, smtplib.SMTPDataError) and 400 <= error.smtp_code < 600
+        state = 'uncertain' if entered_data and not rejected_by_smtp else 'failed-before-effect'
+        detail = {'error': type(error).__name__, 'retrySameRequest': state == 'failed-before-effect'}
+        if isinstance(error, smtplib.SMTPResponseException):
+            detail['smtpCode'] = error.smtp_code
+        store.save(identity, state, detail)
+    finally:
+        if connection:
+            try:
+                connection.quit()
+            except Exception:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+    if account.sent_copy == 'append' and store.get(identity)['state'] == 'succeeded':
+        stored = json.loads(store.get(identity)['result'])
+        store.save(identity, 'succeeded', {**stored, 'sentCopy': append_sent_copy(account, row['mime'])})
+    result = view(store.get(identity))
+    return {'ok': result['state'] == 'succeeded', 'value': result}
+
+
+def append_sent_copy(account, mime):
+    """Hosted SMTP does not file outgoing mail; the receipt records whether the Sent copy landed."""
+    try:
+        connection = account.imap_connection()
+    except Exception as error:
+        return {'state': 'failed', 'error': type(error).__name__}
+    try:
+        status, folders = connection.list()
+        sent = [line.decode() for line in folders or [] if isinstance(line, bytes) and '\\Sent' in line.decode().split(')')[0]]
+        if status != 'OK' or len(sent) != 1:
+            return {'state': 'failed', 'error': 'sent-folder-not-unique', 'found': len(sent)}
+        name = sent[0].rsplit(' ', 1)[-1]
+        status, _ = connection.append(name, '(\\Seen)', imaplib.Time2Internaldate(time.time()), mime)
+        return {'state': 'appended', 'folder': name.strip('"')} if status == 'OK' else {'state': 'failed', 'error': 'append-refused'}
+    except Exception as error:
+        return {'state': 'failed', 'error': type(error).__name__}
+    finally:
+        try:
+            connection.logout()
+        except Exception:
+            pass
+
+
+def product_ledger():
+    """Owner-user private IPC; the same file lock spans product kernel admission and SMTP."""
+    def emit(result):
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    try:
+        claim = json.loads(sys.stdin.readline())
+        if not isinstance(claim, dict) or any(not isinstance(claim.get(key), str) or not claim[key].strip() for key in ('requestId','writer','operationId','rawMime','sender')):
+            raise ValueError('Invalid claim')
+        raw = base64.b64decode(claim['rawMime'], validate=True)
+        message = email.message_from_bytes(raw)
+        recipients = claim.get('recipients')
+        if not raw or not isinstance(recipients, list) or not recipients or any(not isinstance(item, str) for item in recipients):
+            raise ValueError('Invalid MIME/envelope')
+        envelope = addresses(recipients)
+        sender = addresses([claim['sender']])
+        if len(sender) != 1 or len(envelope) != len(set(recipients)):
+            raise ValueError('Invalid envelope')
+        transition = claim.get('transition')
+        if not isinstance(transition, dict) or transition.get('kind') not in ('start','continue','supersede'):
+            raise ValueError('Invalid transition')
+        kind = transition['kind']
+        after = transition.get('after')
+        reason = transition.get('reason')
+        valid_after = isinstance(after,str) and bool(after.strip())
+        if kind == 'supersede' and isinstance(after,list):
+            valid_after = bool(after) and all(isinstance(value,str) and value.strip() for value in after) and len(set(after))==len(after)
+        if kind != 'start' and not valid_after:
+            raise ValueError('Missing predecessor')
+        if kind == 'supersede' and (not isinstance(reason, str) or not reason.strip()):
+            raise ValueError('Missing reason')
+        expected_keys = {'kind'} if kind == 'start' else {'kind','after'} if kind == 'continue' else {'kind','after','reason'}
+        if set(transition) != expected_keys:
+            raise ValueError('Invalid transition fields')
+        identity = claim['requestId']
+        fingerprint = hashlib.sha256(json.dumps({'sender':sender[0],'recipients':envelope,'rawMime':claim['rawMime'],'writer':claim['writer'],'operationId':claim['operationId'],'transition':transition}, sort_keys=True).encode()).hexdigest()
+        with Receipts() as store:
+            row = store.get(identity)
+            if row is not None and row['fingerprint'] != fingerprint:
+                emit({'ok':False,'error':'identity-conflict','requestId':identity})
+                return 1
+            stored_custody = store.db.execute('SELECT * FROM outbound_request WHERE id=?',(identity,)).fetchone()
+            if row is not None and (stored_custody['writer'] != claim['writer'] or stored_custody['operation_id'] != claim['operationId'] or stored_custody['transition'] != kind or stored_custody['predecessor'] != predecessor_value(after) or stored_custody['reason'] != reason):
+                emit({'ok':False,'error':'identity-conflict','requestId':identity})
+                return 1
+            if row is not None and row['state'] == 'succeeded':
+                emit({'ok':True,'state':'succeeded','value':view(row),'replayed':True})
+                return 0
+            if row is not None and row['state'] in ('dispatch-entered','uncertain'):
+                emit({'ok':False,'error':'outcome-uncertain','value':view(row)})
+                return 1
+            if row is not None and row['state'] not in ('prepared','failed-before-effect'):
+                emit({'ok':False,'error':'invalid-receipt-state','value':view(row)})
+                return 1
+            admitted = store.admit(identity, claim['writer'], message, envelope, after if kind == 'continue' else None, after if kind == 'supersede' else None, reason)
+            if not admitted['ok']:
+                emit(admitted)
+                return 1
+            if row is None:
+                at = int(time.time()*1000)
+                store.db.execute('INSERT INTO receipt VALUES(?,?,?,?,?,?,?,?)', (identity,fingerprint,'prepared',raw,sender[0],json.dumps(envelope),None,at))
+                store.claim(identity,claim['writer'],admitted['thread'],envelope,admitted['transition'],admitted['predecessor'],reason,at,admitted['scopes'])
+            store.db.execute('UPDATE outbound_request SET operation_id=? WHERE id=?', (claim['operationId'], identity))
+            store.save(identity,'prepared',{'transport':'mail_send','operationId':claim['operationId']})
+            emit({'ok':True,'state':'ready','requestId':identity})
+            entered = False
+            settled = False
+            try:
+                action = json.loads(sys.stdin.readline())
+                if action.get('action') == 'abort':
+                    if not isinstance(action.get('result'),dict):
+                        raise ValueError('Abort result required')
+                    store.save(identity,'failed-before-effect',action['result'])
+                    emit({'ok':False,'value':view(store.get(identity))})
+                    return 1
+                if action.get('action') != 'enter' or not isinstance(action.get('dispatchIdentity'),dict) or not action['dispatchIdentity']:
+                    raise ValueError('Dispatch identity required')
+                store.db.execute('UPDATE outbound_request SET dispatch_identity=? WHERE id=?',(json.dumps(action['dispatchIdentity'],sort_keys=True),identity))
+                store.save(identity,'dispatch-entered',{'stage':'product-dispatch-entered'})
+                entered = True
+                emit({'ok':True,'state':'entered','requestId':identity})
+                outcome = json.loads(sys.stdin.readline())
+                if outcome.get('action') != 'finish' or outcome.get('state') not in ('succeeded','failed-before-effect','uncertain') or not isinstance(outcome.get('result'),dict):
+                    raise ValueError('Typed outcome required')
+                store.save(identity,outcome['state'],outcome['result'])
+                settled = True
+                emit({'ok':outcome['state']=='succeeded','value':view(store.get(identity))})
+                return 0 if outcome['state']=='succeeded' else 1
+            except (ValueError, TypeError, AttributeError, BrokenPipeError):
+                if not settled:
+                    store.save(identity,'uncertain' if entered else 'failed-before-effect',{'stage':'product-ledger-custody-lost','entered':entered})
+                return 1
+    except (ValueError, TypeError, AttributeError, OSError, sqlite3.Error):
+        emit({'ok':False,'error':'invalid-product-ledger-claim'})
+        return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--to', action='append', default=[])
+    parser.add_argument('--cc', action='append', default=[])
+    parser.add_argument('--subject')
+    parser.add_argument('--body-file')
+    parser.add_argument('--from-name', default='Kenan')
+    parser.add_argument('--from-addr', help='Sender address; validated against the Proton account. Replies without it use the address of ours the replied-to message reached; anything else is a sender-required error')
+    parser.add_argument('--reply-to', metavar='FOLDER/UIDVALIDITY:UID',
+                        help='UID from mail-search; bare UID accepted, historical sequence numbers are not UIDs')
+    parser.add_argument('--attach', action='append', default=[])
+    parser.add_argument('--send', action='store_true')
+    parser.add_argument('--canonical-intent', '--intent-key', dest='intent_key')
+    parser.add_argument('--request-id', help='Stable identity for this exact message; reuse after a known pre-DATA failure')
+    parser.add_argument('--product-ledger', action='store_true', help='Private owner-user product SMTP custody IPC')
+    parser.add_argument('--writer-id', help='Owning conversation ID; required for new SMTP dispatch')
+    transition = parser.add_mutually_exclusive_group()
+    transition.add_argument('--continue-after', metavar='REQUEST_ID', help='Same-writer next message after this successful request')
+    transition.add_argument('--supersede', action='append', metavar='REQUEST_ID', help='Deliberate writer takeover or uncertain-effect recovery')
+    parser.add_argument('--reason', help='Required evidence/reason for supersession; retained in private ledger')
+    parser.add_argument('--inspect-ledger', action='store_true', help='Inspect private outbound writer/fence history without credentials')
+    parser.add_argument('--inspect-action', '--inspect-receipt', dest='inspect_action')
+    for flag in ('--prior-action', '--prior-revision', '--prior-resolution'):
+        parser.add_argument(flag, help='Retained CLI compatibility; local receipts do not require prior contact approval')
+    args = parser.parse_args(argv)
+    if args.product_ledger:
+        return product_ledger()
+    if args.inspect_ledger:
+        with Receipts() as store:
+            result = {'ok': True, 'value': [dict(row) for row in store.db.execute('SELECT r.*,c.state,c.updated_at FROM outbound_request r JOIN receipt c ON c.id=r.id ORDER BY r.recorded_at,r.id')],
+                      'fences': [dict(row) for row in store.db.execute('SELECT * FROM outbound_fence ORDER BY thread,recipient')]}
+    elif args.inspect_action:
+        with Receipts() as store:
+            row = store.get(args.inspect_action)
+            result = {'ok': row is not None, 'value': view(row) if row else None}
+    else:
+        if not args.body_file:
+            parser.error('--body-file is required unless inspecting a receipt')
+        account = load_account()
+        message, fingerprint, sender, basis, envelope = compose(args, account)
+        print(f'# from: {sender} ({basis})', file=sys.stderr)
+        if not args.send:
+            if args.attach:
+                print(f"To: {message['To']}\nCc: {message.get('Cc', '')}\nSubject: {message['Subject']}\n")
+                print(read_body(args.body_file))
+                for part in message.iter_attachments():
+                    print(f'# attachment: {part.get_filename()} ({part.get_content_type()}, {len(part.get_payload(decode=True))} bytes)')
+            else:
+                print(message.as_string())
+            print('# not sent (pass --send)', file=sys.stderr)
+            return 0
+        if not args.request_id or not args.writer_id or not args.writer_id.strip():
+            parser.error('--send requires --request-id and --writer-id')
+        if args.supersede and (not args.reason or not args.reason.strip()):
+            parser.error('--supersede requires --reason explaining continuation/recovery over delay')
+        if args.reason and not args.supersede:
+            parser.error('--reason requires --supersede')
+        identity = args.request_id
+        with Receipts() as store:
+            row = store.get(identity)
+            if row is not None and row['fingerprint'] != fingerprint:
+                result = {'ok': False, 'error': 'identity-conflict', 'requestId': identity, 'message': 'Request identity already belongs to different mail'}
+            elif row is not None and row['state'] == 'succeeded':
+                result = {'ok': True, 'value': view(row), 'replayed': True}
+            elif row is not None and row['state'] in ('dispatch-entered', 'uncertain'):
+                result = {'ok': False, 'error': 'outcome-uncertain', 'value': view(row), 'message': 'SMTP acceptance is unknown. Inspect the original message before deciding on a new request; nothing was resent.'}
+            else:
+                admission = store.admit(identity, args.writer_id, message, envelope, args.continue_after, args.supersede, args.reason)
+                if not admission['ok']:
+                    result = admission
+                elif row is not None and row['state'] not in ('prepared', 'failed-before-effect'):
+                    result = {'ok': False, 'error': 'invalid-receipt-state', 'requestId': identity, 'state': row['state']}
+                else:
+                    if row is None:
+                        at = int(time.time() * 1000)
+                        store.db.execute('INSERT INTO receipt VALUES(?,?,?,?,?,?,?,?)',
+                                         (identity, fingerprint, 'prepared', message.as_bytes(), sender, json.dumps(envelope), None, at))
+                        store.claim(identity, args.writer_id, admission['thread'], envelope, admission['transition'], admission['predecessor'], args.reason, at, admission['scopes'])
+                        store.db.commit()
+                        row = store.get(identity)
+                    result = dispatch(store, row, account)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result['ok'] else 2
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (MailIdentityError, SenderError) as error:
+        print(json.dumps({'ok': False, 'error': error.code, 'message': str(error)}), file=sys.stderr)
+        sys.exit(2)
+    except Exception as error:
+        # Credential/provider exception strings may contain private server text.
+        print(json.dumps({'ok': False, 'error': 'mail-command-failed', 'failureType': type(error).__name__}), file=sys.stderr)
+        sys.exit(2)

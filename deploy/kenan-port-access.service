@@ -1,0 +1,13 @@
+[Unit]
+Description=Reserve Kenan loopback listeners for their owners
+Before=kenan-model-broker.service code-server.service
+After=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/kenan-port-access
+ExecReload=/usr/local/sbin/kenan-port-access
+
+[Install]
+WantedBy=multi-user.target

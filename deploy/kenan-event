@@ -1,0 +1,36 @@
+#!/bin/bash
+# kenan-event [--uid UID] [--id ID] TOPIC < JSON
+# Queues a host event in the durable inbox of the person whose /var/lib/kenan/events/PERSON directory the uid owns
+# (default: the caller's). The Kenan channel hosting that person's manager records it, now or when it next starts, and
+# fires that person's agents' `wake on: "event"` wakes whose topic matches (exact, or a prefix ending in *), carrying
+# the JSON body. --id is the idempotency key: a second event with the same id for the same person is recorded once
+# (default: a fresh random id). Prints the queued file.
+set -euo pipefail
+uid=$(id -u) id=
+while [[ ${1-} == --* ]]; do
+ case $1 in
+  --uid) uid=${2:?--uid needs a uid}; shift 2;;
+  --id) id=${2:?--id needs an id}; shift 2;;
+  *) echo "event_invalid: unknown option $1" >&2; exit 2;;
+ esac
+done
+(( $# == 1 )) || { echo 'usage: kenan-event [--uid UID] [--id ID] TOPIC < JSON' >&2; exit 2; }
+topic=$1
+[[ $topic =~ ^[A-Za-z0-9._:@/-]{1,200}$ ]] || { echo "event_invalid: topic must be 1-200 of A-Z a-z 0-9 . _ : @ / -, got '$topic'" >&2; exit 2; }
+[[ -n $id ]] || id=$(cat /proc/sys/kernel/random/uuid)
+(( ${#id} <= 200 )) || { echo 'event_invalid: id is longer than 200 characters' >&2; exit 2; }
+body=$(cat)
+jq -e . >/dev/null 2>&1 <<<"$body" || { echo 'event_invalid: stdin is not one JSON value' >&2; exit 2; }
+for dir in /var/lib/kenan/events/*/; do
+ [[ -d $dir && $(stat -c %u "$dir") == "$uid" ]] || continue
+ tmp=$(mktemp -p "$dir" .enqueue.XXXXXX)
+ trap 'rm -f "$tmp"' EXIT
+ jq -c --arg topic "$topic" --arg id "$id" '{topic: $topic, id: $id, body: .}' <<<"$body" >"$tmp"
+ file="$dir$(date +%s%N)-$$.json"
+ mv "$tmp" "$file"
+ trap - EXIT
+ echo "$file"
+ exit 0
+done
+echo "event_unqueued: no event inbox in /var/lib/kenan/events is owned by uid $uid" >&2
+exit 1

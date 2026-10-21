@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext", "moduleResolution": "NodeNext", "lib": ["ES2023"], "types": ["node"],
+    "noEmit": false, "outDir": "dist", "rootDir": ".", "sourceMap": true, "jsx": "preserve"
+  },
+  "include": ["server/**/*.ts", "shared/**/*.ts", "bench/**/*.ts"]
+}

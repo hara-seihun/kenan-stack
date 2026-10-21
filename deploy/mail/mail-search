@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Read-only IMAP search over the Proton Bridge mailbox.
+
+Never mutates: mailboxes are opened with EXAMINE (readonly) and bodies fetched
+with BODY.PEEK so no \\Seen flag is set. Credentials come from Proton Pass at
+runtime and are never printed.
+"""
+import imaplib, json, ssl, subprocess, sys, email, os, re
+from email.header import decode_header, make_header
+from html.parser import HTMLParser
+# Keep direct SourceFileLoader callers working through the retained main symlink.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from mail_identity import MailIdentityError, fetch_message, load_account, parse_reference, uidvalidity
+
+
+def criteria_error(message):
+    raise MailIdentityError("invalid-criteria", message)
+
+
+def expression_tokens(expression):
+    tokens = []
+    i = 0
+    while i < len(expression):
+        c = expression[i]
+        if c.isspace():
+            i += 1
+        elif c in "()":
+            tokens.append((c, False))
+            i += 1
+        elif c == '"':
+            i += 1
+            value = ""
+            while i < len(expression) and expression[i] != '"':
+                if expression[i] == "\\":
+                    i += 1
+                    if i == len(expression) or expression[i] not in '\\"':
+                        criteria_error("quoted strings escape only quotes and backslashes")
+                value += expression[i]
+                i += 1
+            if i == len(expression):
+                criteria_error("unterminated quoted string")
+            tokens.append((value, True))
+            i += 1
+            if i < len(expression) and not expression[i].isspace() and expression[i] != ')':
+                criteria_error("missing separator after quoted string")
+        else:
+            end = i
+            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()"':
+                end += 1
+            tokens.append((expression[i:end], False))
+            i = end
+    return tokens
+
+
+def search_criteria(arguments):
+    """Return (one IMAP expression, conjunctive local Unicode header filters).
+
+    --criteria EXPR and a single-expression argument use IMAP lexical syntax.
+    Otherwise each CLI argument is one key/value/parenthesis token; string values
+    retain their shell boundaries. Both forms share the RFC3501 grammar.
+    """
+    if any(any(ord(c) < 32 or ord(c) == 127 for c in arg) for arg in arguments):
+        criteria_error("control characters are forbidden")
+    if sum(map(len, arguments)) > 65536:
+        criteria_error("criteria exceed 64 KiB")
+    if arguments and arguments[0] == "--criteria":
+        if len(arguments) != 2 or not arguments[1].strip():
+            criteria_error("--criteria requires exactly one nonempty IMAP expression")
+        tokens = expression_tokens(arguments[1])
+    elif len(arguments) == 1:
+        if not arguments[0].strip():
+            criteria_error("empty expression")
+        tokens = expression_tokens(arguments[0])
+    else:
+        tokens = [(arg, False) for arg in arguments]
+    if not tokens:
+        return "ALL", []
+    index = 0
+    filters = []
+    flags = set("ALL ANSWERED DELETED DRAFT FLAGGED NEW OLD RECENT SEEN UNANSWERED UNDELETED UNDRAFT UNFLAGGED UNSEEN".split())
+    strings = set("BCC BODY CC FROM SUBJECT TEXT TO".split())
+    dates = set("BEFORE ON SENTBEFORE SENTON SENTSINCE SINCE".split())
+
+    def take():
+        nonlocal index
+        if index == len(tokens):
+            criteria_error("missing search operand")
+        token = tokens[index]
+        index += 1
+        return token
+
+    def value():
+        text, quoted = take()
+        if not quoted and text in {"(", ")"}:
+            criteria_error("expected string operand")
+        return text
+
+    def quote(text):
+        if not text.isascii():
+            criteria_error("non-ASCII value requires conjunctive SUBJECT, FROM or TO")
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def key(depth=0, boolean=False):
+        if depth > 64:
+            criteria_error("criteria nesting exceeds 64")
+        text, quoted = take()
+        if quoted:
+            criteria_error("a quoted string cannot be a search key")
+        name = text.upper()
+        if name == "(":
+            parts = []
+            while index < len(tokens) and tokens[index] != (")", False):
+                parts.append(key(depth + 1, boolean))
+            if not parts or index == len(tokens):
+                criteria_error("empty or unclosed group")
+            take()
+            return "(" + " ".join(parts) + ")"
+        if name in {"OR", "NOT"}:
+            children = [key(depth + 1, True) for _ in range(2 if name == "OR" else 1)]
+            return name + " " + " ".join(children)
+        if name in flags:
+            return name
+        if name in strings:
+            text = value()
+            if not text.isascii() and name in {"SUBJECT", "FROM", "TO"}:
+                if boolean:
+                    criteria_error("Unicode header predicates under OR/NOT are unsupported; semantics would change")
+                filters.append((name, text.casefold()))
+                return "ALL"
+            return name + " " + quote(text)
+        if name == "HEADER":
+            field, text = value(), value()
+            if not re.fullmatch(r"[!-9;-~]+", field):
+                criteria_error("invalid HEADER field name")
+            return name + " " + quote(field) + " " + quote(text)
+        if name in dates:
+            text = value()
+            if not re.fullmatch(r"[0-9]{1,2}-[A-Za-z]{3}-[0-9]{4}", text):
+                criteria_error("date must be DD-Mon-YYYY")
+            return name + " " + text
+        if name in {"LARGER", "SMALLER"}:
+            text = value()
+            if not re.fullmatch(r"[0-9]+", text):
+                criteria_error("size must be a nonnegative integer")
+            return name + " " + text
+        if name in {"KEYWORD", "UNKEYWORD"}:
+            text = value()
+            if not re.fullmatch(r'[^(){} %*"\\\]\x00-\x20\x7f-\uffff]+', text):
+                criteria_error("keyword must be an IMAP atom")
+            return name + " " + text
+        sequence = value() if name == "UID" else text
+        if re.fullmatch(r"(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?(?:,(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?)*", sequence):
+            return ("UID " if name == "UID" else "") + sequence
+        criteria_error("unknown search key or invalid operand")
+
+    parts = []
+    while index < len(tokens):
+        parts.append(key())
+    return " ".join(parts), filters
+
+
+class HTMLText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+        self.hidden = 0
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and not self.hidden:
+            href = dict(attrs).get("href") or ""
+            self.links.append(href if href.startswith(("http://", "https://")) else "")
+        if tag in {"style", "script", "head"}:
+            self.hidden += 1
+        elif tag in {"p", "div", "br", "tr", "li"} and not self.hidden:
+            self.text.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and not self.hidden and self.links:
+            href = self.links.pop()
+            if href:
+                self.text.append(f" <{href}>")
+        if tag in {"style", "script", "head"}:
+            self.hidden = max(0, self.hidden - 1)
+        elif tag in {"p", "div", "tr", "li"} and not self.hidden:
+            self.text.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+
+
+def connect():
+    return load_account().imap_connection()
+
+
+def dec(s):
+    try:
+        return str(make_header(decode_header(s or "")))
+    except Exception:
+        return s or ""
+
+
+def body(msg):
+    """Plain text for both single-part and multipart mail, excluding attachments."""
+    parts = [p for p in msg.walk() if not p.is_multipart()
+             and p.get_content_disposition() != "attachment"]
+    for content_type in ("text/plain", "text/html"):
+        for part in parts:
+            if part.get_content_type() != content_type:
+                continue
+            text = (part.get_payload(decode=True) or b"").decode(
+                part.get_content_charset() or "utf-8", "replace")
+            if content_type == "text/html":
+                parser = HTMLText()
+                parser.feed(text)
+                text = "\n".join(line.strip() for line in "".join(parser.text).splitlines()
+                                 if line.strip())
+            return text
+    return ""
+
+
+class Attachment:
+    def __init__(self, index, filename, content_type, content):
+        self.index = index
+        self.filename = filename
+        self.content_type = content_type
+        self.content = content
+
+
+def safe_filename(name, index):
+    """A single path component: no separators, controls or leading dots; never empty."""
+    name = re.sub(r'[\x00-\x1f\x7f/\\]', '_', name.replace('\r', ' ').replace('\n', ' ')).strip()
+    name = name.lstrip('.').strip()
+    if len(name.encode()) > 200:
+        stem, dot, ext = name.rpartition('.')
+        ext = dot + ext if dot and len(ext) <= 16 else ''
+        name = (stem if dot else name).encode()[:200 - len(ext.encode())].decode('utf-8', 'ignore') + ext
+    return name or f'attachment-{index}'
+
+
+def attachments(msg):
+    """Parts a mail client shows as attachments, in MIME order, with unique safe filenames.
+
+    A part is an attachment when it has Content-Disposition: attachment or a filename and is
+    not the text body; attached messages (message/rfc822) are kept whole as .eml files.
+    """
+    found = []
+
+    def visit(part):
+        disposition = part.get_content_disposition()
+        raw_name = part.get_filename()
+        name = dec(raw_name) if raw_name else None
+        if part.get_content_type() == 'message/rfc822' and (disposition == 'attachment' or name):
+            inner = part.get_payload()
+            content = inner[0].as_bytes() if isinstance(inner, list) and inner else (part.get_payload(decode=True) or b'')
+            subject = dec(inner[0].get('Subject')) if isinstance(inner, list) and inner else ''
+            found.append((name or ((subject or 'message') + '.eml'), 'message/rfc822', content))
+            return
+        if part.is_multipart():
+            for child in part.get_payload():
+                visit(child)
+            return
+        if disposition == 'attachment' or name:
+            found.append((name or '', part.get_content_type(), part.get_payload(decode=True) or b''))
+
+    visit(msg)
+    result, used = [], set()
+    for index, (name, content_type, content) in enumerate(found, 1):
+        filename = safe_filename(name, index)
+        stem, dot, ext = filename.rpartition('.')
+        candidate, n = filename, 2
+        while candidate.casefold() in used:
+            candidate = f'{stem} ({n}).{ext}' if dot and stem else f'{filename} ({n})'
+            n += 1
+        used.add(candidate.casefold())
+        result.append(Attachment(index, candidate, content_type, content))
+    return result
+
+
+def save_attachments(found, directory):
+    """Write each attachment into directory; returns absolute paths.
+
+    Never overwrites: an existing file with identical bytes is reused, a different one is
+    an output-exists error raised before anything is written.
+    """
+    directory = os.path.realpath(directory)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as error:
+        raise MailIdentityError('output-unwritable', f'cannot create {directory}: {error.strerror}') from error
+    plan = []
+    for item in found:
+        path = os.path.join(directory, item.filename)
+        if os.path.lexists(path):
+            if not os.path.isfile(path) or os.path.islink(path):
+                raise MailIdentityError('output-exists', f'{path} exists and is not a regular file')
+            with open(path, 'rb') as existing:
+                if existing.read() != item.content:
+                    raise MailIdentityError('output-exists', f'{path} exists with different content')
+            plan.append((path, item, False))
+        else:
+            plan.append((path, item, True))
+    for path, item, write in plan:
+        if write:
+            try:
+                with open(path, 'xb') as out:
+                    out.write(item.content)
+            except OSError as error:
+                raise MailIdentityError('output-unwritable', f'cannot write {path}: {error.strerror}') from error
+    return [(path, item) for path, item, _ in plan]
+
+
+def usage(status=0):
+    stream = sys.stdout if status == 0 else sys.stderr
+    print("""Usage: mail-search folders
+       mail-search search FOLDER [IMAP-CRITERIA ...]
+       mail-search read FOLDER UID-REFERENCE [UID-REFERENCE ...]
+       mail-search attachments FOLDER UID-REFERENCE --out DIR
+
+Search and read Proton Mail through the local Bridge without changing message
+flags. References are UID or UIDVALIDITY:UID (never sequence numbers).
+Search stdout is TSV: UID, date, from, subject, UIDVALIDITY:UID, Message-ID.
+Use --criteria for one IMAP expression (nested OR/NOT/groups supported), or
+separate KEY VALUE arguments, or one argument holding a whole expression.
+String values are escaped by grammar position; expressions are never quoted
+as values. Non-ASCII SUBJECT/FROM/TO conjunctions are filtered locally;
+Unicode inside OR/NOT is an explicit invalid-criteria error.
+Read ends with an Attachments section (name, type, decoded bytes).
+Attachments saves every attachment of one message into DIR (created if
+missing, never overwritten) and prints TSV: path, bytes, type, filename.
+A message without attachments is a no-attachments error.""", file=stream)
+    raise SystemExit(status)
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        usage()
+    if len(sys.argv) < 2:
+        usage(64)
+    mode = sys.argv[1]
+    if mode == "folders":
+        if len(sys.argv) != 2:
+            usage(64)
+    elif mode == "read":
+        if len(sys.argv) < 4:
+            usage(64)
+    elif mode == "search":
+        if len(sys.argv) < 3:
+            usage(64)
+    elif mode == "attachments":
+        if len(sys.argv) != 6 or sys.argv[4] != "--out" or not sys.argv[5]:
+            usage(64)
+        parse_reference(sys.argv[3])
+    else:
+        usage(64)
+
+    plan = search_criteria(sys.argv[3:]) if mode == "search" else None
+    m = connect()
+    if mode == "folders":
+        for f in m.list()[1]:
+            print(f.decode())
+        return
+    box = sys.argv[2]
+    # Python 3.14 imaplib no longer quotes mailbox names; "All Mail" must be quoted.
+    qbox = box if box.startswith('"') else '"' + box.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    try:
+        typ, _ = m.select(qbox, readonly=True)
+    except imaplib.IMAP4.error as error:
+        raise MailIdentityError("folder-missing", f"cannot EXAMINE {box}") from error
+    if typ != "OK":
+        raise MailIdentityError("folder-missing", f"cannot EXAMINE {box}")
+    validity = uidvalidity(m)
+    if mode == "read":
+        for reference in sys.argv[3:]:
+            content = fetch_message(m, reference, validity, "BODY.PEEK[]")
+            msg = email.message_from_bytes(content)
+            uid = reference.split(":")[-1]
+            print(f"===== {validity}:{uid}\tFrom: {dec(msg.get('From'))}\tDate: {msg.get('Date','')}")
+            print(f"Message-ID: {msg.get('Message-ID', '')}")
+            print(f"To: {dec(msg.get('To'))}")
+            print(f"Subject: {dec(msg.get('Subject'))}\n")
+            print(body(msg))
+            found = attachments(msg)
+            if found:
+                print(f"\nAttachments ({len(found)}):")
+                for item in found:
+                    print(f"- {item.filename}\t{item.content_type}\t{len(item.content)} bytes")
+        m.logout()
+        return
+    if mode == "attachments":
+        reference = sys.argv[3]
+        content = fetch_message(m, reference, validity, "BODY.PEEK[]")
+        m.logout()
+        found = attachments(email.message_from_bytes(content))
+        if not found:
+            raise MailIdentityError("no-attachments", f"Message {validity}:{reference.split(':')[-1]} has no attachments")
+        saved = save_attachments(found, sys.argv[5])
+        print(f"# {box} {validity}:{reference.split(':')[-1]}: {len(saved)} attachments; columns=path,bytes,type,filename", file=sys.stderr)
+        for path, item in saved:
+            print(f"{path}\t{len(item.content)}\t{item.content_type}\t{item.filename}")
+        return
+    crit, header_filters = plan
+    try:
+        typ, data = m.uid("SEARCH", None, crit)
+    except imaplib.IMAP4.error as error:
+        raise MailIdentityError("search-rejected", "server rejected UID SEARCH criteria") from error
+    if typ != "OK" or not data or not isinstance(data[0], bytes):
+        raise MailIdentityError("search-failed", "UID SEARCH failed")
+    ids = data[0].split()
+    rows = []
+    for msg_id in ids[-400:]:
+        try:
+            content = fetch_message(m, msg_id.decode(), validity,
+                                    "BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT MESSAGE-ID)]")
+        except MailIdentityError as error:
+            if error.code != "message-missing":
+                raise
+            print(f"# {error}", file=sys.stderr)
+            continue
+        h = email.message_from_bytes(content)
+        fields = {name: dec(h.get(name.title())) for name in ("SUBJECT", "FROM", "TO")}
+        if any(value not in fields[key].casefold() for key, value in header_filters):
+            continue
+        rows.append((msg_id, h, fields))
+    print(f"# {box}: {len(rows)} hits for {crit!r}; identity=IMAP-UID UIDVALIDITY={validity}; columns=UID,date,from,subject,UIDVALIDITY:UID,Message-ID", file=sys.stderr)
+    for msg_id, h, fields in rows:
+        row = [msg_id.decode(), h.get('Date', ''), fields['FROM'], fields['SUBJECT'],
+               f"{validity}:{msg_id.decode()}", h.get('Message-ID', '')]
+        print("\t".join(str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ") for value in row))
+    m.logout()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except MailIdentityError as error:
+        raise SystemExit(str(error))

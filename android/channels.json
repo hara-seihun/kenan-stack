@@ -1,0 +1,16 @@
+{
+  "production": {
+    "label": "Kenan",
+    "androidPackage": "com.example.kenan.piremote.kenan",
+    "apkStem": "kenan",
+    "gatewayOrigin": "https://kenan.example.com",
+    "signerCertificateSha256": "a9a1d86727f7e5adfc6047eac193154575df0654066f648b2ebaba1b122ec69d"
+  },
+  "beta": {
+    "label": "Kenan Beta",
+    "androidPackage": "com.example.kenan.android",
+    "apkStem": "kenan-beta",
+    "gatewayOrigin": "https://beta.kenan.example.com",
+    "signerCertificateSha256": "4466f84dde2b15db98568e8a2b7ff10531c54b8f83c63f7197f08f0507658722"
+  }
+}

@@ -1,0 +1,82 @@
+#!/bin/bash
+# Root operations for household operators who aren't administrators (the kenan-operators group; machine/user-access.md).
+# Installed root-owned at /usr/local/sbin/kenan-operator by deploy/operator/install.sh; sudoers admits exactly this program.
+# Everything it runs as root comes from root-owned code or from commits already pushed to the shared repository.
+set -euo pipefail
+repo=/home/kenan/work/repos/kenan.git
+usage() {
+ cat >&2 <<'EOF'
+Usage: sudo kenan-operator COMMAND ...
+  deploy beta|production forward|rollback COMMIT
+      Deploy a commit pushed to /home/kenan/work/repos/kenan.git (deploy/deploy.sh calls this for you).
+  systemctl start|stop|restart|reload|try-restart|reset-failed|enable|disable|status UNIT...
+      Kenan units only (names starting with "kenan").
+  systemctl daemon-reload
+  apt update
+  apt install|reinstall|remove PACKAGE...
+      Ubuntu archive packages by name (optionally NAME=VERSION).
+EOF
+ exit 64
+}
+fail() { echo "$1: $2" >&2; exit "${3:-1}"; }
+(( EUID == 0 )) || fail operator_not_root 'run through sudo: sudo kenan-operator ...' 77
+(( $# >= 1 )) || usage
+command=$1; shift
+
+case $command in
+ deploy)
+  (( $# == 3 )) || usage
+  channel=$1 mode=$2 commit=$3
+  [[ $channel == beta || $channel == production ]] || fail operator_usage "channel must be beta or production, got $channel" 64
+  [[ $mode == forward || $mode == rollback ]] || fail operator_usage "mode must be forward or rollback, got $mode" 64
+  [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail operator_usage "commit must be a full 40-hex commit id, got $commit" 64
+  shared() { GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$repo" "$@"; }
+  shared cat-file -e "$commit^{commit}" 2>/dev/null || fail deploy_commit_unpublished "${commit:0:8} is not in $repo; push it first" 5
+  [[ -n $(shared for-each-ref --count=1 --contains "$commit" refs/heads) ]] || fail deploy_commit_unpublished "${commit:0:8} is not on any branch of $repo; push it first" 5
+  running=$(systemctl list-units --plain --no-legend --state=activating,active "kenan-deploy-$channel-*" | awk '{print $1}')
+  [[ -z $running ]] || fail deploy_in_progress "$running is still deploying $channel; inspect it with journalctl -u ${running%% *}" 75
+  # One root-owned checkout per channel keeps node_modules between deploys; the detached deploy unit builds from it.
+  checkout=/var/lib/kenan/operator-deploy/$channel
+  if [[ ! -d $checkout/.git ]]; then
+   install -d -m 0755 /var/lib/kenan/operator-deploy
+   git -c safe.directory='*' clone --quiet --no-checkout "$repo" "$checkout"
+  fi
+  git -c safe.directory='*' -C "$checkout" fetch --quiet origin
+  git -c safe.directory='*' -C "$checkout" checkout --quiet --force --detach "$commit"
+  git -c safe.directory='*' -C "$checkout" clean -fdxq -e node_modules
+  cd "$checkout"
+  if [[ $mode == rollback ]]; then exec /bin/bash deploy/deploy.sh "$channel" --rollback; fi
+  exec /bin/bash deploy/deploy.sh "$channel"
+  ;;
+ systemctl)
+  (( $# >= 1 )) || usage
+  verb=$1; shift
+  case $verb in
+   daemon-reload) (( $# == 0 )) || usage; exec systemctl daemon-reload;;
+   start|stop|restart|reload|try-restart|reset-failed|enable|disable|status) ;;
+   *) fail operator_usage "systemctl verb $verb is not one of start stop restart reload try-restart reset-failed enable disable status daemon-reload" 64;;
+  esac
+  (( $# >= 1 )) || usage
+  for unit in "$@"; do
+   [[ $unit =~ ^kenan[A-Za-z0-9@_.:-]*$ ]] || fail operator_unit_refused "$unit: only units whose names start with kenan" 77
+  done
+  exec systemctl --no-pager "$verb" -- "$@"
+  ;;
+ apt)
+  (( $# >= 1 )) || usage
+  verb=$1; shift
+  export DEBIAN_FRONTEND=noninteractive
+  case $verb in
+   update) (( $# == 0 )) || usage; exec apt-get update;;
+   install|reinstall|remove) ;;
+   *) fail operator_usage "apt verb $verb is not one of update install reinstall remove" 64;;
+  esac
+  (( $# >= 1 )) || usage
+  for package in "$@"; do
+   [[ $package =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?(=[A-Za-z0-9.+:~-]+)?$ ]] || fail operator_package_refused "$package: a package name from the configured archives (no paths or options)" 77
+  done
+  exec apt-get -y "$verb" -- "$@"
+  ;;
+ -h|--help|help) usage;;
+ *) fail operator_usage "unknown command $command" 64;;
+esac

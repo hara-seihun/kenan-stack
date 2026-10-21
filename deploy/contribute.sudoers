@@ -1,0 +1,2 @@
+# Submit-only queue helper, run as the stack owner. Add one line per registered developer.
+# DEVELOPER ALL=(kenan) NOPASSWD: /usr/local/bin/kenan-stack-contribute *

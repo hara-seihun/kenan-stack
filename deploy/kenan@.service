@@ -1,0 +1,23 @@
+[Unit]
+Description=Kenan rewrite %i
+# Wants, not Requires: a failed postgres start must not make the app's start job fail for good (2026-10-19, acme-host
+# stayed down 21:15-23:47Z after postgres recovered). The app retries until postgres answers, and postgres pulls it in.
+Wants=kenan-postgres.service
+After=kenan-postgres.service network.target kenan@%i.socket
+# The channel's socket (kenan@.socket) is held by systemd and passed in, so restarts never refuse a request.
+Requires=kenan@%i.socket
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+WorkingDirectory=/srv/kenan/%i
+ExecStart=/usr/local/bin/node /srv/kenan/%i/dist/server/main.js /etc/kenan/%i.json
+Restart=always
+RestartSec=2
+RestartSteps=8
+RestartMaxDelaySec=60
+RuntimeDirectory=kenan
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+[Install]
+WantedBy=multi-user.target kenan-postgres.service

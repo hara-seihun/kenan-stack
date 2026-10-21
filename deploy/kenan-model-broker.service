@@ -1,0 +1,23 @@
+[Unit]
+Description=Kenan subscription model broker
+After=network-online.target kenan-port-access.service
+Wants=kenan-port-access.service
+Wants=network-online.target
+
+[Service]
+User=kenan
+Group=kenan
+WorkingDirectory=/home/kenan
+Environment=HOME=/home/kenan
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/usr/local/bin/node /srv/kenan/broker/current/dist/cli.js model-broker /etc/kenan/model-broker.json
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=30min
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

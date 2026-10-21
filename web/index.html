@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/><meta name="theme-color" content="#000000"/><meta name="description" content="Kenan — conversations and work"/><link rel="icon" href="/app-icon.svg"/><link rel="manifest" href="/manifest.webmanifest"/><link rel="apple-touch-icon" href="/apple-touch-icon.png"/><meta name="apple-mobile-web-app-capable" content="yes"/><meta name="apple-mobile-web-app-title" content="Kenan"/><meta name="apple-mobile-web-app-status-bar-style" content="black"/><title>Kenan</title>
+<script>
+// Open the event stream now, while the app's script downloads: its first event is the startup snapshot.
+// The app adopts it (web/events.ts) and replays what arrived before it loaded.
+(function () {
+  var link = new URLSearchParams(location.search).get('conversationId'), open = link || localStorage.getItem('kenan-open');
+  var base = location.pathname.indexOf('/pi-stack/') === 0 ? '/pi-stack' : '';
+  var source = new EventSource(base + '/api/events' + (open ? '?open=' + encodeURIComponent(open) : ''));
+  var early = window.__kenanStream = { source: source, events: [] };
+  ['ready', 'unauthenticated', 'message', 'delta', 'conversation', 'activity', 'agent', 'goal', 'heartbeat'].forEach(function (type) {
+    source.addEventListener(type, function (event) { if (early.events) early.events.push(event); });
+  });
+})();
+</script>
+</head><body><div id="root"><main class="login">Opening Kenan…</main></div><script type="module" src="/main.tsx"></script></body></html>
