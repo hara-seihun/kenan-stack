@@ -2992,6 +2992,10 @@ function createWorkspace(database, args, statePath) {
       return;
     }
     if (job.state === "failed") {
+      if(job.error.code==="checkout-cessation-unknown") {
+        const repair=command(process.execPath,[new URL("checkout-job.mjs",import.meta.url).pathname,"--cleanup",candidate],{timeout:5000});
+        if(repair.status!==0)fail(`checkout cessation unresolved; original staging/custody retained: ${repair.stderr||job.error.message}`);
+      }
       const next = `${generationFile}.tmp`;
       writeFileSync(next, String(generation + 1), { mode: 0o600 });
       renameSync(next, generationFile);

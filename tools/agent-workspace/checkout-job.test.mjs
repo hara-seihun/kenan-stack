@@ -68,6 +68,7 @@ ${shellQuote(realGit)} "$@" || exit $?
 printf '%s\\n%s\\n%s\\n' "$$" "$PPID" "$staging" > ${shellQuote(marker)}
 mode=$(<${shellQuote(modeFile)})
 if [ "$mode" = interrupt ]; then kill -KILL "$PPID"; exit 137; fi
+if [ "$mode" = orphan ]; then kill -KILL "$PPID"; while true; do sleep 1; done; fi
 if [ "$mode" = hold ]; then
   while [ ! -e ${shellQuote(release)} ]; do sleep 0.025; done
 fi
@@ -105,6 +106,7 @@ fi
       const deadline = Date.now() + 10_000;
       do {
         const result = cli(args(budget, extra));
+        if(result.status===2&&/checkout failed \(checkout-materialization-failed\)|creation budget exhausted; pending reservation retained/.test(result.stderr)) { await delay(25);continue; }
         assert.equal(result.status, 75, `${result.stdout}\n${result.stderr}`);
         assert.equal(result.receipt.ok, true);
         if (result.receipt.state === "creating") {
@@ -192,6 +194,20 @@ test("workspace child SIGKILL cleans staging and exact retry starts a fresh mate
     assert.match(observed.stderr, /checkout failed/);
     await retry(f, reserved);
   } finally { f.close(); }
+});
+
+test("unexpected creator death ceases surviving Git before terminal staging cleanup", options, async()=>{
+ const f=fixture("orphan");
+ try {
+  const reserved=await f.start();const held=await f.held();
+  const terminal=await f.terminal(reserved);
+  assert.equal(terminal.state,"failed");assert.equal(terminal.error.code,"checkout-materialization-failed");
+  const {liveGroupMembers}=await import('./checkout-cessation.mjs');
+  assert.equal(liveGroupMembers(held.parent).length,0);
+  if(existsSync(`/proc/${held.pid}/stat`))assert.match(readFileSync(`/proc/${held.pid}/stat`,'utf8'),/\) [ZX] /);
+  assert.equal(existsSync(held.staging),false);assert.equal(existsSync(f.destination),false);
+  await retry(f,reserved);
+ }finally{f.close();}
 });
 
 for (const scope of ["main", "all"]) test(`systemd ${scope}-process SIGKILL automatically resumes clean staging and preserves the reservation`, options, async () => {

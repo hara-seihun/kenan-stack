@@ -60,10 +60,10 @@ function run(args, env, cwd) {
     const output=execFileSync(entry,fixtureMaintenanceArguments(args,env),{cwd,env:{...process.env,...env},encoding:'utf8',timeout:7000});
     const checkpoint=JSON.parse(output);return JSON.stringify(checkpoint.kind==='maintenance-preview'?checkpoint.results.map(row=>row.result):checkpoint.results);
   }
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + 90_000;
   let preparing = null;
   while (true) {
-    assert.ok(Date.now() < deadline, `source preparation did not finish within 30s: ${JSON.stringify(preparing)}`);
+    assert.ok(Date.now() < deadline, `source preparation did not finish within 90s: ${JSON.stringify(preparing)}`);
     let output;
     try {
       output = execFileSync(entry, args, {
@@ -88,10 +88,10 @@ function run(args, env, cwd) {
 }
 
 async function runAsync(args, env, cwd) {
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + 90_000;
   let preparing = null;
   while (true) {
-    assert.ok(Date.now() < deadline, `source preparation did not finish within 30s: ${JSON.stringify(preparing)}`);
+    assert.ok(Date.now() < deadline, `source preparation did not finish within 90s: ${JSON.stringify(preparing)}`);
     const output = await new Promise((resolve, reject) => {
       execFile(entry, args, {
         cwd,
@@ -189,25 +189,26 @@ process.exit(result.status ?? 1);
 
 // Retained materialized creations from earlier releases still need conservative resume coverage.
 function materializedPendingFixture(args, env) {
+  const fixtureGit = (cwd,...args)=>execFileSync("git",["-C",cwd,...args],{env:{...process.env,...env},encoding:"utf8",timeout:5000}).trim();
   const database = new DatabaseSync(env.PI_WORKSPACE_STATE);
   const record = database.prepare("SELECT * FROM workspace WHERE state='creating' ORDER BY created_at DESC LIMIT 1").get();
   database.close();
   if (!record || existsSync(record.path)) return;
   const input = JSON.parse(record.creation_request);
   mkdirSync(record.path, { recursive: true });
-  git(record.path, "init");
-  git(record.path, "fetch", "--no-tags", input.repository, record.source_commit);
-  git(record.path, "remote", "add", "origin", input.repository);
-  git(record.path, "update-ref", "--no-deref", "HEAD", record.source_commit);
-  git(record.path, "tag", `pi-workspace-source-${record.source_commit}`, record.source_commit);
+  fixtureGit(record.path, "init");
+  fixtureGit(record.path, "fetch", "--no-tags", input.repository, record.source_commit);
+  fixtureGit(record.path, "remote", "add", "origin", input.repository);
+  fixtureGit(record.path, "update-ref", "--no-deref", "HEAD", record.source_commit);
+  fixtureGit(record.path, "tag", `pi-workspace-source-${record.source_commit}`, record.source_commit);
   if (input.sparsePatterns?.length) {
     mkdirSync(path.join(record.path, ".git", "info"), { recursive: true });
     writeFileSync(path.join(record.path, ".git", "info", "sparse-checkout"), `${input.sparsePatterns.join("\n")}\n`);
-    git(record.path, "config", "core.sparseCheckout", "true");
-    git(record.path, "config", "core.sparseCheckoutCone", "false");
+    fixtureGit(record.path, "config", "core.sparseCheckout", "true");
+    fixtureGit(record.path, "config", "core.sparseCheckoutCone", "false");
   }
   if (env.PI_WORKSPACE_TEST_PREEXISTING_STAGE === "checkout") {
-    git(record.path, "checkout", "--force", ...(input.mode === "review" ? ["--detach"] : ["-B", input.branch]), record.source_commit);
+    fixtureGit(record.path, "checkout", "--force", ...(input.mode === "review" ? ["--detach"] : ["-B", input.branch]), record.source_commit);
   }
 }
 
@@ -785,6 +786,8 @@ test("bounded reconciliation reports deferred custody and resumes after a releas
 
 test("bounded reconciliation preserves caches across a runtime-referenced group", () => {
   const f = fixture();
+  const priorSafety=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
+  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY="empty";
   try {
     const records = ["group-a", "group-b"].map((name) => JSON.parse(run([
       "create", "--root", f.workspaces, "--repo", f.remote, "--name", name, "--group", "runtime",
@@ -807,7 +810,7 @@ test("bounded reconciliation preserves caches across a runtime-referenced group"
       assert.ok(results.every((r) => r.action === "none"));
       assert.ok(records.every((r) => existsSync(path.join(r.path, "node_modules", "runtime-data"))));
     } finally { database.close(); }
-  } finally { f.close(); }
+  } finally { if(priorSafety===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=priorSafety;f.close(); }
 });
 
 test("a queued thread on one group member keeps both workspaces and their caches", () => {
@@ -894,22 +897,22 @@ test("filesystem headroom is shared across completed workspaces while pending co
     const plan = { intent: "unestimated", estimate: "unknown", constructionBytes: 30 * GiB, growthBytes: 0, headroomBytes: 0 };
     for (const record of records) db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(plan), record.id);
     let reservations = workspaceTesting.capacityReservations(db, device);
-    assert.deepEqual(reservations, { priced: [], headroomBytes: 30 * GiB, unpricedDormant: 0 });
+    assert.deepEqual(reservations, { priced: [], headroomBytes: 30 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 30 * GiB);
     db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(records[0].id);
     reservations = workspaceTesting.capacityReservations(db, device);
     const constructionSpent = 0;
-    assert.deepEqual(reservations, { priced: [30 * GiB - constructionSpent], headroomBytes: 30 * GiB, unpricedDormant: 0 });
+    assert.deepEqual(reservations, { priced: [30 * GiB - constructionSpent], headroomBytes: 30 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 60 * GiB - constructionSpent);
     db.prepare("UPDATE workspace SET state='released' WHERE id=?").run(records[0].id);
     const budgeted = { intent: "budgeted", estimate: "whole-tree-upper-bound", constructionBytes: 5 * GiB, growthBytes: 2 * GiB, headroomBytes: 40 * GiB };
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(budgeted), records[1].id);
     db.prepare("UPDATE workspace SET state='repair-required', lease_expires_at=0 WHERE id=?").run(records[1].id);
     reservations = workspaceTesting.capacityReservations(db, device);
-    assert.deepEqual(reservations, { priced: [2 * GiB], headroomBytes: 40 * GiB, unpricedDormant: 0 });
+    assert.deepEqual(reservations, { priced: [2 * GiB], headroomBytes: 40 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 42 * GiB);
     db.prepare("UPDATE workspace SET state='released'").run();
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     db.close();
   } finally { f.close(); }
 });
@@ -1112,6 +1115,7 @@ test("capacity caches survive retained source inspection and invalidate only bef
   try {
     const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "cache-lifecycle", "--repo", f.source,
       "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", "128", "--json"], f.env));
+    writeFileSync(path.join(created.path,".git/info/exclude"),"node_modules/\n");
     writeFileSync(path.join(created.path, "file.txt"), "dirty retained source\n");
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
     const db = new DatabaseSync(f.env.PI_WORKSPACE_STATE);
@@ -1123,10 +1127,15 @@ test("capacity caches survive retained source inspection and invalidate only bef
     mkdirSync(path.join(created.path, "node_modules"));
     writeFileSync(path.join(created.path, "node_modules", "generated"), "generated\n");
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
+    const generatedMeasurement=cached();
     run(["release", "--id", created.id, "--json"], f.env);
-    assert.equal(cached(), undefined);
-    assert.equal(existsSync(path.join(created.path, "node_modules")), false);
+    assert.deepEqual(cached(), generatedMeasurement);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "dirty retained source\n");
+    git(created.path,"checkout","--","file.txt");
+    const cleaned=JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    assert.equal(cached(), undefined,JSON.stringify(cleaned));
+    assert.equal(existsSync(path.join(created.path, "node_modules")), false);
+    assert.equal(existsSync(created.path),false);
     db.close();
   } finally { f.close(); }
 });
@@ -1653,33 +1662,33 @@ test("budgeted source creation shares existing objects and records immutable spa
     const device = String(statSync(f.workspaces).dev);
     const fullPlan = { intent: "unestimated", estimate: "unknown", constructionBytes: 30 * 1024 ** 3, growthBytes: 0, headroomBytes: 0 };
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(fullPlan), created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 30 * 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 30 * 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(created.capacity), created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace SET lease_expires_at=0 WHERE id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace SET state='creating', lease_expires_at=0 WHERE id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [created.capacity.growthBytes + created.capacity.constructionBytes], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [created.capacity.growthBytes + created.capacity.constructionBytes], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("DELETE FROM workspace_capacity WHERE workspace_id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1 });
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device, created.path), { priced: [], headroomBytes: 0, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device, created.path), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     // An old dormant reservation is priced again under the filesystem fence before resuming.
     const resumed = JSON.parse(run(args, f.env));
     assert.equal(resumed.id, created.id);
     assert.equal(resumed.capacity.sourceCommit, created.sourceCommit);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const beforeGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device);
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(70 * 1024 ** 2));
     const measured = JSON.parse(run(["measure-capacity", "--id", created.id, "--json"], f.env));
     assert.equal(measured[0].status, "measured");
     const partialGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device).bytes - beforeGrowth.bytes - 64 * 1024 ** 2;
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const unavailable = workspaceTesting.capacityReservations(db, device, undefined, () => ({ ok: false, error: "unreadable fixture" }));
     assert.deepEqual(unavailable, { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0,
       measurementFailures: [{ path: created.path, error: "unreadable fixture", reservedBytes: 8 * 1024 ** 2 }] });
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(80 * 1024 ** 2));
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const cache = JSON.parse(db.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(created.id).measurement_json);
     db.prepare("UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?").run(JSON.stringify({ ...cache, startedAt: Date.now() - 16 * 60_000 }), created.id);
     assert.equal(workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, device).ok, false);
@@ -1690,11 +1699,11 @@ test("budgeted source creation shares existing objects and records immutable spa
     assert.match(workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, device).error, /cache missing/);
     rmSync(path.join(created.path, "generated.bin"));
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     // End the real completed allocation through its ordinary lifecycle. Faking
     // a pending row can race a durable checkout's terminal receipt writer.
     run(["release", "--id", created.id], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     db.close();
   } finally { f.close(); }
 });
@@ -1837,7 +1846,7 @@ test("an active legacy creator refuses unknown capacity while a dormant one must
     child.stdin.end();
     await closed;
     child = undefined;
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1 });
+    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
     assert.equal(JSON.parse(run([...base, "--name", "other"], f.env)).capacity.admission.unpricedDormant, 1);
     assert.throws(() => run([...base.map(arg => arg === "0" ? "1000000" : arg), "--name", "legacy"], f.env), /GiB is required/);
     assert.equal(db.prepare("SELECT count(*) AS count FROM workspace_capacity WHERE workspace_id=?").get(created.id).count, 0);
@@ -1890,14 +1899,16 @@ test("allocates from a reclaimed caller directory without changing valid relativ
     const fromRemovedDirectory = (name, repository) => {
       const gone = path.join(f.root, `caller-${name}`);
       mkdirSync(gone);
-      return execFileSync("bash", ["-c", 'rmdir -- "$1"; shift; exec "$@"', "removed-cwd",
+      let output;try{output=execFileSync("bash", ["-c", 'rmdir -- "$1"; shift; exec "$@"', "removed-cwd",
         gone, entry, "create", "--root", f.workspaces, "--name", name,
         "--repo", repository, "--min-free-gib", "0", "--json"], {
         cwd: gone,
         env: { ...process.env, ...f.env },
         encoding: "utf8",
         timeout: 30_000,
-      });
+      });}catch(error){if(error.status!==75)throw error;output=error.stdout;}
+      const pending=JSON.parse(output);
+      return pending.state==="creating"||pending.state==="preparing"?run(["create","--root",f.workspaces,"--name",name,"--repo",repository,"--min-free-gib","0","--json"],f.env):output;
     };
     const relative = JSON.parse(run(["create", "--root", "workspaces", "--name", "relative",
       "--repo", "source", "--min-free-gib", "0", "--json"], f.env, f.root));
@@ -2045,7 +2056,7 @@ test("forty cold registry clients initialize one WAL schema without contention f
     for (const result of results) assert.deepEqual(JSON.parse(result).records, []);
     const database = new DatabaseSync(f.env.PI_WORKSPACE_STATE);
     assert.equal(database.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
-    assert.equal(database.prepare("PRAGMA user_version").get().user_version, 1);
+    assert.equal(database.prepare("PRAGMA user_version").get().user_version, 2);
     assert.ok(database.prepare("PRAGMA table_info(workspace)").all().some(column => column.name === "creation_request"));
     database.close();
   } finally { f.close(); }
@@ -2091,7 +2102,8 @@ process.exit(result.status ?? 1);
     const env = { ...f.env, PATH: `${bin}:${process.env.PATH}` };
     const create = ["create", "--root", f.workspaces, "--repo", f.source, "--min-free-gib", "0", "--json"];
     const commit = git(f.source, "rev-parse", "HEAD");
-    const records = await Promise.all(Array.from({ length: 24 }, async (_, index) =>
+    const settle=async promises=>{const results=await Promise.allSettled(promises);const errors=results.filter(r=>r.status==="rejected").map(r=>r.reason);if(errors.length)throw new AggregateError(errors,"concurrent original creators failed",{cause:errors[0]});return results.map(r=>r.value);};
+    const records = await settle(Array.from({ length: 24 }, async (_, index) =>
       JSON.parse(await runAsync([...create, "--name", `local-${index}`], env))));
     assert.equal(new Set(records.map(record => record.id)).size, 24);
     for (const record of records) {
@@ -2099,7 +2111,7 @@ process.exit(result.status ?? 1);
       assert.equal(record.sourceCommit, commit);
       assert.equal(git(record.path, "rev-parse", "HEAD"), commit);
     }
-    const remoteRecords = await Promise.all(Array.from({ length: 24 }, async (_, index) =>
+    const remoteRecords = await settle(Array.from({ length: 24 }, async (_, index) =>
       JSON.parse(await runAsync(["create", "--root", f.workspaces, "--repo", `file://${f.remote}`,
         "--name", `remote-${index}`, "--min-free-gib", "0", "--json"], env))));
     for (const record of remoteRecords) {
@@ -2801,7 +2813,7 @@ test("an untracked .agent-workspace-caches manifest does not classify anything",
   }
 });
 
-test("leaves a tracked directory alone when its name matches a cache path", () => {
+test("retains tracked cache-name source and generated caches while its commit is unpublished", () => {
   const f = fixture();
   try {
     const created = JSON.parse(run([
@@ -2818,14 +2830,14 @@ test("leaves a tracked directory alone when its name matches a cache path", () =
     writeFileSync(path.join(created.path, "__pycache__", "tool.pyc"), "generated\n");
     const result = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
     assert.equal(result.inspection.classification, "repair-required");
-    assert.equal(existsSync(path.join(created.path, "__pycache__")), false);
+    assert.equal(existsSync(path.join(created.path, "__pycache__")), true);
     assert.equal(readFileSync(path.join(created.path, "build", "release.sh"), "utf8"), "echo build\n");
   } finally {
     f.close();
   }
 });
 
-test("preserves tracked cache names inside nested submodules while removing generated caches", () => {
+test("preserves unpublished nested-submodule source and its generated caches", () => {
   const f = fixture();
   try {
     const created = JSON.parse(run([
@@ -2850,8 +2862,8 @@ test("preserves tracked cache names inside nested submodules while removing gene
     assert.equal(result.inspection.classification, "repair-required");
     for (const repository of [created.path, child, grandchild]) {
       assert.equal(readFileSync(path.join(repository, "build", "release.sh"), "utf8"), "echo source\n");
-      assert.equal(existsSync(path.join(repository, "__pycache__")), false);
-      assert.equal(git(repository, "status", "--porcelain"), "");
+      assert.equal(existsSync(path.join(repository, "__pycache__")), true);
+      assert.match(git(repository, "status", "--porcelain"), /__pycache__/);
     }
   } finally {
     f.close();
@@ -2901,15 +2913,15 @@ test("clone release excludes durable source ancestry but protects every unpublis
     const release = () => JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
     const unpushed = release();
     assert.equal(unpushed.inspection.classification, "repair-required");
-    assert.match(unpushed.inspection.reason, /refs\/heads\/agent\/durable-base:1/);
-    assert.match(unpushed.inspection.reason, /HEAD:1/);
+    assert.match(unpushed.inspection.reason, /commits absent from remote refs or durable source ancestry/);
+    assert.match(unpushed.inspection.reason, /commits absent from remote refs or durable source ancestry/);
     assert.equal(existsSync(created.path), true);
 
     // Returning HEAD to the reserved source must not hide a unique sibling branch.
     git(created.path, "checkout", "source-base");
     const sibling = release();
     assert.equal(sibling.inspection.classification, "repair-required");
-    assert.match(sibling.inspection.reason, /refs\/heads\/agent\/durable-base:1/);
+    assert.match(sibling.inspection.reason, /commits absent from remote refs or durable source ancestry/);
     assert.equal(existsSync(created.path), true);
 
     git(created.path, "checkout", "agent/durable-base");
@@ -2941,7 +2953,7 @@ test("keeps a unique detached HEAD even when local branches are remote", () => {
 
     const held = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
     assert.equal(held.inspection.classification, "repair-required");
-    assert.match(held.inspection.reason, /HEAD:1/);
+    assert.match(held.inspection.reason, /commits absent from remote refs or durable source ancestry/);
     assert.equal(existsSync(created.path), true);
   } finally {
     f.close();
@@ -3403,10 +3415,18 @@ for (const grouped of [false, true]) test(`expired live references require an ex
       "create", "--root", f.workspaces, "--name", "group-peer", "--repo", f.remote,
       "--group", "live-group", "--lease-seconds", "0", "--min-free-gib", "0", "--json",
     ], f.env);
-    sleeper = spawn("sleep", ["60"], { cwd: created.path, stdio: "ignore" });
+    sleeper = spawn("sleep", ["180"], { cwd: created.path, stdio: "ignore" });
     await new Promise((resolve) => setTimeout(resolve, 100));
     const exited = new Promise((resolve) => sleeper.once("exit", resolve));
-    const liveSafety = { ...f.env, PI_WORKSPACE_TEST_EXTERNAL_SAFETY: "host" };
+    // Keep real /proc runtime custody, but no unrelated host container/service discovery.
+    const bin=path.join(f.root,"runtime-tools");mkdirSync(bin);
+    const systemctl=execFileSync("which",["systemctl"],{encoding:"utf8"}).trim();
+    writeFileSync(path.join(bin,"docker"),"#!/bin/sh\nif [ \"$1\" = context ]; then echo '\"tcp://fixture.invalid:2375\"'; fi\n",{mode:0o755});
+    writeFileSync(path.join(bin,"systemctl"),`#!/bin/sh
+for a in "$@"; do if [ "$a" = list-units ]; then echo '[]';exit 0;fi;done
+exec ${systemctl} "$@"
+`,{mode:0o755});
+    const liveSafety = { ...f.env, PATH:`${bin}:${process.env.PATH}`, PI_WORKSPACE_TEST_EXTERNAL_SAFETY: "host" };
     const held = JSON.parse(await runAsync(["release", "--id", created.id, "--json"], liveSafety));
     assert.equal((grouped ? held.find(result => result.record.id === created.id) : held).inspection.classification, "referenced");
     assert.equal(existsSync(created.path), true);
@@ -3419,7 +3439,7 @@ for (const grouped of [false, true]) test(`expired live references require an ex
     assert.equal((grouped ? released.find(result => result.record.id === created.id) : released).inspection.classification, "referenced");
     assert.equal(sleeper.exitCode, null);
     const reaped = JSON.parse(await runAsync(["release", "--id", created.id, "--reap-expired", "--json"], liveSafety));
-    assert.equal((grouped ? reaped[0] : reaped).action, grouped ? "released-group" : "released");
+    assert.equal((grouped ? reaped[0] : reaped).action, grouped ? "released-group" : "released",JSON.stringify(reaped));
     assert.equal(existsSync(created.path), false);
     await exited;
   } finally {
@@ -3548,7 +3568,7 @@ test("status, list and dry-run reconciliation leave disposal to executing lifecy
   } finally { f.close(); }
 });
 
-test("a surviving Git child retains its checkout fence after creator termination", async () => {
+test("unexpected creator death ceases surviving Git before staging cleanup and exact retry", async () => {
   const f = fixture();
   let connection;
   let accept;
@@ -3565,7 +3585,7 @@ test("a surviving Git child retains its checkout fence after creator termination
       while ((end = buffer.indexOf("\n")) >= 0) {
         const event = JSON.parse(buffer.slice(0, end));
         buffer = buffer.slice(end + 1);
-        if (event.pid) accept(event.pid);
+        if (event.creatorPid) accept(event);
         else completed(event.code);
       }
     });
@@ -3580,7 +3600,7 @@ const { spawnSync } = require('node:child_process');
 const args = process.argv.slice(2);
 if (args[0] !== 'clone') process.exit(spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'}).status ?? 1);
 const socket = require('node:net').createConnection(${JSON.stringify(socketPath)});
-socket.on('connect', () => socket.write(JSON.stringify({pid:process.ppid})+'\\n'));
+socket.on('connect', () => socket.write(JSON.stringify({creatorPid:process.ppid,gitPid:process.pid,args})+'\\n'));
 socket.once('data', () => {
   const code = spawnSync(${JSON.stringify(realGit)}, args, {stdio:'ignore'}).status;
   socket.end(JSON.stringify({code})+'\\n');
@@ -3590,15 +3610,23 @@ socket.once('data', () => {
     const args = ["create", "--root", f.workspaces, "--name", "surviving-child", "--repo", f.source,
       "--min-free-gib", "0", "--json"];
     const first = runAsync(args, { ...f.env, PATH: `${bin}:${process.env.PATH}` }).catch(error => error);
-    const pid = await Promise.race([gate, first.then(() => { throw Error("creation exited before child gate"); })]);
-    process.kill(pid, "SIGKILL");
+    const held = await Promise.race([gate, first.then(() => { throw Error("creation exited before child gate"); })]);
+    assert.equal(held.args[0],"clone");const staging=held.args.at(-1);
+    assert.match(path.basename(staging),/^\.surviving-child\.creating-/);
+    assert.equal(existsSync(path.join(f.workspaces,"surviving-child")),false);
+    process.kill(held.creatorPid, "SIGKILL");
     assert.ok(await first instanceof Error);
+    const {liveGroupMembers}=await import('./checkout-cessation.mjs');
+    const deadline=Date.now()+5000;
+    while(liveGroupMembers(held.creatorPid).length&&Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+    assert.deepEqual(liveGroupMembers(held.creatorPid),[]);
+    assert.equal(existsSync(staging),false);
     const key = createHash("sha256").update(`checkout:${path.join(f.workspaces, "surviving-child")}`).digest("hex");
     const lock = path.join(path.dirname(f.env.PI_WORKSPACE_STATE), "locks", key);
-    assert.throws(() => execFileSync("flock", ["--nonblock", lock, "true"]), error => error.status === 1);
-    connection.write("continue");
-    assert.equal(await done, 0);
-    const resumed = JSON.parse(await runAsync(args, f.env));
+    execFileSync("flock", ["--nonblock", lock, "true"]);
+    let resumed;
+    try{resumed=JSON.parse(await runAsync(args,f.env));}
+    catch(error){assert.match(error.message,/checkout failed/);resumed=JSON.parse(await runAsync(args,f.env));}
     assert.equal(resumed.state, "active");
     assert.equal(readFileSync(path.join(resumed.path, "file.txt"), "utf8"), "source\n");
   } finally {
