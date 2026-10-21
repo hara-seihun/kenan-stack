@@ -4067,6 +4067,7 @@ function help() {
   agent-workspace job-status --job-id SHA256 [--json]
   agent-workspace source-status --job-id SHA256 [--json]
   agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--retained | --lease-seconds N]
+  agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
   agent-workspace custody-status --id ID --path PATH --json
   agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
@@ -4199,7 +4200,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["register", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4209,6 +4210,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     if (commandName === "create") createCommand(database, args, statePath);
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);
+    else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
     else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);

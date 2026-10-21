@@ -41,7 +41,7 @@ export function validateRetirement(disposition, binding, safety, now = Date.now(
     growthError('growth-writer-unknown', 'growth writer observation is unset');
   }
   if (safety.errors.length) growthError('growth-writer-unknown', safety.errors.join('; '));
-  if (safety.references.length) growthError('growth-writer-active', 'runtime/thread/process references remain; no read-only assumption permitted');
+  if (safety.references.length) growthError('growth-writer-active', 'runtime/thread/process references remain; no read-only assumption permitted: '+JSON.stringify(safety.references.map(r=>({kind:r.kind,id:r.id,pid:r.pid,channel:r.channel,root:r.root,workspacePath:r.workspacePath}))).slice(0,4096));
 }
 
 // Active reduction is not retirement: keep the writer, lease, baseline and source.
