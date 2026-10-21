@@ -17,7 +17,7 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
  const bin=process.env.WORKSPACE_TEST_PG_BIN||execFileSync('pg_config',['--bindir'],{encoding:'utf8',timeout:2000}).trim();
  const pg=(name,args)=>execFileSync(path.join(bin,name),args,{encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']});let started=false;
  try{
-  pg('initdb',['-D',data,'--username=fixture','--no-locale','--auth=trust','--no-sync']);
+  pg('initdb',['-D',data,'--username=fixture','--no-locale','--auth=trust','--no-sync','--set=max_connections=10','--set=shared_buffers=8MB']);
   pg('pg_ctl',['-D',data,'-l',path.join(root,'postgres.log'),'-o',`-F -k ${root} -c listen_addresses='' -c max_connections=10 -c shared_buffers=8MB`,'-w','start']);started=true;
   const source="/fixture/source/it's";
   let n=0;const uuid=()=>`00000000-0000-4000-8000-${String(++n).padStart(12,'0')}`;

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {tmpdir} from 'node:os';
+process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY = 'empty';
 import {workspaceTesting} from './workspace.mjs';
 
 test('an installed file naming a checkout keeps it referenced; node_modules are not scanned', () => {

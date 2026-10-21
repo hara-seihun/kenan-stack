@@ -1,6 +1,7 @@
+import {MaintenanceJournal,digest} from './maintenance-journal.mjs';
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statfsSync, statSync, symlinkSync, linkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
@@ -42,7 +43,23 @@ function pendingFailureOutput(args, error) {
   return ["preparing", "creating"].includes(receipt?.state) ? output : null;
 }
 
+function fixtureMaintenanceArguments(args,env) {
+ const directory=path.dirname(env.PI_WORKSPACE_STATE),priorFile=path.join(directory,'maintenance-fixture-prior.json');
+ if(!existsSync(priorFile)){
+  mkdirSync(directory,{recursive:true});const operationId=randomUUID(),file=path.join(directory,'maintenance-fixture-prior.sqlite3');
+  const registry=new DatabaseSync(env.PI_WORKSPACE_STATE);const target=registry.prepare('SELECT id,path FROM workspace WHERE path=?').get(args[args.indexOf('--path')+1]);registry.close();
+  const journal=new MaintenanceJournal(file,operationId,{scope:{root:null,id:target.id,path:target.path},kind:'offline-prior-fixture'},{deadline:Date.now()+5000});
+  const spec={kind:'offline-prior-fixture-effect'};journal.run({maxRecords:2,next:c=>c?null:{id:'fixture'},inspect:()=>{},execute:()=>journal.effect(spec,()=>null)});journal.close();
+  const receipt=path.join(directory,'maintenance-fixture-prior-receipt.json');writeFileSync(receipt,JSON.stringify({kind:'maintenance-settled-effect',operationId,effectId:digest(spec),specDigest:digest(spec),resultDigest:digest(null)}));
+  writeFileSync(priorFile,JSON.stringify({kind:'maintenance-canonical-reconciliation',originalOperationId:operationId,state:'settled',journal:file,effects:[{effectId:digest(spec),state:'applied',canonicalReceipt:receipt,receiptSha256:createHash('sha256').update(readFileSync(receipt)).digest('hex')}]}));
+ }
+ return [...args,'--budget-ms','5000','--max-records','32',...(args.includes('--execute')?['--operation-id',randomUUID(),'--prior-state',priorFile,'--prior-state-sha256',createHash('sha256').update(readFileSync(priorFile)).digest('hex')]:[])];
+}
 function run(args, env, cwd) {
+  if(args[0]==='maintain'){
+    const output=execFileSync(entry,fixtureMaintenanceArguments(args,env),{cwd,env:{...process.env,...env},encoding:'utf8',timeout:7000});
+    const checkpoint=JSON.parse(output);return JSON.stringify(checkpoint.kind==='maintenance-preview'?checkpoint.results.map(row=>row.result):checkpoint.results);
+  }
   const deadline = Date.now() + 30_000;
   let preparing = null;
   while (true) {

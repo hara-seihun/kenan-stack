@@ -25,6 +25,11 @@ const state = JSON.parse(fs.readFileSync(context, 'utf8'));
 const args = process.argv.slice(2);
 if (process.argv[1].endsWith('/systemctl')) {
   if (state.mode === 'unsupported') { process.stderr.write('Failed to connect to user bus'); process.exit(1); }
+  if (state.mode === 'show-timeout-ready') {
+    const directory = state.submissions[0].at(-1);
+    fs.writeFileSync(require('node:path').join(directory, 'result.json'), JSON.stringify({state:'ready',value:{recovered:true}}));
+  }
+  if (state.mode.startsWith('show-timeout')) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
   const unit = args[2];
   const active = state.units[unit];
   process.stdout.write('LoadState=' + (active ? 'loaded' : 'not-found') + '\nActiveState=' + (active || 'inactive') + '\nSubState=' + (active === 'active' ? 'running' : 'dead') + '\nResult=success\nExecMainStatus=0\n');
@@ -33,14 +38,16 @@ if (process.argv[1].endsWith('/systemctl')) {
   const unit = args.find(value => value.startsWith('--unit=')).slice(7);
   state.units[unit] = 'active';
   fs.writeFileSync(context, JSON.stringify(state));
-  if (state.mode === 'ready' || state.mode === 'no-result') {
+  if (state.mode === 'ready' || state.mode === 'no-result' || state.mode === 'submit-timeout-ready') {
     const command = args.slice(args.indexOf('--') + 1);
     cp.spawnSync(command[0], command.slice(1), { stdio: 'ignore' });
     state.units[unit] = 'inactive';
     fs.writeFileSync(context, JSON.stringify(state));
     // systemd-run acknowledges exec admission, not the worker's eventual exit status.
+    if (state.mode === 'submit-timeout-ready') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
     process.exit(0);
   }
+  if (state.mode === 'submit-timeout') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);
 }
 `}`);
     chmodSync(filename, 0o700);
@@ -344,5 +351,79 @@ test("new completions project terminal progress; stopped unfinished observer nev
     assert.deepEqual(JSON.parse(readFileSync(path.join(directory, "progress.json"))), result);
     assert.deepEqual(observeSourceJob(directory), result);
     assert.equal(f.state().submissions.length, 2);
+  } finally { f.restore(); }
+});
+
+for (const mode of ["submit-timeout-ready", "show-timeout-ready"]) test(`${mode}: immutable result wins over control timeout, with one durable attempt`, () => {
+  const f = fixture(mode);
+  try {
+    f.options.command = readyCommand({ recovered: true });
+    assert.deepEqual(runSourceJob(f.options), { state: "ready", value: { recovered: true } });
+    assert.deepEqual(runSourceJob(f.options), { state: "ready", value: { recovered: true } });
+    assert.equal(f.state().submissions.length, 1);
+    assert.equal(JSON.parse(readFileSync(path.join(f.jobDirectory(), "attempt.json"))).number, 1);
+  } finally { f.restore(); }
+});
+
+test("timed-out submission reconciles an active original unit without resubmission", () => {
+  const f = fixture("submit-timeout");
+  try {
+    const first = runSourceJob(f.options);
+    assert.equal(first.state, "pending");
+    assert.equal(first.phase, "running");
+    const again = runSourceJob({...f.options, restartInterrupted: true});
+    assert.equal(again.jobId, first.jobId);
+    assert.equal(again.state, "pending");
+    assert.equal(f.state().submissions.length, 1);
+    assert.equal(JSON.parse(readFileSync(path.join(f.jobDirectory(), "attempt.json"))).number, 1);
+  } finally { f.restore(); }
+});
+
+test("unknown control state stays durable pending in create and read-only status, never ready or a new attempt", () => {
+  const f = fixture();
+  try {
+    const first = runSourceJob(f.options);
+    f.update({...f.state(), mode: "show-timeout"});
+    for (const result of [runSourceJob({...f.options, restartInterrupted: true}), observeSourceJob(f.jobDirectory())]) {
+      assert.equal(result.state, "pending");
+      assert.equal(result.phase, "control-timeout");
+      assert.equal(result.jobId, first.jobId);
+      assert.equal(result.observationError.code, "source-job-control-timeout");
+      assert.equal(result.resultPath, first.resultPath);
+    }
+    assert.equal(f.state().submissions.length, 1);
+    f.update({...f.state(), mode: "running"});
+    assert.equal(finishSourceJob(f.jobDirectory(), {state:"ready",value:{recovered:true}}).ok, true);
+    assert.deepEqual(runSourceJob(f.options), {state:"ready",value:{recovered:true}});
+  } finally { f.restore(); }
+});
+
+test("existing attempt completion during timed-out status wins without restart", () => {
+  const f = fixture();
+  try {
+    runSourceJob(f.options);
+    f.update({...f.state(), mode: "show-timeout-ready"});
+    assert.deepEqual(runSourceJob({...f.options, restartInterrupted:true}), {state:"ready",value:{recovered:true}});
+    assert.equal(f.state().submissions.length, 1);
+  } finally { f.restore(); }
+});
+
+test("read-only job observation durably settles orphaned starting without terminalizing or replaying", () => {
+  const f = fixture();
+  try {
+    runSourceJob(f.options);
+    const state = f.state();
+    state.units = {};
+    f.update(state);
+    const directory = f.jobDirectory();
+    const result = observeSourceJob(directory);
+    assert.equal(result.state, "interrupted");
+    assert.equal(JSON.parse(readFileSync(path.join(directory,"progress.json"))).state,"interrupted");
+    assert.equal(existsSync(path.join(directory,"result.json")),false);
+    assert.equal(f.state().submissions.length,1);
+    assert.ok(f.state().submissions[0].includes("--property=TimeoutStartSec=120"));
+    const resumed = runSourceJob({...f.options,restartInterrupted:true});
+    assert.equal(resumed.state,"pending");
+    assert.equal(f.state().submissions.length,2);
   } finally { f.restore(); }
 });

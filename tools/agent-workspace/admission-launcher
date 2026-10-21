@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stable host admission: resolve selected implementation only AFTER shared admission.
+# Publisher takes exclusive admission with a finite wait and releases it on exit.
+set -eu
+lock=${AGENT_WORKSPACE_ADMISSION_LOCK:-/run/lock/agent-workspace-admission.lock}
+selected=${AGENT_WORKSPACE_SELECTED_ROOT:-/srv/pi/tools/agent-workspace}
+exec flock --shared --wait 30 --conflict-exit-code 75 "$lock" sh -c 'target=$1; shift; exec "$target/main" "$@"' sh "$selected" "$@"

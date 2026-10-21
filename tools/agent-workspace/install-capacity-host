@@ -1,0 +1,35 @@
+#!/bin/bash
+# Converge-only narrow tools installation; no Kenan runtime publication.
+set -euo pipefail
+repo=$1; base=$2; expected=$3; receipt=$4
+if [[ ${5:-} != locked ]]; then
+ # Install stable discovery from this committed source before fencing. All future
+ # CLI calls share admission; detached originals are drained below, never killed.
+ sudo install -Dm755 "$repo/tools/agent-workspace/admission-launcher" /usr/local/libexec/agent-workspace-admission
+ sudo touch /run/lock/agent-workspace-admission.lock
+ sudo chmod 0666 /run/lock/agent-workspace-admission.lock
+ sudo ln -sfn /usr/local/libexec/agent-workspace-admission /usr/local/bin/agent-workspace
+ ln -sfn /usr/local/libexec/agent-workspace-admission "$HOME/.local/bin/agent-workspace"
+ sudo install -m644 "$repo/tools/agent-workspace/admission-tmpfiles.conf" /etc/tmpfiles.d/agent-workspace.conf
+ exec sudo flock --exclusive --nonblock /srv/pi/.pi-stack-deploy.lock timeout 150 flock --exclusive --wait 30 /run/lock/agent-workspace-admission.lock "$0" "$repo" "$base" "$expected" "$receipt" locked
+fi
+# Stable launchers already fence new admissions. Existing detached originals finish
+# naturally; no PID or systemd unit is killed and no ledger data is changed.
+python3 - "$receipt" <<'PY'
+import os,time,json,sys
+start=time.time(); empty=0
+while time.time()-start<80:
+ active=[]
+ for p in os.listdir('/proc'):
+  if not p.isdigit():continue
+  try:a=open('/proc/'+p+'/cmdline','rb').read().decode().split('\0')
+  except (OSError,UnicodeError):continue
+  if any(x.endswith(('/agent-workspace/workspace.mjs','/agent-workspace/source-job.mjs','/agent-workspace/checkout-job.mjs')) for x in a):active.append(int(p))
+ if not active:empty+=1
+ else:empty=0
+ if empty==2:
+  json.dump({'originalMutableProcesses':active,'twoConsecutiveEmptyScans':True,'waitSeconds':time.time()-start,'noKills':True},open(sys.argv[1]+'.drain.json','w'));break
+ time.sleep(1)
+else:raise SystemExit('original mutable helpers still active; no effects applied')
+PY
+/usr/local/bin/node "$repo/tools/agent-workspace/capacity-deploy.mjs" "$repo" "$base" "$expected" "$receipt" reservation-aware

@@ -11,7 +11,7 @@ export function boundedCommand(name,args,options) {
   out=fs.openSync(path.join(directory,'stdout'),'wx+',0o600);err=fs.openSync(path.join(directory,'stderr'),'wx+',0o600);
   // Regular output descriptors prevent a grandchild's inherited pipe from extending the parent's timeout.
   const result=spawnSync(name,args,{...options,detached:true,killSignal:'SIGKILL',stdio:['ignore',out,err]});
-  if(result.error||result.signal) {
+  if(result.error||result.signal||options.reapGroup===true) {
    if(result.pid>0)try{process.kill(-result.pid,'SIGKILL');}catch(error){if(error.code!=='ESRCH')return {status:null,error:{code:'COMMAND_CESSATION_UNKNOWN',message:error.message},stdout:'',stderr:''};}
   }
   if([out,err].some(fd=>fs.fstatSync(fd).size>options.maxBuffer))return {status:null,error:{code:'COMMAND_OUTPUT_LIMIT'},stdout:'',stderr:''};

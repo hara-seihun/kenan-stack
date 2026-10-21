@@ -1,10 +1,16 @@
 #!/usr/bin/env node
+import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
+import {hasUncoveredCommits} from './release-reachability.mjs';
+import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
+import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
+import {boundedCommand} from './bounded-command.mjs';
 import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contract.mjs';
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  fsyncSync,
   accessSync,
   constants,
   closeSync,
@@ -98,6 +104,11 @@ class RegistrationMismatchError extends CliError {
   }
 }
 
+let maintenanceContext;
+function maintenanceEffect(kind, input, execute) {
+  if (!maintenanceContext) return execute();
+  return maintenanceContext.journal.effect({kind, workspace: maintenanceContext.record, input}, execute);
+}
 let inspectionDeadline;
 let creationDeadline;
 function duringInspection(deadline, inspect) {
@@ -181,7 +192,7 @@ function currentDirectory() {
 }
 
 function command(executable, commandArgs, options = {}) {
-  const remaining = Math.min(inspectionDeadline ?? Infinity, creationDeadline ?? Infinity, sourcePreparationDeadline) - Date.now();
+  const remaining = Math.min(maintenanceContext?.journal.deadline ?? Infinity, inspectionDeadline ?? Infinity, creationDeadline ?? Infinity, sourcePreparationDeadline) - Date.now() - (maintenanceContext ? 250 : 0);
   if (sourcePreparationMode === "foreground" && remaining <= 0) throw new SourcePreparationRequired();
   if (remaining <= 0) fail(creationDeadline === undefined
     ? "workspace inspection budget exhausted; no safety verdict was established"
@@ -194,7 +205,7 @@ function command(executable, commandArgs, options = {}) {
     stdio: ["pipe", "pipe", "pipe", ...heldResourceLocks.values()],
     env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0" },
     maxBuffer: 16 * 1024 * 1024,
-    timeout: Math.max(1, Math.min(options.timeout ?? 30_000, remaining)),
+    timeout: Math.max(1, Math.min(options.timeout ?? 30_000, maintenanceContext ? 2000 : Infinity, remaining)),
     ...(inspectionDeadline === undefined ? {} : { killSignal: "SIGKILL" }),
   });
   if (sourcePreparationMode === "foreground" && result.error?.code === "ETIMEDOUT") throw new SourcePreparationRequired();
@@ -209,13 +220,19 @@ function command(executable, commandArgs, options = {}) {
     stdout: (result.stdout ?? "").trim(),
     stderr: (result.stderr ?? "").trim(),
     error: result.error,
+    signal: result.signal,
   };
 }
 
 function run(executable, commandArgs, options = {}) {
+  if (maintenanceContext && !options.maintenanceDispatched && executable === 'git') {
+    const args=commandArgs.filter((_,i)=>!((commandArgs[i-1]==='-C')||(commandArgs[i-1]==='--git-dir'))).filter(x=>!['-C','--git-dir'].includes(x));
+    const readOnly=['rev-parse','for-each-ref','reflog','show-ref'].includes(args[0]) || (args[0]==='config' && args.some(x=>['--list','--get','--get-all'].includes(x)));
+    if (!readOnly) return maintenanceEffect('git', {args:commandArgs}, ()=>run(executable,commandArgs,{...options,maintenanceDispatched:true}));
+  }
   const result = command(executable, commandArgs, options);
   if (result.status !== 0) {
-    const detail = result.stderr || result.stdout || result.error?.message || `exit ${result.status}`;
+    const detail = commandFailureDetail(result);
     fail(`${executable} ${commandArgs.join(" ")} failed: ${detail}`);
   }
   return result.stdout;
@@ -227,7 +244,7 @@ function git(workspace, args, options = {}) {
 
 const registryPaths = new WeakMap();
 
-const REGISTRY_SCHEMA_VERSION = 1;
+const REGISTRY_SCHEMA_VERSION = 2;
 
 function hasPendingIndex(database) {
   return database.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='workspace_pending'").get() !== undefined;
@@ -262,6 +279,9 @@ function initializeRegistry(database) {
     new_owner TEXT NOT NULL, new_source_commit TEXT NOT NULL,
     authorization TEXT NOT NULL, occurred_at INTEGER NOT NULL
   ); CREATE INDEX IF NOT EXISTS workspace_reassignment_record ON workspace_reassignment(workspace_id, sequence)`);
+  database.exec(`CREATE TABLE IF NOT EXISTS workspace_source_capacity (
+    destination TEXT PRIMARY KEY, device_id TEXT NOT NULL, plan_json TEXT NOT NULL, receipt TEXT NOT NULL
+  )`);
   database.exec(`CREATE TABLE IF NOT EXISTS workspace_capacity (
     workspace_id TEXT PRIMARY KEY, device_id TEXT NOT NULL, plan_json TEXT NOT NULL
   ); CREATE INDEX IF NOT EXISTS workspace_capacity_device ON workspace_capacity(device_id)`);
@@ -473,7 +493,7 @@ function maintainReferenceClone(workspace, execute, statePath) {
       fail(`Git maintenance still owns ${gitDirectory}/gc.pid; retry after it finishes`);
     }
     gcLog = execute ? "removed-diagnosed-warning" : "would-remove-diagnosed-warning";
-    if (execute) rmSync(log);
+    if (execute) maintenanceEffect('gc-warning-removal', {file:log,sha256:createHash('sha256').update(readFileSync(log)).digest('hex')},()=>{if(existsSync(path.join(gitDirectory,'gc.pid'))||readFileSync(log,'utf8').trim()!==contents)throw new MaintenanceError('maintenance-warning-preimage-changed');rmSync(log);return null;});
   }
   const objectCustody = stabilizeObjectCustody(workspace, alternates, execute, statePath);
   return { path: workspace, settings: settings.map(([name]) => name), gcLog, objectCustody };
@@ -603,6 +623,7 @@ function processSnapshot(strict = false, workspacePath = null, fdAccess = "write
   let entries;
   try { entries = readdirSync("/proc"); } catch (error) { if (strict) throw error; return []; }
   for (const entry of entries) {
+    assertSafetyBudget("process references");
     if (!/^\d+$/u.test(entry)) continue;
     const pid = Number(entry);
     if (ignored.has(pid)) continue;
@@ -758,6 +779,7 @@ function parseSystemdUnits(output, manager) {
       activeState,
       workingDirectory: rawWorkingDirectory.replace(/^[!+~-]+/u, "") || null,
       execStart: properties.get("ExecStart") ?? "",
+      mainPid: Number(properties.get("MainPID") ?? 0),
     }];
   });
 }
@@ -801,6 +823,7 @@ function systemdManagerSnapshot(manager, execute = command) {
     "--property=ActiveState",
     "--property=WorkingDirectory",
     "--property=ExecStart",
+    "--property=MainPID",
     "--",
     ...unitIds,
   ], { timeout: 20_000 });
@@ -824,39 +847,70 @@ function serializedPathReference(serialized, workspacePath) {
     serialized.includes(`=${workspacePath}`) || serialized.includes(` ${workspacePath} `);
 }
 
-function systemdReferences(workspacePath, snapshot = systemdSnapshot()) {
+// A release unit necessarily names its target in --path. Ignore only that exact
+// authenticated ancestor, never another unit, a checkout cwd or executable.
+function ownReleaseUnit(unit, workspacePath, context) {
+  if (!context || context.command !== "release" || context.target !== workspacePath ||
+      !Number.isSafeInteger(unit.mainPid) || unit.mainPid <= 1 ||
+      !context.ancestors.has(unit.mainPid) ||
+      unit.workingDirectory === null || within(workspacePath, unit.workingDirectory) ||
+      unit.execStart.includes(`${workspacePath}/`) ||
+      unit.execStart.split(workspacePath).length !== 2 ||
+      !unit.execStart.includes(`--path ${workspacePath} `)) return false;
+  try {
+    const status = context.read(`/proc/${unit.mainPid}/status`);
+    if (Number(status.match(/^Uid:\s+(\d+)/mu)?.[1]) !== context.uid) return false;
+    const cwd = context.link(`/proc/${unit.mainPid}/cwd`);
+    const executable = context.link(`/proc/${unit.mainPid}/exe`);
+    return cwd !== null && executable !== null && !within(workspacePath, cwd) && !within(workspacePath, executable);
+  } catch { return false; }
+}
+function releaseInspectionContext() {
+  const args = process.argv.slice(2);
+  if (args[0] !== "release") return null;
+  const index = args.indexOf("--path");
+  const target = index < 0 ? args.find(arg => arg.startsWith("--path="))?.slice(7) : args[index + 1];
+  if (!target || !path.isAbsolute(target)) return null;
+  return { command: "release", target: path.resolve(target), uid: process.getuid?.(),
+    ancestors: processAncestry(), read: file => readFileSync(file, "utf8"), link: readLink };
+}
+function systemdReferences(workspacePath, snapshot = systemdSnapshot(), context = releaseInspectionContext()) {
   if (snapshot.error !== undefined) return { references: [], available: snapshot.available, error: snapshot.error };
   return {
     available: snapshot.available,
     references: snapshot.units.filter((unit) =>
       (unit.workingDirectory !== null && within(workspacePath, unit.workingDirectory)) ||
-      serializedPathReference(unit.execStart, workspacePath)),
+      (serializedPathReference(unit.execStart, workspacePath) && !ownReleaseUnit(unit, workspacePath, context))),
   };
 }
 
-// A linked worktree whose repository was deleted has no object store, so nothing can depend on it.
+// A linked worktree whose repository was deleted has no object store.
 function orphanedWorktree(workspacePath) {
   const pointer = /^gitdir: (.+)$/m.exec(readFileSync(path.join(workspacePath, ".git"), "utf8"));
   return pointer !== null && !existsSync(path.resolve(workspacePath, pointer[1].trim()));
 }
 
-// Installed files that name a checkout path: a bundle under /opt whose __dirname points into an
-// agent clone's node_modules, a /srv release built in place, a unit under /etc/systemd running from
-// it. 2026-10-19 (converge-kenan): the Slack sender installed at /opt/converge-slack-sender/8fe1fe50
-// from checkout limmy-independent-83fd broke when that checkout was released a minute later.
-// Depth-bounded; node_modules and .git are skipped. Same scan as /usr/local/bin/liveuse.
-const INSTALLED_REFERENCE_ROOTS = ["/opt", "/srv", "/etc/systemd"];
-const INSTALLED_REFERENCE_DEPTH = 4;
-function installedReferenceSnapshot(roots = INSTALLED_REFERENCE_ROOTS) {
+// Installed artifacts under /opt and /srv that name a checkout path (a bundle whose __dirname
+// points into an agent clone's node_modules). 2026-10-19: the Slack sender installed at
+// /opt/converge-slack-sender/8fe1fe50 from limmy-independent-83fd broke when that checkout was
+// released a minute later. Depth-bounded, node_modules/.git skipped; same scan as /usr/local/bin/liveuse.
+const INSTALL_ROOTS = ["/opt", "/srv", "/etc/systemd"];
+function assertSafetyBudget(phase) {
+  if (inspectionDeadline !== undefined && Date.now() >= inspectionDeadline)
+    growthError("growth-observation-timeout", `${phase} observation budget exhausted; no safety verdict established`);
+}
+function installedReferenceSnapshot(roots = INSTALL_ROOTS) {
   const references = [];
   const pattern = /\/home\/[A-Za-z0-9._@+-]+\/[A-Za-z0-9._\/@+-]+/gu;
   const walk = (directory, depth) => {
+    assertSafetyBudget("installed references");
     let entries;
     try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
+      assertSafetyBudget("installed references");
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) {
-        if (depth < INSTALLED_REFERENCE_DEPTH - 1 && entry.name !== "node_modules" && entry.name !== ".git") walk(candidate, depth + 1);
+        if (depth < 3 && entry.name !== "node_modules" && entry.name !== ".git") walk(candidate, depth + 1);
       } else if (entry.isFile()) {
         let data;
         try { if (statSync(candidate).size > 32 << 20) continue; data = readFileSync(candidate); } catch { continue; }
@@ -940,14 +994,17 @@ function ownerThreadDatabases() {
 function threadSnapshot(paths = ownerThreadDatabases()) {
   const references = [];
   for (const databasePath of paths) {
+    assertSafetyBudget("thread references");
     if (!optionalOwnerPath(databasePath)) continue;
     const database = new DatabaseSync(databasePath, { readOnly: true });
     try {
-      references.push(...database.prepare(`SELECT t.id, t.cwd FROM thread t WHERE t.state='running'
-        OR json_extract(t.metadata,'$.agentWait') IS NOT NULL
-        OR json_extract(t.metadata,'$.cancellationRequest') IS NOT NULL
-        OR EXISTS(SELECT 1 FROM thread_work w WHERE w.thread_id=t.id AND w.status!='done')
-        OR EXISTS(SELECT 1 FROM thread_execution e WHERE e.thread_id=t.id AND e.ended_at IS NULL)`)
+      references.push(...database.prepare(`SELECT t.id, t.cwd FROM thread t WHERE t.id IN (
+        SELECT id FROM thread WHERE state='running'
+          OR json_extract(metadata,'$.agentWait') IS NOT NULL
+          OR json_extract(metadata,'$.cancellationRequest') IS NOT NULL
+        UNION SELECT thread_id FROM thread_work WHERE status!='done'
+        UNION SELECT thread_id FROM thread_execution WHERE ended_at IS NULL
+      )`)
         .all().map((row) => ({ id: row.id, cwd: row.cwd, database: databasePath })));
     } finally {
       database.close();
@@ -1013,33 +1070,32 @@ function gitDisposition(record, nestedWorkspaces = []) {
       try { return existsSync(candidate) && directoryHasEntries(candidate); } catch { return true; }
     });
   const head = git(record.path, ["rev-parse", "HEAD"]);
-  const refs = record.checkoutType === "clone"
-    ? git(record.path, ["for-each-ref", "--format=%(refname)", "refs/heads"])
-      .split("\n")
-      .filter(Boolean)
-    : [];
-  const candidates = [...refs, "HEAD"];
-  const durableSource = record.durableSourceCommit === null ? [] : [record.durableSourceCommit];
-  const freshlyObserved=[];
-  const initiallyMissing=candidates.some(ref=>Number(git(record.path,["rev-list","--count",ref,"--not","--remotes",...durableSource]))>0);
-  if(initiallyMissing&&refs.length){
-    const knownHeads=new Map(refs.map(ref=>[ref,git(record.path,["rev-parse",ref])]));
-    const remotes=git(record.path,["remote"]).split("\n").filter(Boolean);
-    for(const remote of remotes){
-      const observed=command("git",["-C",record.path,"ls-remote","--heads",remote,...refs],{timeout:4000});
-      if(observed.status!==0)return {safe:false,sourceRetention:true,reason:`remote custody observation unavailable for ${remote}; checkout and generated caches retained`,head};
-      for(const line of observed.stdout.split("\n").filter(Boolean)){
-        const [sha,ref]=line.split(/\s+/u);if(!/^[a-f0-9]{40,64}$/u.test(sha)||!knownHeads.has(ref))return {safe:false,sourceRetention:true,reason:"remote custody observation malformed; checkout and generated caches retained",head};
-        if(knownHeads.get(ref)===sha)freshlyObserved.push(sha);
+  // Snapshot names and object IDs together; do not walk the graph per branch.
+  const inventory = git(record.path, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes"])
+    .split("\n").filter(Boolean).map(line => line.split(" "));
+  const knownHeads = new Map(record.checkoutType === "clone"
+    ? inventory.filter(([ref]) => ref.startsWith("refs/heads/")) : []);
+  const refs = [...knownHeads.keys()];
+  const candidates = [...knownHeads.values(), head];
+  const durable = inventory.filter(([ref]) => ref.startsWith("refs/remotes/")).map(([,sha]) => sha);
+  if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
+  const uncovered = () => hasUncoveredCommits((args, options) => git(record.path, args, options), candidates, durable);
+  const initiallyUncovered = uncovered();
+  if (initiallyUncovered && refs.length) {
+    const remotes = git(record.path, ["remote"]).split("\n").filter(Boolean);
+    for (const remote of remotes) {
+      const observed = command("git", ["-C", record.path, "ls-remote", "--heads", remote, ...refs], {timeout:4000});
+      if (observed.status !== 0) return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable for ${remote}; checkout and generated caches retained`, head};
+      for (const line of observed.stdout.split("\n").filter(Boolean)) {
+        const [sha,ref] = line.split(/\s+/u);
+        if (!/^[a-f0-9]{40,64}$/u.test(sha) || !knownHeads.has(ref)) return {safe:false, sourceRetention:true, reason:"remote custody observation malformed; checkout and generated caches retained", head};
+        if (knownHeads.get(ref) === sha) durable.push(sha);
       }
     }
+    if (uncovered()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
+  } else if (initiallyUncovered) {
+    return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
-  const local = [];
-  for (const ref of candidates) {
-    const count = Number(git(record.path, ["rev-list", "--count", ref, "--not", "--remotes", ...durableSource, ...freshlyObserved]));
-    if (count > 0) local.push(`${ref}:${count}`);
-  }
-  if (local.length > 0) return { safe: false, sourceRetention: true, reason: `checkout has commits absent from remote refs: ${local.join(", ")}`, head };
   if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
   if (head === record.durableSourceCommit) return { safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head };
   return { safe: true, sourceRetention: false, reason: "every local branch commit exists on a remote ref or in durable source ancestry", head };
@@ -1542,6 +1598,9 @@ function reconcileRecords(database, selected, options) {
         const current = recordsInGroup(database, recordBy(database, { id: selectedRecord.id }));
         const queuedProtection=stackQueueInspection(stackQueueSafety(current.map(record=>record.path),options.safety,options.terminalSourceTransfer===true?"physical-checkout":"source",options.deadline));
         if(queuedProtection!==null) return current.map(record=>({record,inspection:queuedProtection,action:"none"}));
+        if(options.execute) for(const record of current) {
+          if(!generatedOnlySourceCustody(database,record.id)&&!recordRetainsCustody(database,record.id)&&!retainedParent(database,record.path)) assertNoAmplifyingCleanupImport(record.path,options.statePath);
+        }
         const maintenance = duringInspection(options.deadline, () => new Map(current.map((record) => [record.id, generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database, record.path) ? "retained-custody" : maintainReferenceClone(record.path, options.execute, options.statePath)])));
         const reconciled = current.length > 1 ? groupReconciliation(database, current, options)
           : current.length === 1 ? [reconcileRecord(database, current[0], options)] : [];
@@ -1936,8 +1995,11 @@ function checkoutConstructionCapacity(entries, selected, blockSize) {
 function importBaseCommits(repository, sourceCommit, mirror) {
   const baseCommits = [];
   if (mirror && existsSync(mirror) && !existsSync(path.join(mirror, "objects", "info", "alternates"))) {
-    const tips = [...new Set(git(mirror, ["for-each-ref", "--sort=-committerdate", "--format=%(objectname)"]).split("\n").filter(Boolean))];
-    // Bound qualification work; omitting older tips only overestimates import.
+    const tips = [...new Set(git(mirror, ["for-each-ref", "--count=16", "--format=%(objectname)"]).split("\n").filter(Boolean))];
+    // Import bases are an optional capacity optimisation. Do not sort by commit
+    // date: that dereferences every retained tip (24k on Converge) before the
+    // existing 16-tip limit and can exhaust the Git deadline. Lexical candidates
+    // are sufficient: omitting newer/better bases only overestimates import.
     for (const tip of tips.slice(0, 16)) {
       const common = command("git", ["-C", repository, "merge-base", "--all", tip, sourceCommit]);
       if (common.status !== 0) continue;
@@ -1953,14 +2015,7 @@ function sourceImportCapacity(repository, sourceCommit, mirror, sparsePatterns) 
   if (mirror && existsSync(mirror) && hasObjectClosure(mirror, sourceCommit, sparsePatterns)) return { bytes: 0, baseCommits: [sourceCommit] };
   const baseCommits = importBaseCommits(repository, sourceCommit, mirror);
   const objects = git(repository, ["rev-list", "--objects", "--no-object-names", sourceCommit, ...baseCommits.map(tip => `^${tip}`)]);
-  const sizes = run("git", ["-C", repository, "cat-file", "--batch-check=%(objectsize)"], { input: `${objects}\n` });
-  let bytes = 16 * 1024 ** 2;
-  for (const size of sizes.split("\n")) {
-    if (!/^\d+$/u.test(size)) fail("source capacity estimate unknown: source history object is unavailable");
-    // Pack construction can temporarily hold both incoming and installed files.
-    bytes += 2 * (Number(size) + Math.ceil(Number(size) / 1000) + 128);
-  }
-  if (!Number.isSafeInteger(bytes)) fail("source history capacity exceeds supported byte range");
+  const bytes = historyImportBytes(objects, input => command("git", ["-C", repository, "cat-file", "--batch-check=%(objectsize)"], { input }));
   return { bytes, baseCommits };
 }
 
@@ -2117,7 +2172,16 @@ function capacityReservations(database, device, reservedPath, measure) {
       if (!measurement.ok) measurementFailures.push({ path: row.path, error: measurement.error, reservedBytes: budget });
       return remainingCapacityBytes(plan, row.state, measurement);
     }).filter(bytes => bytes > 0);
-  return { priced, headroomBytes, unpricedDormant, ...(measurementFailures.length ? { measurementFailures } : {}) };
+  // Source imports reserve before releasing the device fence. A killed importer
+  // retains liability until its original operation reconciles; elapsed time is not credit.
+  const sources = database.prepare("SELECT destination,receipt,plan_json FROM workspace_source_capacity WHERE device_id=? AND destination!=?").all(device, reservedPath ?? "");
+  for (const row of sources) {
+    const plan = JSON.parse(row.plan_json);
+    capacityRequirement(plan, []);
+    headroomBytes = Math.max(headroomBytes, plan.headroomBytes, plan.intent === "unestimated" ? plan.constructionBytes : 0);
+    priced.push(plan.growthBytes + (plan.intent === "unestimated" ? 0 : plan.constructionBytes));
+  }
+  return { priced, headroomBytes, unpricedDormant, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
 // Diagnostic projection only: the admission decision still uses capacityRequirement.
@@ -2136,6 +2200,7 @@ function capacityRefusalDetails(plan, reservations) {
       unestimated ? plan.constructionBytes : 0),
     otherReservationsBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     otherReservationBytes: [...reservations.priced],
+    sourceImports: reservations.sourceImports ?? [],
     unpricedDormant: reservations.unpricedDormant,
     measurementFailures: reservations.measurementFailures === undefined ? [] : reservations.measurementFailures,
     sourceImport: plan.sourceImportBytes === undefined ? { state: "unset" } : { state: "set", bytes: plan.sourceImportBytes },
@@ -2222,18 +2287,20 @@ function repositoryRemotes(repository) {
   const fetch = command("git", ["-C", repository, "remote", "get-url", "origin"]);
   if (fetch.status !== 0 || fetch.stdout.length === 0) return { fetch: repository, push: repository };
   const push = command("git", ["-C", repository, "remote", "get-url", "--push", "origin"]);
+  const explicitPush = command("git", ["-C", repository, "config", "--get-all", "remote.origin.pushurl"]);
   const directory = realpathSync(repository);
   return {
+    explicitPush: explicitPush.status === 0 && explicitPush.stdout.length > 0,
     fetch: repositoryLocation(fetch.stdout, directory),
     push: repositoryLocation(push.status === 0 && push.stdout.length > 0 ? push.stdout : fetch.stdout, directory),
   };
 }
 
 // An explicit push URL disables Git's `url.<base>.pushInsteadOf` rewriting for the remote, so a
-// checkout only records one when the source really pushes somewhere other than it fetches. A
+// checkout preserves an explicit source push URL even when equal to fetch. A
 // programme checkout cloned from a read-only URL then still pushes through the host's rewrite.
 function configurePushUrl(gitArgs, upstream) {
-  if (upstream.push !== upstream.fetch) {
+  if (upstream.explicitPush || upstream.push !== upstream.fetch) {
     run("git", [...gitArgs, "remote", "set-url", "--push", "origin", upstream.push]);
   } else if (command("git", [...gitArgs, "config", "--get", "remote.origin.pushurl"]).status === 0) {
     run("git", [...gitArgs, "config", "--unset-all", "remote.origin.pushurl"]);
@@ -2259,11 +2326,18 @@ function withResourceLock(statePath, key, action, deadline) {
   const file = path.join(directory, createHash("sha256").update(key).digest("hex"));
   const descriptor = openSync(file, "a", 0o600);
   try {
-    const waitMs = deadline === undefined ? 30_000 : Math.max(0, Math.min(100, deadline - Date.now()));
+    const effectiveDeadline=maintenanceContext?.journal.deadline ?? deadline;
+    const waitMs = effectiveDeadline === undefined ? 30_000 : Math.max(0, Math.min(100, effectiveDeadline - Date.now()-250));
     const result = spawnSync("flock", ["--exclusive", "--wait", String(waitMs / 1000), "3"], {
       stdio: ["ignore", "pipe", "pipe", descriptor], encoding: "utf8", timeout: waitMs + 1000,
     });
-    if (result.status !== 0) throw new ResourceBusyError(`workspace resource busy: ${key}: ${result.error?.message || result.stderr?.trim() || `${waitMs}ms lock budget exhausted`}`);
+    if (result.status !== 0) {
+      const error = new ResourceBusyError(`workspace resource busy: ${key}: ${result.error?.message || result.stderr?.trim() || `${waitMs}ms lock budget exhausted`}`);
+      // flock exit 1 with no diagnostic is an exhausted wait, not a failed import.
+      // Mark only the capacity acquisition boundary, never action() or mirror failures.
+      if (/^capacity:[0-9]+$/u.test(key) && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-capacity-lock-busy";
+      throw error;
+    }
     heldResourceLocks.set(identity, descriptor);
     return action();
   } finally {
@@ -2277,6 +2351,12 @@ function sourceRefFor(repository, ref) {
 }
 
 function renameAlternate(file, objectSource) {
+  if (maintenanceContext) return maintenanceEffect('alternates-replacement', {file,objectSource}, () => {
+    const temporary=`${file}.maintain-${maintenanceContext.journal.operation}`;
+    const descriptor=openSync(temporary,'wx',0o600);
+    try{writeFileSync(descriptor,`${objectSource}\n`);fsyncSync(descriptor);}finally{closeSync(descriptor);}
+    renameSync(temporary,file);const parent=openSync(path.dirname(file),'r');try{fsyncSync(parent);}finally{closeSync(parent);}return null;
+  });
   const temporary = `${file}.${randomUUID()}`;
   try {
     writeFileSync(temporary, `${objectSource}\n`, { flag: "wx", mode: 0o600 });
@@ -2298,11 +2378,12 @@ function stabilizeObjectCustody(workspace, alternates, execute, statePath) {
   const mirror = mirrorFor(statePath, upstream.fetch);
   withResourceLock(statePath, `mirror:${mirror}`, () => {
     prepareMirror(mirror, workspace, upstream);
-    const objects = new Set([
+    const collectObjects = () => [...new Set([
       git(workspace, ["rev-parse", "--verify", "HEAD"]),
       ...git(workspace, ["for-each-ref", "--format=%(objectname)"]).split("\n"),
       ...git(workspace, ["reflog", "--all", "--format=%H"]).split("\n"),
-    ].filter(Boolean));
+].filter(Boolean))];
+    const objects=maintenanceContext ? maintenanceContext.journal.freeze(`objects:${workspace}`,collectObjects) : collectObjects();
     const refs = [...objects].map(object => `+${object}:refs/pi-workspace/objects/${object}`);
     for (let index = 0; index < refs.length; index += 128) {
       run("git", ["--git-dir", mirror, "fetch", "--no-tags", "--no-auto-maintenance", workspace,
@@ -2436,14 +2517,15 @@ function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatte
 }
 
 function prepareMirror(mirror, repository, upstream) {
-  mkdirSync(path.dirname(mirror), { recursive: true, mode: 0o700 });
+  maintenanceEffect('mirror-directory',{directory:path.dirname(mirror)},()=>{mkdirSync(path.dirname(mirror), { recursive: true, mode: 0o700 });return null;});
   if (!existsSync(mirror)) run("git", ["init", "--bare", mirror]);
   if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
   for (const [name, value] of Object.entries({ ...REFERENCE_CLONE_CONFIG, "fetch.unpackLimit": "1" })) {
     run("git", ["--git-dir", mirror, "config", "--local", name, value]);
   }
   for (const [name, url] of [["origin", upstream.fetch], ["workspace-source", repository]]) {
-    const existing = command("git", ["--git-dir", mirror, "remote", "get-url", name]);
+    const observeRemote=()=>command("git", ["--git-dir", mirror, "remote", "get-url", name]);
+    const existing = maintenanceContext ? maintenanceContext.journal.freeze(`remote:${mirror}:${name}`,observeRemote) : observeRemote();
     if (existing.status !== 0 && existing.status !== 2) {
       fail(`cannot read mirror remote ${name}: ${existing.stderr || existing.error?.message || `exit ${existing.status}`}`);
     }
@@ -2556,16 +2638,59 @@ function prepareSourceValue(database, args, request) {
   const device = String(statSync(root).dev);
   let resolvedCommit;
   withResourceLock(statePath, `capacity:${device}`, () => {
+    const priorImport = database.prepare("SELECT receipt FROM workspace_source_capacity WHERE destination=?").get(destination);
+    if (priorImport && priorImport.receipt !== request.receipt) throw new ResourceBusyError("source import retains capacity under a different original request; reconcile that operation first");
     try { plan.admission = assertCapacity(root, args, database, destination, plan); }
     catch (error) {
       if (error.code === "workspace-capacity-refused") writePreparationReceipt(forecastPath,
         { ...forecast, refusal: { code: error.code, capacity: error.capacity } });
       throw error;
     }
-    resolvedCommit = resolveSource(statePath, mirror, repository, upstream, sourceCommit, sparsePatterns);
-    if (!resolvedCommit.startsWith(sourceCommit)) fail("source preparation changed the requested commit");
+    // Reserve all priced liability atomically, then release the device fence before
+    // mirror-lock waits, closure traversal and Git import. Independent mirrors proceed.
+    database.prepare("INSERT OR REPLACE INTO workspace_source_capacity(destination,device_id,plan_json,receipt) VALUES(?,?,?,?)")
+      .run(destination, device, JSON.stringify(plan), request.receipt);
   });
-  return { sourceCommit: resolvedCommit, plan, stamp: objectStoreStamp(mirror) };
+  try {
+    const importSource = () => resolveSource(statePath, mirror, repository, upstream, sourceCommit, sparsePatterns);
+    // Reservation-aware emergency rollback: retain schema2/accounting and serialize transport.
+    resolvedCommit = process.env.PI_WORKSPACE_SERIAL_IMPORT === "1"
+      ? withResourceLock(statePath, `capacity:${device}`, importSource) : importSource();
+    if (!resolvedCommit.startsWith(sourceCommit)) fail("source preparation changed the requested commit");
+    return { sourceCommit: resolvedCommit, plan, stamp: objectStoreStamp(mirror) };
+  } finally {
+    try {
+      withResourceLock(statePath, `capacity:${device}`, () => {
+        database.prepare("DELETE FROM workspace_source_capacity WHERE destination=? AND receipt=?").run(destination, request.receipt);
+      });
+    } catch (error) {
+      // Import may already have happened. Never misclassify cleanup contention as
+      // pre-import acquisition and authorize another generation from that receipt.
+      throw Object.assign(new CliError(`source import capacity settlement failed; original liability retained: ${error.message}`), { code: "source-import-settlement-failed" });
+    }
+  }
+}
+
+// Object-store stamps invalidate closure memoization, not an immutable completed request.
+// Refresh the proof before reusing a READY plan; never refetch merely because unrelated
+// commits/config writes changed the shared mirror. Admission still recomputes capacity.
+function revalidatePreparedSource(value, input, sourceCommit) {
+  const priorMode = sourcePreparationMode, priorDeadline = sourcePreparationDeadline;
+  sourcePreparationMode = "foreground";
+  sourcePreparationDeadline = Math.min(priorDeadline, Date.now() + 1500);
+  try { return revalidatePreparedSourceWithinBudget(value, input, sourceCommit); }
+  catch (error) { if (error instanceof SourcePreparationRequired) return null; throw error; }
+  finally { sourcePreparationMode = priorMode; sourcePreparationDeadline = priorDeadline; }
+}
+function revalidatePreparedSourceWithinBudget(value, input, sourceCommit) {
+  if (value?.sourceCommit !== sourceCommit || value.plan?.sourceCommit !== sourceCommit) return null;
+  const stamp = objectStoreStamp(input.mirror);
+  if (stamp === null) return null;
+  assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
+  assertSourceCheckoutFilters(input.mirror);
+  if (!hasObjectClosure(input.mirror, sourceCommit, input.sparsePatterns)) return null;
+  if (objectStoreStamp(input.mirror) !== stamp) return null;
+  return { ...value, stamp };
 }
 
 function prepareCreationSource(database, args, input) {
@@ -2582,7 +2707,16 @@ function prepareCreationSource(database, args, input) {
   const stamp = objectStoreStamp(input.mirror);
   if (stamp !== null && existsSync(receipt)) {
     const value = JSON.parse(readFileSync(receipt, "utf8"));
-    if (value.sourceCommit === sourceCommit && value.stamp === stamp) return { state: "ready", value };
+    if (value.sourceCommit === sourceCommit && value.stamp === stamp) {
+      assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
+      assertSourceCheckoutFilters(input.mirror);
+      return { state: "ready", value };
+    }
+    const refreshed = revalidatePreparedSource(value, input, sourceCommit);
+    if (refreshed !== null) {
+      writePreparationReceipt(receipt, refreshed);
+      return { state: "ready", value: refreshed };
+    }
   }
   const pointerPath = path.join(directory, `${key}.job.json`);
   let pointer = existsSync(pointerPath) ? JSON.parse(readFileSync(pointerPath, "utf8")) : null;
@@ -2626,7 +2760,14 @@ function prepareCreationSource(database, args, input) {
       writePreparationReceipt(path.join(directory, "recoveries", `${recovery.value.id}.json`), { previous, next: pointer });
       writePreparationReceipt(pointerPath, pointer);
     }
-    if (terminal.state === "ready" && terminal.value.stamp !== stamp) pointer = null;
+    if (terminal.state === "ready") {
+      const refreshed = revalidatePreparedSource(terminal.value, input, sourceCommit);
+      if (refreshed !== null) {
+        writePreparationReceipt(receipt, refreshed);
+        return { state: "ready", value: refreshed };
+      }
+      if (terminal.value.stamp !== stamp) pointer = null;
+    }
   }
   let value;
   try {
@@ -2678,7 +2819,7 @@ function sourcePreparationWorker() {
     const result = finishSourceJob(directory, { state: "ready", value });
     if (!result.ok) fail(result.error.message);
   } catch (error) {
-    finishSourceJob(directory, { state: "failed", error: { code: error.code === "workspace-capacity-refused" ? error.code : "source-preparation-failed", message: error.message } });
+    finishSourceJob(directory, { state: "failed", error: { code: ["workspace-capacity-refused", "workspace-capacity-lock-busy"].includes(error.code) ? error.code : "source-preparation-failed", message: error.message } });
     throw error;
   } finally { database.close(); }
 }
@@ -3322,16 +3463,23 @@ function releaseCommand(database, args, statePath) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
   const deadline=Date.now()+35_000;
-  const result = duringInspection(deadline,()=>reconcileRecords(database, current, {
-    deadline,
-    execute: true,
-    reapExpired: bool(args, "reap-expired"),
-    preserveRuntime: bool(args, "preserve-runtime"),
-    ignoreLease: true,
-    statePath,
-    safety: safetySnapshot(database),
-    terminalSourceTransfer:true,
-  })).map(leaseReleaseDisposition);
+  // Snapshot failure is a completed *non-destructive* refusal, not an orphaned
+  // release. Never substitute partial/empty reference observations.
+  let result;
+  try {
+    result = duringInspection(deadline,()=>reconcileRecords(database, current, {
+      deadline,
+      execute: true,
+      reapExpired: bool(args, "reap-expired"),
+      preserveRuntime: bool(args, "preserve-runtime"),
+      ignoreLease: true,
+      statePath,
+      safety: safetySnapshot(database),
+      terminalSourceTransfer:true,
+    })).map(leaseReleaseDisposition);
+  } catch (error) {
+    result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
+  }
   const settled = finishOrdinaryRelease(database, requestId, result);
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
 }
@@ -3833,22 +3981,61 @@ function reconcileCommand(database, args, statePath) {
   print(results, bool(args, "json"));
 }
 
-function maintainCommand(database, args) {
-  assertOnly(args, ["root", "id", "path", "execute", "json"]);
-  const records = one(args, "id") !== undefined || one(args, "path") !== undefined
-    ? [recordBy(database, selectorFrom(args, 'maintain'))] : listRecords(database, one(args, "root"));
-  const results = [];
-  for (const record of records) {
-    try {
-      const result = withWorkspaceLock(database, record.path, () => maintainReferenceClone(record.path, bool(args, "execute"), registryPaths.get(database)), record.groupId);
-      if (result) results.push(result);
-    } catch (error) {
-      results.push({ path: record.path, error: error instanceof Error ? error.message : String(error) });
-      process.exitCode = 1;
-    }
+function maintenancePostcondition(spec) {
+  if(spec.kind==='mirror-directory')return existsSync(spec.input.directory) && lstatSync(spec.input.directory).isDirectory()?{kind:'applied',result:null,evidence:'canonical-directory-observation'}:{kind:'unknown'};
+  if(spec.kind==='gc-warning-removal')return !existsSync(spec.input.file)?{kind:'applied',result:null,evidence:'canonical-warning-path-absent-postcondition-not-historical-attribution'}:{kind:'unknown'};
+  if(spec.kind==='alternates-replacement')return existsSync(spec.input.file)&&readFileSync(spec.input.file,'utf8')===`${spec.input.objectSource}\n`?{kind:'applied',result:null,evidence:'canonical-exact-alternates-bytes'}:{kind:'unknown'};
+  if(spec.kind!=='git')return {kind:'unknown'};
+  const args=spec.input.args,offset=['-C','--git-dir'].includes(args[0])?2:0,location=args.slice(0,offset),verb=args[offset],rest=args.slice(offset+1);
+  const read=(suffix)=>command('git',[...location,...suffix]);
+  if(verb==='config'){
+    const words=rest.filter(x=>!x.startsWith('--'));if(words.length===2){const result=read(['config','--local','--get-all',words[0]]);if(result.status===0&&result.stdout===words[1])return {kind:'applied',result:'',evidence:'canonical-exact-config'};}
+    if(rest.includes('--unset-all')&&words.length===1){const result=read(['config','--local','--get-all',words[0]]);if(result.status===1&&!result.error)return {kind:'applied',result:'',evidence:'canonical-config-unset-postcondition'};}
   }
-  if (bool(args, "json")) print(results, true);
-  else for (const result of results) process.stdout.write(`${result.path}\t${result.error ?? `${result.settings.join(",") || "configured"}; gc.log ${result.gcLog}; objects ${result.objectCustody}`}\n`);
+  if(verb==='remote'&&['add','set-url'].includes(rest[0])){const name=rest.at(-2),url=rest.at(-1),result=read(['remote','get-url',...(rest.includes('--push')?['--push']:[]),name]);if(result.status===0&&result.stdout===url)return {kind:'applied',result:'',evidence:'canonical-remote-url'};}
+  if(verb==='init'&&rest[0]==='--bare'){const result=command('git',['--git-dir',rest[1],'rev-parse','--is-bare-repository']);if(result.status===0&&result.stdout==='true')return {kind:'applied',result:'',evidence:'canonical-bare-mirror'};}
+  if(verb==='fetch'){
+    const refs=rest.filter(x=>/^\+[a-f0-9]{40,64}:refs\/pi-workspace\/objects\//.test(x));if(!refs.length||refs.length>128)return {kind:'unknown'};
+    for(const ref of refs){maintenanceContext.journal.check();const [oid,name]=ref.slice(1).split(':');const observed=read(['rev-parse','--verify',name]);if(observed.status!==0||observed.stdout!==oid)return {kind:'unknown'};}
+    return {kind:'applied',result:'',evidence:'canonical-every-exact-fetch-ref'};
+  }
+  return {kind:'unknown'};
+}
+function maintainCommand(database, args) {
+  assertOnly(args,['root','id','path','execute','json','operation-id','resume','reconcile','budget-ms','max-records','prior-state','prior-state-sha256']);
+  const budget=Number(required(args,'budget-ms')),maxRecords=Number(required(args,'max-records'));
+  if(!Number.isSafeInteger(budget)||budget<1000||budget>20000||!Number.isSafeInteger(maxRecords)||maxRecords<1||maxRecords>32)throw new MaintenanceError('maintenance-explicit-bounds-required');
+  const deadline=Date.now()+budget,statePath=registryPaths.get(database);
+  const root=one(args,'root')===undefined?null:path.resolve(one(args,'root'));
+  if(root!==null&&(one(args,'id')!==undefined||one(args,'path')!==undefined))throw new MaintenanceError('maintenance-selection-conflict');
+  const target=root===null?recordBy(database,selectorFrom(args,'maintain')):null;
+  const scope={root,id:target?.id??null,path:target?.path??null};
+  const next=(cursor)=>{
+    const row=target ? cursor===''?database.prepare('SELECT id,path,owner,source_commit,group_id FROM workspace WHERE id=?').get(target.id):null
+      : database.prepare('SELECT id,path,owner,source_commit,group_id FROM workspace WHERE root=? AND id>? ORDER BY id LIMIT 1').get(root,cursor);
+    return row?{id:row.id,path:row.path,owner:row.owner,sourceCommit:row.source_commit,groupId:row.group_id}:null;
+  };
+  if(!bool(args,'execute')){
+    if(bool(args,'reconcile')||bool(args,'resume'))throw new MaintenanceError('maintenance-execute-required');
+    const results=[];let cursor='';duringInspection(deadline,()=>{while(results.length<maxRecords){const record=next(cursor);if(!record)break;cursor=record.id;results.push({id:record.id,path:record.path,result:withWorkspaceLock(database,record.path,()=>maintainReferenceClone(record.path,false,statePath),record.groupId,deadline)});}});
+    print({kind:'maintenance-preview',cursor,results,notExecution:true},true);return;
+  }
+  const operation=required(args,'operation-id');
+  // A prior unknown legacy run must be reconciled by its actual owner, not replayed.
+  const prior=priorDisposition(required(args,'prior-state'),required(args,'prior-state-sha256'),scope);
+  const journalFile=path.join(path.dirname(statePath),'maintenance-journal.sqlite3');
+  const journal=new MaintenanceJournal(journalFile,operation,{scope,prior,protocol:1,toolSha256:createHash('sha256').update(readFileSync(new URL(import.meta.url))).digest('hex'),journalSha256:createHash('sha256').update(readFileSync(new URL('./maintenance-journal.mjs',import.meta.url))).digest('hex')},{resume:bool(args,'resume'),deadline});
+  const inspect=record=>{
+    const actual=database.prepare('SELECT id,path,owner,source_commit,group_id FROM workspace WHERE id=?').get(record.id);
+    if(!actual||maintenanceDigest(record)!==maintenanceDigest({id:actual.id,path:actual.path,owner:actual.owner,sourceCommit:actual.source_commit,groupId:actual.group_id}))throw new MaintenanceError('maintenance-record-identity-conflict');
+    if(generatedOnlySourceCustody(database,record.id)||recordRetainsCustody(database,record.id)||retainedParent(database,record.path))throw new MaintenanceError('maintenance-retained-custody');
+  };
+  try{
+    if(bool(args,'reconcile')){
+      const result=journal.reconcile(spec=>{inspect(spec.workspace);return withWorkspaceLock(database,spec.workspace.path,()=>{inspect(spec.workspace);maintenanceContext={journal,record:spec.workspace};try{return maintenancePostcondition(spec);}finally{maintenanceContext=undefined;}},spec.workspace.groupId,deadline);});print(result,true);return;
+    }
+    const result=journal.run({next,inspect,maxRecords,execute:record=>withWorkspaceLock(database,record.path,()=>{inspect(record);maintenanceContext={journal,record};try{return maintainReferenceClone(record.path,true,statePath);}finally{maintenanceContext=undefined;}},record.groupId,deadline)});print(result,true);if(result.state!=='settled')process.exitCode=75;
+  }catch(error){const checkpoint=journal.status();print({...checkpoint,error:{code:error instanceof MaintenanceError?error.code:'maintenance-command-failed',message:error.message}},true);process.exitCode=75;}finally{maintenanceContext=undefined;journal.close();}
 }
 
 function statusCommand(database, args) {
@@ -3954,7 +4141,7 @@ function help() {
   agent-workspace retire-source-materialization --id ID --path PATH --owner OWNER --request ABS_FILE --request-sha256 SHA --json
   agent-workspace retire-growth ${selectorSyntax("retire-growth")} --owner OWNER --disposition FILE --disposition-sha256 SHA [--json]
   agent-workspace resume-growth ${selectorSyntax("resume-growth")} --owner OWNER --expected-plan-sha256 SHA --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
-  agent-workspace maintain [--root PATH | --path PATH] [--execute] [--json]
+  agent-workspace maintain (--root PATH | --id ID | --path PATH) --budget-ms 1000..20000 --max-records 1..32 [--execute --operation-id UUID --prior-state FILE --prior-state-sha256 SHA256 [--resume] [--reconcile]] [--json]
   agent-workspace status [--root PATH] [--path SUBSTRING] [--owner SUBSTRING] [--limit 1..500 (initial page 100)] [--after CURSOR|start] [--json]
   agent-workspace list ...                    alias for status
 
@@ -3975,7 +4162,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if (argv[0] === "materialization-process-snapshot") {
@@ -4052,6 +4239,13 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
       return;
     }
     creationDeadline = Date.now() + budgetMs;
+  }
+  if(commandName==='maintain'&&process.env.PI_WORKSPACE_MAINTAIN_WORKER!==statePath){
+    const budget=Number(one(args,'budget-ms'));
+    if(!Number.isSafeInteger(budget)||budget<1000||budget>20000)throw new MaintenanceError('maintenance-explicit-bounds-required');
+    const result=boundedCommand(process.execPath,[new URL(import.meta.url).pathname,...argv],{timeout:budget+1000,maxBuffer:1048576,reapGroup:true,env:{...process.env,PI_WORKSPACE_STATE:statePath,PI_WORKSPACE_MAINTAIN_WORKER:statePath}});
+    if(result.error||result.signal){print({kind:'maintenance-worker-outcome-unknown',state:'unknown',operationId:one(args,'operation-id')??null,code:result.error?.code??'worker-signalled',next:'observe original journal; reconcile before resume; never replay as a new operation'},true);process.exitCode=75;return;}
+    process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
   }
   const database = openRegistry(statePath);
   try {

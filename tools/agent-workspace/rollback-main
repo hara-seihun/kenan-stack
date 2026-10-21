@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+export PI_WORKSPACE_SERIAL_IMPORT=1
+exec /usr/local/bin/node "$(dirname "$0")/workspace.mjs" "$@"

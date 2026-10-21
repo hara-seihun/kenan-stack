@@ -33,3 +33,18 @@ test('group reconciliation also retains cache when unique source prevents releas
  const safety={processes:[],threads:[],docker:{available:false,containers:[]},systemd:{available:false,units:[]},gitAlternates:[],linkedWorktrees:[],currentStackQueue:{errors:[],references:[],observedAt:Date.now()}};
  const result=workspaceTesting.groupReconciliation(f.db,[{...f.record,leaseExpiresAt:0}],{execute:true,ignoreLease:true,reapExpired:false,preserveRuntime:true,safety,statePath:f.state,terminalSourceTransfer:true,deadline:Date.now()+5000});assert.equal(result[0].action,'none');assert.deepEqual(result[0].removedCaches,[]);assert.equal(fs.existsSync(path.join(f.source,'node_modules','receipt')),true);
 }));
+test('timed-out union walk retains source, cache, foreign refs and release custody',()=>fixture(f=>{
+ f.commit();const foreign=f.git('-C',f.source,'rev-parse','HEAD');f.git('-C',f.source,'branch','foreign-work',foreign);
+ const bin=path.join(f.root,'bin');fs.mkdirSync(bin);
+ // Only the release graph probe is delayed; this does not alter the checkout.
+ const originalPath=process.env.PATH;const native=execFileSync('which',['git'],{encoding:'utf8'}).trim();
+ fs.writeFileSync(path.join(bin,'git'),'#!/bin/sh\nif [ "$3" = "rev-list" ]; then sleep 2; fi\nexec '+JSON.stringify(native)+' "$@"\n',{mode:0o755});
+ process.env.PATH=bin+':'+originalPath;
+ try {
+  const safety={processes:[],threads:[],docker:{available:false,containers:[]},systemd:{available:false,units:[]},gitAlternates:[],linkedWorktrees:[],currentStackQueue:{errors:[],references:[],observedAt:Date.now()}};
+  assert.throws(()=>workspaceTesting.groupReconciliation(f.db,[{...f.record,leaseExpiresAt:0}],{execute:true,ignoreLease:true,reapExpired:false,preserveRuntime:true,safety,statePath:f.state,terminalSourceTransfer:true,deadline:Date.now()+700}),/timed out|budget exhausted/);
+ }finally{process.env.PATH=originalPath;}
+ assert.equal(f.git('-C',f.source,'rev-parse','foreign-work'),foreign);
+ assert.equal(fs.existsSync(path.join(f.source,'node_modules','receipt')),true);
+ assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'new unique work');
+}));

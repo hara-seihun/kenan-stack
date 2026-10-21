@@ -100,6 +100,18 @@ export function finishSourceJob(directory, result) {
   } catch (error) { return { ok: false, error: ioError(error) }; }
 }
 
+// Interruption is durable progress, not an immutable terminal result: explicit
+// same-identity recovery remains possible. Never settle an uncertain control RPC.
+export function recordSourceJobInterruption(directory, attempt) {
+  const result = readTerminal(directory);
+  if (result) return result;
+  const value = { state: "interrupted", error: { code: "source-job-interrupted",
+    message: "source job stopped without a terminal result; repeat the original create request to resume" } };
+  atomicJson(path.join(directory, "progress.json"), { ...value, attempt: attempt.number,
+    unit: attempt.unit, updatedAt: new Date().toISOString() });
+  return value;
+}
+
 export function observeSourceJob(directory) {
   try {
     const result = readTerminal(directory);
@@ -114,10 +126,9 @@ export function observeSourceJob(directory) {
     // Completion may race with unit observation; its immutable result wins.
     const completed = readTerminal(directory);
     if (completed) return completed;
-    if (!observed.ok) return { state: "failed", error: observed.error };
-    if (observed.state !== "running" && observed.state !== "stopping") return {
-      state: "interrupted", error: { code: "source-job-interrupted", message: "source job stopped without a terminal result; repeat the original create request to resume" },
-    };
+    if (!observed.ok) return controlObservation(observed, path.basename(directory), directory);
+    if (observed.state !== "running" && observed.state !== "stopping")
+      return recordSourceJobInterruption(directory, attempt.value);
     const progress = readJson(path.join(directory, "progress.json"));
     return { state: "pending", phase: observed.state, progress: progress.present ? progress.value : null };
   } catch (error) { return { state: "failed", error: ioError(error) }; }
@@ -198,6 +209,17 @@ function pending(jobId, directory, phase) {
   return { state: "pending", jobId, progressPath: path.join(directory, "progress.json"), resultPath: path.join(directory, "result.json"), phase };
 }
 
+// A timed-out control RPC says nothing about the durable worker's outcome.
+// Never turn an indeterminate observation into a terminal failure or resubmit.
+function controlObservation(observed, jobId, directory) {
+  const completed = readTerminal(directory);
+  if (completed) return completed;
+  if (observed.error.code === "source-job-control-timeout") {
+    return { ...pending(jobId, directory, "control-timeout"), observationError: observed.error };
+  }
+  return { state: "failed", error: observed.error };
+}
+
 function readTerminal(directory) {
   const result = readJson(path.join(directory, "result.json"));
   return result.present ? terminal(result.value) : undefined;
@@ -262,12 +284,13 @@ export function runSourceJob({ directory, key, request, command, env = {}, waitM
         return failure("source-job-invalid-state", "source job attempt metadata is invalid");
       }
       const observed = unitState(attempt.value.unit);
-      if (!observed.ok) return { state: "failed", error: observed.error };
       const completed = readTerminal(jobDirectory);
       if (completed) return completed;
+      if (!observed.ok) return controlObservation(observed, jobId, jobDirectory);
       if (observed.state === "running" || observed.state === "stopping") {
         return pending(jobId, jobDirectory, observed.state);
       }
+      recordSourceJobInterruption(jobDirectory, attempt.value);
       if (!restartInterrupted) return {
         state: "interrupted", jobId, progressPath: path.join(jobDirectory, "progress.json"),
         error: { code: "source-job-interrupted", message: "source preparation unit stopped without a terminal result; repeat with restartInterrupted to resume the same job" },
@@ -289,15 +312,31 @@ export function runSourceJob({ directory, key, request, command, env = {}, waitM
       "--user", "--quiet", "--collect", `--unit=${unit}`, "--service-type=exec",
       `--property=Restart=${restartAbnormal ? "on-abnormal" : "no"}`, "--property=RestartSec=1s",
       "--property=KillMode=control-group", "--property=UMask=0077",
+      "--property=TimeoutStartSec=120",
       "--property=StandardOutput=null", "--property=StandardError=null",
       ...(cleanupCommand.length ? [`--property=ExecStopPost=${cleanupCommand.map(value =>
         `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`).join(" ")}`] : []),
       "--", process.execPath, modulePath, "--worker", jobDirectory,
     ]);
-    if (!submitted.ok) return { state: "failed", error: submitted.error };
+    if (!submitted.ok) {
+      const completed = readTerminal(jobDirectory);
+      if (completed) return completed;
+      if (submitted.error.code !== "source-job-control-timeout") return { state: "failed", error: submitted.error };
+      // systemd-run may have admitted the worker before its acknowledgement
+      // timed out. Reconcile only; keep this attempt and its immutable identity.
+      const observed = unitState(unit);
+      const reconciled = readTerminal(jobDirectory);
+      if (reconciled) return reconciled;
+      if (!observed.ok) return controlObservation(observed, jobId, jobDirectory);
+      if (observed.state === "running" || observed.state === "stopping") {
+        atomicJson(attemptPath, { number, unit, state: "submitted" });
+        return pending(jobId, jobDirectory, observed.state);
+      }
+      return controlObservation(submitted, jobId, jobDirectory);
+    }
     if (submitted.status !== 0) {
       const observed = unitState(unit);
-      if (!observed.ok) return { state: "failed", error: observed.error };
+      if (!observed.ok) return controlObservation(observed, jobId, jobDirectory);
       if (observed.state !== "running") {
         const completed = readTerminal(jobDirectory);
         return completed ?? failure("source-job-submit-failed", "systemd did not accept the source preparation job; durable state retained for reconciliation");
@@ -318,14 +357,12 @@ export function runSourceJob({ directory, key, request, command, env = {}, waitM
       Atomics.wait(pause, 0, 0, Math.min(20, remaining));
     } while (true);
     const observed = unitState(unit);
-    if (!observed.ok) return { state: "failed", error: observed.error };
     const completed = readTerminal(jobDirectory);
     if (completed) return completed;
+    if (!observed.ok) return controlObservation(observed, jobId, jobDirectory);
     if (observed.state === "running" || observed.state === "stopping") return pending(jobId, jobDirectory, observed.state);
-    return {
-      state: "interrupted", jobId, progressPath: path.join(jobDirectory, "progress.json"),
-      error: { code: "source-job-interrupted", message: "source preparation unit stopped without a terminal result" },
-    };
+    return { ...recordSourceJobInterruption(jobDirectory, { number, unit }),
+      jobId, progressPath: path.join(jobDirectory, "progress.json") };
   } catch (error) { return { state: "failed", error: ioError(error) }; }
   finally {
     if (database) {
