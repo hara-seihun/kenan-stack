@@ -515,3 +515,6 @@ A completed immutable source request is not invalidated just because unrelated i
 ### Resumable mirror contention
 
 Exact exhausted mirror-lock acquisition waits are typed `workspace-mirror-lock-busy`. Repeating the original create links a successor generation through the existing recovery record, retaining original terminal bytes/job/attempt. Legacy generic receipts recover only with the exact exhausted-wait grammar bound to that request’s canonical mirror. Action errors, settlement failures, unknown custody and failed flock execution never qualify. The successor rechecks capacity/source custody; no lock is evicted and no reservation is bypassed.
+
+### Recent ancestral import custody
+Before the existing 16 lexical mirror-tip fallback, import pricing checks at most 128 first-parent ancestors of the exact requested source (including that source). Only an independently full-closure-qualified ancestor can exclude history. This avoids enumerating years of objects merely because the first lexical mirror refs are stale. Missing/incomplete ancestors earn no credit; no recent match retains conservative existing full-history pricing, including explicit timeout/unknown failure. The existing command deadline, complete size accounting, sparse checkout charge, growth/headroom, original preparation receipts and operation identities are unchanged.

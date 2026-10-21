@@ -7,6 +7,7 @@ import {boundedCommand} from './bounded-command.mjs';
 import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contract.mjs';
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
+import { recentImportBase } from "./import-ancestors.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -1995,6 +1996,12 @@ function checkoutConstructionCapacity(entries, selected, blockSize) {
 function importBaseCommits(repository, sourceCommit, mirror) {
   const baseCommits = [];
   if (mirror && existsSync(mirror) && !existsSync(path.join(mirror, "objects", "info", "alternates"))) {
+    // A recent source ancestor often has durable custody even when lexical
+    // mirror tips predate thousands of merges. Bound this search independently
+    // of mirror ref cardinality; closure qualification is never inferred.
+    const recent = recentImportBase(repository, sourceCommit, mirror, {git,
+      closure: (store, tip) => command("git", ["--git-dir", store, "cat-file", "-e", `${tip}^{commit}`]).status === 0 && hasObjectClosure(store, tip)});
+    if (recent !== null) return [recent];
     const tips = [...new Set(git(mirror, ["for-each-ref", "--count=16", "--format=%(objectname)"]).split("\n").filter(Boolean))];
     // Import bases are an optional capacity optimisation. Do not sort by commit
     // date: that dereferences every retained tip (24k on Converge) before the
