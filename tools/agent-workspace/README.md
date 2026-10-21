@@ -511,3 +511,7 @@ Converge tools-only source deployment uses `install-capacity-host REPO FULL_RECO
 ### READY source continuation after shared mirror writes
 
 A completed immutable source request is not invalidated just because unrelated imports or mirror configuration writes changed the global object-store stamp. On a stale stamp, the creator refreshes the exact commit's independent closure proof and both source/mirror checkout-filter guards within a 1500ms foreground budget. A successful refresh reuses the original conservative pricing and job identity, without an import or editing terminal job receipts; final workspace admission still recomputes free space and reservations. Missing/changed closure, alternates, changed commit, filters or an exhausted proof budget do not authorize reuse. Slow or genuinely missing custody follows ordinary durable preparation. The original READY outcome remains immutable.
+
+### Resumable mirror contention
+
+Exact exhausted mirror-lock acquisition waits are typed `workspace-mirror-lock-busy`. Repeating the original create links a successor generation through the existing recovery record, retaining original terminal bytes/job/attempt. Legacy generic receipts recover only with the exact exhausted-wait grammar bound to that request’s canonical mirror. Action errors, settlement failures, unknown custody and failed flock execution never qualify. The successor rechecks capacity/source custody; no lock is evicted and no reservation is bypassed.

@@ -2336,6 +2336,7 @@ function withResourceLock(statePath, key, action, deadline) {
       // flock exit 1 with no diagnostic is an exhausted wait, not a failed import.
       // Mark only the capacity acquisition boundary, never action() or mirror failures.
       if (/^capacity:[0-9]+$/u.test(key) && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-capacity-lock-busy";
+      if (key.startsWith("mirror:") && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-mirror-lock-busy";
       throw error;
     }
     heldResourceLocks.set(identity, descriptor);
@@ -2741,7 +2742,7 @@ function prepareCreationSource(database, args, input) {
       const stats = statfsSync(input.root);
       const observation = { observedAt: Date.now(), device: String(statSync(input.root).dev),
         freeBytes: stats.bavail * stats.bsize, freeInodes: stats.ffree, totalInodes: stats.files };
-      const recovery = capacityRecovery(terminal, pointer.jobId, observation);
+      const recovery = capacityRecovery(terminal, pointer.jobId, observation, input.mirror);
       if (recovery.state === "invalid") fail(`${recovery.error.code}: ${recovery.error.message}`);
       if (recovery.state !== "retry") return accepted(observeJob());
       try {
@@ -2819,7 +2820,7 @@ function sourcePreparationWorker() {
     const result = finishSourceJob(directory, { state: "ready", value });
     if (!result.ok) fail(result.error.message);
   } catch (error) {
-    finishSourceJob(directory, { state: "failed", error: { code: ["workspace-capacity-refused", "workspace-capacity-lock-busy"].includes(error.code) ? error.code : "source-preparation-failed", message: error.message } });
+    finishSourceJob(directory, { state: "failed", error: { code: ["workspace-capacity-refused", "workspace-capacity-lock-busy", "workspace-mirror-lock-busy"].includes(error.code) ? error.code : "source-preparation-failed", message: error.message } });
     throw error;
   } finally { database.close(); }
 }
