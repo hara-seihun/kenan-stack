@@ -2196,10 +2196,16 @@ test("ignores containers removed during the Docker ownership snapshot", () => {
   const snapshot = workspaceTesting.dockerSnapshot((_executable, args) => {
     if (args[0] === "context") return { status: 0, stdout: JSON.stringify("tcp://docker-host:2375"), stderr: "" };
     if (args[0] === "ps") return { status: 0, stdout: "vanished\nlive", stderr: "" };
-    if (args[1] === "vanished") return { status: 1, stdout: "", stderr: "Error: No such object: vanished" };
-    return { status: 0, stdout: JSON.stringify([{ Id: "live" }]), stderr: "" };
+    assert.deepEqual(args, ["inspect", "vanished", "live"]);
+    return { status: 1, stdout: JSON.stringify([{ Id: "live" }]), stderr: "error: no such object: vanished" };
   }, { env: {} });
   assert.deepEqual(snapshot, { containers: [{ Id: "live" }], available: true });
+  const refused = workspaceTesting.dockerSnapshot((_executable, args) => {
+    if (args[0] === "context") return { status: 0, stdout: JSON.stringify("tcp://docker-host:2375"), stderr: "" };
+    if (args[0] === "ps") return { status: 0, stdout: "vanished\nlive", stderr: "" };
+    return { status: 1, stdout: "[]", stderr: "error: no such object: vanished\npermission denied while inspecting live" };
+  }, { env: {} });
+  assert.match(refused.error, /permission denied/);
 });
 
 test("systemd discovery keeps multiline command descriptions out of unit operands", () => {

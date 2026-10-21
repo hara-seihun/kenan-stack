@@ -35,6 +35,8 @@ import {
 import { homedir, tmpdir, userInfo } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import * as census from "./safety-census.mjs";
+import { CensusFailure, withCensusDeadline, processAncestry, readLink, within } from "./safety-census.mjs";
 import { pathToFileURL } from "node:url";
 import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourceJob, sourceJobId } from "./source-job.mjs";
 import { capacityRecovery } from "./capacity-recovery.mjs";
@@ -583,87 +585,62 @@ function updateState(database, record, state, detail) {
   return { ...record, state, detail, updatedAt: now };
 }
 
-function processAncestry() {
-  const ignored = new Set([process.pid, process.ppid]);
-  let candidate = process.ppid;
-  while (candidate > 1) {
-    try {
-      const status = readFileSync(`/proc/${candidate}/status`, "utf8");
-      const match = status.match(/^PPid:\s+(\d+)/mu);
-      if (match === null) break;
-      candidate = Number(match[1]);
-      if (ignored.has(candidate)) break;
-      ignored.add(candidate);
-    } catch {
-      break;
-    }
-  }
-  return ignored;
+// Safety observations live in safety-census.mjs so release can run them in parallel
+// worker threads; these bind them to the current inspection deadline.
+function censusBound(action) {
+  try { return withCensusDeadline(inspectionDeadline, action); }
+  catch (error) { if (error instanceof CensusFailure) fail(error.message); throw error; }
+}
+function assertSafetyBudget(phase) { return censusBound(() => census.assertSafetyBudget(phase)); }
+function processSnapshot(...args) { return censusBound(() => census.processSnapshot(...args)); }
+function dockerSnapshot(execute, options) { return censusBound(() => census.dockerSnapshot(execute, options)); }
+function systemdManagerSnapshot(manager, execute) { return censusBound(() => census.systemdManagerSnapshot(manager, execute)); }
+function systemdSnapshot() { return censusBound(() => census.systemdSnapshot()); }
+function installedReferenceSnapshot(roots, options) { return censusBound(() => census.installedReferenceSnapshot(roots, options)); }
+function threadSnapshot(paths, options) { return censusBound(() => census.threadSnapshot(paths, options)); }
+
+// Stream only topology; cache/creation JSON is large and irrelevant here. The
+// statement is drained before any observation so no read transaction outlives it.
+function workspaceTopology(database) {
+  const rows = [];
+  for (const row of database.prepare("SELECT id,path,checkout_type AS checkoutType FROM workspace ORDER BY path,id").iterate())
+    rows.push({ id: row.id, path: row.path, checkoutType: row.checkoutType });
+  return rows;
+}
+function gitDependencySnapshot(database) {
+  const rows = workspaceTopology(database);
+  return censusBound(() => census.gitDependencyCensus(rows));
 }
 
-function readLink(file) {
-  try {
-    return readlinkSync(file).replace(/ \(deleted\)$/u, "");
-  } catch {
-    return null;
-  }
+// Observation caches beside the registry; each entry is reused only after its
+// file identities are revalidated (see safety-census.mjs).
+function observationCache(database, name) {
+  const statePath = database.location();
+  return statePath === null ? undefined : path.join(path.dirname(statePath), name);
 }
 
-function within(root, candidate) {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
-}
-
-function processSnapshot(strict = false, workspacePath = null, fdAccess = "write") {
-  if (!["write", "all"].includes(fdAccess)) growthError("growth-writer-unknown", "unknown FD observation mode");
-  if (!existsSync("/proc")) { if (strict) growthError("growth-writer-unknown", "/proc unavailable"); return []; }
-  const ignored = processAncestry();
-  const uid = process.getuid?.();
-  if (uid === undefined) { if (strict) growthError("growth-writer-unknown", "process identity unavailable"); return []; }
-  const processes = [];
-  let entries;
-  try { entries = readdirSync("/proc"); } catch (error) { if (strict) throw error; return []; }
-  for (const entry of entries) {
-    assertSafetyBudget("process references");
-    if (!/^\d+$/u.test(entry)) continue;
-    const pid = Number(entry);
-    if (ignored.has(pid)) continue;
-    const root = `/proc/${pid}`;
-    try {
-      const status = readFileSync(`${root}/status`, "utf8");
-      const owner = Number(status.match(/^Uid:\s+(\d+)/mu)?.[1]);
-      if (strict && !Number.isSafeInteger(owner)) growthError("growth-writer-unknown", `unknown process owner ${pid}`);
-      if (owner !== uid && !strict) continue;
-      const commandLine = readFileSync(`${root}/cmdline`, "utf8").split("\0").filter(Boolean);
-      if (strict && readLink(`${root}/cwd`) === null && commandLine.length > 0) growthError("growth-writer-unknown", `unknown cwd for process ${pid}`);
-      const writableFiles = [];
-      const cwd = readLink(`${root}/cwd`), executable = readLink(`${root}/exe`);
-      if (strict && commandLine.length > 0) {
-        for (const fd of readdirSync(`${root}/fd`)) {
-          let target;
-          try { target = readlinkSync(`${root}/fd/${fd}`).replace(/ \(deleted\)$/u, ""); }
-          catch (error) { if (error.code === "ENOENT") continue; throw error; }
-          if (workspacePath && path.isAbsolute(target) && (Array.isArray(workspacePath) ? workspacePath : [workspacePath]).some(root => within(root, target))) {
-            const flags = readFileSync(`${root}/fdinfo/${fd}`, "utf8").match(/^flags:\s+([0-7]+)$/mu)?.[1];
-            if (flags === undefined) growthError("growth-writer-unknown", `unknown fd flags ${pid}/${fd}`);
-            if (fdAccess === "all" || (parseInt(flags,8) & 3) !== 0) writableFiles.push(target);
-          }
-        }
-      }
-      processes.push({
-        writableFiles,
-        pid,
-        command: commandLine[0] ?? "unknown",
-        commandLine,
-        cwd,
-        executable,
-      });
-    } catch (error) {
-      if (strict && (!["ENOENT", "ESRCH"].includes(error.code) || existsSync(root))) growthError("growth-writer-unknown", `cannot inspect process ${pid}: ${error.message}`);
-      continue;
-    }
-  }
-  return processes;
+function safetySnapshot(database) {
+  const isolated = process.env.NODE_TEST_CONTEXT !== undefined &&
+    process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
+  const threadsObserved = !isolated || Boolean(process.env.PI_THREAD_DATABASE);
+  const tasks = {
+    gitDependencies: { rows: workspaceTopology(database) },
+    ...(threadsObserved ? { threads: { paths: census.ownerThreadDatabases(), cacheFile: observationCache(database, "thread-references.v1.json") } } : {}),
+    ...(isolated ? {} : {
+      process: {}, docker: {}, systemdUser: {}, systemdSystem: {},
+      installed: { roots: census.INSTALL_ROOTS, cacheFile: observationCache(database, "installed-references.v1.json") },
+    }),
+  };
+  const observed = censusBound(() => census.runCensuses(tasks, inspectionDeadline));
+  return {
+    processes: isolated ? [] : observed.process,
+    docker: isolated ? { containers: [], available: false } : observed.docker,
+    systemd: isolated ? { units: [], available: false } : census.unionSystemd(observed.systemdUser, observed.systemdSystem),
+    threads: threadsObserved ? observed.threads : [],
+    gitAlternates: observed.gitDependencies.alternates,
+    linkedWorktrees: observed.gitDependencies.linkedWorktrees,
+    installed: isolated ? [] : observed.installed,
+  };
 }
 
 function processReferences(workspacePath, snapshot = processSnapshot()) {
@@ -674,69 +651,6 @@ function processReferences(workspacePath, snapshot = processSnapshot()) {
     if (processRecord.commandLine.some((argument) => argument === workspacePath || argument.includes(`${workspacePath}/`) || argument.includes(`=${workspacePath}`))) matches.push("argument");
     return matches.length === 0 ? [] : [{ pid: processRecord.pid, command: processRecord.command, matches }];
   });
-}
-
-function dockerEndpointScope(endpoint, {
-  uid = process.getuid?.(),
-  inspect = statSync,
-  writable = (file) => accessSync(file, constants.W_OK),
-} = {}) {
-  if (!endpoint.startsWith("unix://")) return { inspect: true };
-  const socketPath = endpoint.slice("unix://".length);
-  if (!path.isAbsolute(socketPath)) return { error: "Docker Unix endpoint must have an absolute socket path" };
-  let socket;
-  try {
-    socket = inspect(socketPath);
-  } catch (error) {
-    return { error: `Docker Unix socket metadata failed: ${error.code ?? "unknown"}` };
-  }
-  if (!socket.isSocket()) return { error: "Docker Unix endpoint is not a socket" };
-  try {
-    writable(socketPath);
-  } catch (error) {
-    // A foreign daemon without a connect grant cannot own this account's Docker work.
-    // Failure at an owned or otherwise authorized endpoint remains an inspection failure.
-    if (error.code === "EACCES" && uid !== undefined && uid !== 0 && socket.uid !== uid) {
-      return { inspect: false, reason: "foreign-owned-socket-without-connect-grant" };
-    }
-    return { error: `Docker Unix socket access failed: ${error.code ?? "unknown"}` };
-  }
-  return { inspect: true };
-}
-
-function dockerSnapshot(execute = command, { env = process.env, endpointScope = dockerEndpointScope } = {}) {
-  const context = execute("docker", ["context", "inspect", ...(env.DOCKER_CONTEXT ? [env.DOCKER_CONTEXT] : []),
-    "--format", "{{json .Endpoints.docker.Host}}"], { timeout: 10_000 });
-  if (context.error?.code === "ENOENT") return { containers: [], available: false };
-  if (context.status !== 0) return { containers: [], available: true, error: context.stderr || context.stdout || "docker context inspect failed" };
-  let endpoint;
-  try {
-    endpoint = !env.DOCKER_CONTEXT && env.DOCKER_HOST ? env.DOCKER_HOST : JSON.parse(context.stdout);
-    if (typeof endpoint !== "string" || endpoint.length === 0) throw new Error("missing endpoint");
-  } catch {
-    return { containers: [], available: true, error: "docker context inspect returned an invalid endpoint" };
-  }
-  const scope = endpointScope(endpoint);
-  if (scope.error) return { containers: [], available: true, error: scope.error };
-  if (!scope.inspect) return { containers: [], available: false, reason: scope.reason };
-  const listed = execute("docker", ["ps", "--all", "--quiet", "--no-trunc"], { timeout: 10_000 });
-  if (listed.error?.code === "ENOENT") return { containers: [], available: false };
-  if (listed.status !== 0) return { containers: [], available: true, error: listed.stderr || listed.stdout || "docker ps failed" };
-  const containers = [];
-  for (const id of listed.stdout.split(/\s+/u).filter(Boolean)) {
-    const inspected = execute("docker", ["inspect", id], { timeout: 20_000 });
-    const detail = inspected.stderr || inspected.stdout || "docker inspect failed";
-    if (inspected.status !== 0 && /no such object/iu.test(detail)) continue;
-    if (inspected.status !== 0) return { containers: [], available: true, error: detail };
-    try {
-      const parsed = JSON.parse(inspected.stdout);
-      if (!Array.isArray(parsed)) return { containers: [], available: true, error: "docker inspect returned invalid JSON" };
-      containers.push(...parsed);
-    } catch {
-      return { containers: [], available: true, error: "docker inspect returned invalid JSON" };
-    }
-  }
-  return { containers, available: true };
 }
 
 function dockerReferences(workspacePath, snapshot = dockerSnapshot()) {
@@ -762,85 +676,6 @@ function dockerReferences(workspacePath, snapshot = dockerSnapshot()) {
     });
   }
   return { references, available: snapshot.available };
-}
-
-function parseSystemdUnits(output, manager) {
-  return output.split(/\n\s*\n/u).flatMap((block) => {
-    const properties = new Map(block.split("\n").flatMap((line) => {
-      const separator = line.indexOf("=");
-      return separator === -1 ? [] : [[line.slice(0, separator), line.slice(separator + 1)]];
-    }));
-    const id = properties.get("Id");
-    const activeState = properties.get("ActiveState");
-    if (id === undefined || activeState === undefined || !["active", "activating", "reloading", "deactivating"].includes(activeState)) return [];
-    const rawWorkingDirectory = properties.get("WorkingDirectory") ?? "";
-    return [{
-      id,
-      manager,
-      activeState,
-      workingDirectory: rawWorkingDirectory.replace(/^[!+~-]+/u, "") || null,
-      execStart: properties.get("ExecStart") ?? "",
-      mainPid: Number(properties.get("MainPID") ?? 0),
-    }];
-  });
-}
-
-function systemdManagerSnapshot(manager, execute = command) {
-  const managerArgs = manager === "user" ? ["--user"] : [];
-  const listed = execute("systemctl", [
-    ...managerArgs,
-    "list-units",
-    "--all",
-    "--state=active,activating,reloading,deactivating",
-    "--type=service",
-    "--type=scope",
-    "--output=json",
-    "--no-pager",
-  ], { timeout: 20_000 });
-  if (listed.error?.code === "ENOENT" || /not been booted with systemd|failed to connect to (?:user scope )?bus|(?:DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR) not defined/iu.test(listed.stderr)) {
-    return { units: [], available: false };
-  }
-  if (listed.status !== 0) return { units: [], available: true, error: listed.stderr || listed.stdout || "systemctl list-units failed" };
-  let rows;
-  try {
-    rows = JSON.parse(listed.stdout);
-  } catch {
-    return { units: [], available: true, error: "systemctl list-units returned invalid JSON" };
-  }
-  if (!Array.isArray(rows) || rows.some((row) =>
-    row === null || typeof row !== "object" || typeof row.unit !== "string" ||
-    !/^[a-zA-Z0-9:_.@\\\\-]+\.(?:service|scope)$/u.test(row.unit))) {
-    return { units: [], available: true, error: "systemctl list-units returned invalid unit records" };
-  }
-  const unitIds = rows.map((row) => row.unit);
-  if (new Set(unitIds).size !== unitIds.length) {
-    return { units: [], available: true, error: "systemctl list-units returned duplicate unit records" };
-  }
-  if (unitIds.length === 0) return { units: [], available: true };
-  const shown = execute("systemctl", [
-    ...managerArgs,
-    "show",
-    "--property=Id",
-    "--property=ActiveState",
-    "--property=WorkingDirectory",
-    "--property=ExecStart",
-    "--property=MainPID",
-    "--",
-    ...unitIds,
-  ], { timeout: 20_000 });
-  if (shown.status !== 0) return { units: [], available: true, error: shown.stderr || shown.stdout || "systemctl show failed" };
-  return { units: parseSystemdUnits(shown.stdout, manager), available: true };
-}
-
-function systemdSnapshot() {
-  const user = systemdManagerSnapshot("user");
-  const system = systemdManagerSnapshot("system");
-  const errors = [user.error, system.error].filter(Boolean);
-  return {
-    units: [...user.units, ...system.units],
-    available: user.available || system.available,
-    ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
-  };
 }
 
 function serializedPathReference(serialized, workspacePath) {
@@ -885,154 +720,14 @@ function systemdReferences(workspacePath, snapshot = systemdSnapshot(), context 
   };
 }
 
-// A linked worktree whose repository was deleted has no object store.
-function orphanedWorktree(workspacePath) {
-  const pointer = /^gitdir: (.+)$/m.exec(readFileSync(path.join(workspacePath, ".git"), "utf8"));
-  return pointer !== null && !existsSync(path.resolve(workspacePath, pointer[1].trim()));
-}
-
-// Installed artifacts under /opt and /srv that name a checkout path (a bundle whose __dirname
-// points into an agent clone's node_modules). 2026-10-19: the Slack sender installed at
-// /opt/converge-slack-sender/8fe1fe50 from limmy-independent-83fd broke when that checkout was
-// released a minute later. Depth-bounded, node_modules/.git skipped; same scan as /usr/local/bin/liveuse.
-const INSTALL_ROOTS = ["/opt", "/srv", "/etc/systemd"];
-function assertSafetyBudget(phase) {
-  if (inspectionDeadline !== undefined && Date.now() >= inspectionDeadline)
-    growthError("growth-observation-timeout", `${phase} observation budget exhausted; no safety verdict established`);
-}
-function installedReferenceSnapshot(roots = INSTALL_ROOTS) {
-  const references = [];
-  const pattern = /\/home\/[A-Za-z0-9._@+-]+\/[A-Za-z0-9._\/@+-]+/gu;
-  const walk = (directory, depth) => {
-    assertSafetyBudget("installed references");
-    let entries;
-    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      assertSafetyBudget("installed references");
-      const candidate = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (depth < 3 && entry.name !== "node_modules" && entry.name !== ".git") walk(candidate, depth + 1);
-      } else if (entry.isFile()) {
-        let data;
-        try { if (statSync(candidate).size > 32 << 20) continue; data = readFileSync(candidate); } catch { continue; }
-        if (data.subarray(0, 8192).includes(0)) continue;
-        for (const match of data.toString("latin1").matchAll(pattern)) references.push({ file: candidate, path: match[0] });
-      }
-    }
-  };
-  for (const root of roots) walk(root, 0);
-  return references;
-}
-
 function installedReferences(workspacePath, snapshot = []) {
   return snapshot.filter((reference) => within(workspacePath, reference.path));
 }
 
-function gitDependencySnapshot(database) {
-  const alternates = [];
-  const linkedWorktrees = [];
-  // Stream only topology; cache/creation JSON is large and irrelevant here.
-  const rows = database.prepare("SELECT id,path,checkout_type AS checkoutType FROM workspace ORDER BY path,id").iterate();
-  for (const record of rows) {
-    if (inspectionDeadline !== undefined && Date.now() >= inspectionDeadline) growthError("growth-observation-timeout", "dependency observation budget exhausted");
-    if (!existsSync(record.path)) continue;
-    let commonDirectory = path.join(record.path, ".git");
-    if (record.checkoutType === "worktree") {
-      const common = command("git", ["-C", record.path, "rev-parse", "--git-common-dir"]);
-      if (common.status !== 0 && orphanedWorktree(record.path)) continue;
-      if (common.status !== 0) fail(`cannot inspect linked worktree ${record.path}: ${common.stderr || common.error?.message || `exit ${common.status}`}`);
-      commonDirectory = path.resolve(record.path, common.stdout);
-      linkedWorktrees.push({ recordId: record.id, workspacePath: record.path, commonDirectory });
-    }
-    const objectDirectory = path.join(commonDirectory, "objects");
-    const alternatesPath = path.join(objectDirectory, "info", "alternates");
-    if (!existsSync(alternatesPath)) continue;
-    let contents;
-    contents = readFileSync(alternatesPath, "utf8");
-    for (const alternate of contents.split("\n").filter(Boolean)) {
-      alternates.push({
-        recordId: record.id,
-        workspacePath: record.path,
-        objectDirectory: path.resolve(objectDirectory, alternate),
-      });
-    }
-  }
-  return { alternates, linkedWorktrees };
-}
-
-function optionalOwnerPath(candidate) {
-  try { statSync(candidate); return true; }
-  catch (error) {
-    if (error?.code === "ENOENT") return false;
-    throw error;
-  }
-}
-
-function ownerThreadDatabases() {
-  const databases = new Set();
-  const fleetDir = path.dirname(process.env.PI_ORCHESTRATOR_LEDGER ??
-    path.join(homedir(), ".local", "share", "pi-orchestrator", "ledger.sqlite3"));
-  databases.add(path.join(fleetDir, "threads.sqlite3"));
-  const applications = path.join(fleetDir, "applications");
-  if (optionalOwnerPath(applications)) {
-    for (const entry of readdirSync(applications, { withFileTypes: true })) {
-      if (entry.isDirectory() && !entry.isSymbolicLink()) databases.add(path.join(applications, entry.name, "threads.sqlite3"));
-    }
-  }
-  const owner = userInfo().username;
-  const person = path.join("/var/lib/pi-remote/persons", `${owner}.json`);
-  let remoteData = process.env.PI_REMOTE_DATA;
-  if (!remoteData && optionalOwnerPath(person)) {
-    const registration = JSON.parse(readFileSync(person, "utf8"));
-    if (registration.user === owner) remoteData = registration.environment?.PI_REMOTE_DATA;
-  }
-  remoteData ??= path.join(process.env.XDG_STATE_HOME ?? path.join(homedir(), ".local", "state"), "pi-remote");
-  databases.add(path.join(remoteData, "threads.sqlite3"));
-  if (process.env.PI_THREAD_DATABASE) databases.add(process.env.PI_THREAD_DATABASE);
-  return [...databases];
-}
-
-function threadSnapshot(paths = ownerThreadDatabases()) {
-  const references = [];
-  for (const databasePath of paths) {
-    assertSafetyBudget("thread references");
-    if (!optionalOwnerPath(databasePath)) continue;
-    const database = new DatabaseSync(databasePath, { readOnly: true });
-    try {
-      references.push(...database.prepare(`SELECT t.id, t.cwd FROM thread t WHERE t.id IN (
-        SELECT id FROM thread WHERE state='running'
-          OR json_extract(metadata,'$.agentWait') IS NOT NULL
-          OR json_extract(metadata,'$.cancellationRequest') IS NOT NULL
-        UNION SELECT thread_id FROM thread_work WHERE status!='done'
-        UNION SELECT thread_id FROM thread_execution WHERE ended_at IS NULL
-      )`)
-        .all().map((row) => ({ id: row.id, cwd: row.cwd, database: databasePath })));
-    } finally {
-      database.close();
-    }
-  }
-  return references;
-}
-
-function safetySnapshot(database) {
-  const isolated = process.env.NODE_TEST_CONTEXT !== undefined &&
-    process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
-  const gitDependencies = gitDependencySnapshot(database);
-  return {
-    processes: isolated ? [] : processSnapshot(),
-    docker: isolated ? { containers: [], available: false } : dockerSnapshot(),
-    systemd: isolated ? { units: [], available: false } : systemdSnapshot(),
-    threads: isolated && !process.env.PI_THREAD_DATABASE ? [] : threadSnapshot(),
-    gitAlternates: gitDependencies.alternates,
-    linkedWorktrees: gitDependencies.linkedWorktrees,
-    installed: isolated ? [] : installedReferenceSnapshot(),
-  };
-}
-
-function freshThreadSafety(safety) {
+function freshThreadSafety(database, safety) {
   if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty" &&
     !process.env.PI_THREAD_DATABASE) return safety;
-  return { ...safety, threads: [...(safety?.threads ?? []), ...threadSnapshot()] };
+  return { ...safety, threads: [...(safety?.threads ?? []), ...threadSnapshot(undefined, { cacheFile: observationCache(database, "thread-references.v1.json") })] };
 }
 
 function directoryHasEntries(directory) {
@@ -1403,7 +1098,7 @@ function reconcileRecord(database, record, options) {
   }
   let removedCaches = [];
   if (options.execute) {
-    safety = freshThreadSafety(safety);
+    safety = freshThreadSafety(database, safety);
     inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
     if (inspection.classification === "referenced" || inspection.classification === "blocked") {
       updateState(database, record, inspection.classification, inspection.reason);
@@ -1421,7 +1116,7 @@ function reconcileRecord(database, record, options) {
   if (!options.execute) return { record, inspection, action: "would-release" };
   const current = recordBy(database, { id: record.id });
   if (!options.ignoreLease && current.leaseExpiresAt > Date.now()) return { record: current, inspection: inspectRecord(current), action: "lease-renewed" };
-  const latest = inspectRecord(current, { ignoreLease: true, safety: freshThreadSafety(safety), deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
+  const latest = inspectRecord(current, { ignoreLease: true, safety: freshThreadSafety(database, safety), deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
   if (latest.classification !== "reclaimable") {
     updateState(database, current, latest.classification, latest.reason);
     return { record: current, inspection: latest, removedCaches, action: "none" };
@@ -1484,7 +1179,7 @@ function groupReconciliation(database, records, options) {
   const preserveKnownSource = inspections.some((inspection)=>inspection.sourceRetention===true);
   const removedCaches = new Map();
   if (options.execute && !preserveKnownSource && !inspections.some((inspection) => ["referenced", "blocked"].includes(inspection.classification)||inspection.sourceRetention===true)) {
-    safety = freshThreadSafety(safety);
+    safety = freshThreadSafety(database, safety);
     inspections = records.map((record) => inspectRecord(record,
       groupInspectionOptions(record, records, { ignoreLease: true, safety, deadline: options.deadline,terminalSourceTransfer:options.terminalSourceTransfer===true })));
   }
@@ -1499,7 +1194,7 @@ function groupReconciliation(database, records, options) {
   }
 
   if (options.execute && !preserveKnownSource && !inspections.some((inspection) => ["referenced", "blocked"].includes(inspection.classification)||inspection.sourceRetention===true)) {
-    safety = freshThreadSafety(safety);
+    safety = freshThreadSafety(database, safety);
     inspections = records.map((record) => inspectRecord(record,
       groupInspectionOptions(record, records, { ignoreLease: true, safety, deadline: options.deadline,terminalSourceTransfer:options.terminalSourceTransfer===true })));
   }
@@ -4174,7 +3869,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if (argv[0] === "materialization-process-snapshot") {
