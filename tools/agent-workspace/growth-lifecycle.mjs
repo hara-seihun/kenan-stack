@@ -41,7 +41,7 @@ export function validateRetirement(disposition, binding, safety, now = Date.now(
     growthError('growth-writer-unknown', 'growth writer observation is unset');
   }
   if (safety.errors.length) growthError('growth-writer-unknown', safety.errors.join('; '));
-  if (safety.references.length) growthError('growth-writer-active', 'runtime/thread/process references remain; no read-only assumption permitted');
+  if (safety.references.length) growthError('growth-writer-active', 'runtime/thread/process references remain; no read-only assumption permitted: '+JSON.stringify(safety.references.map(r=>({kind:r.kind,id:r.id,pid:r.pid,channel:r.channel,root:r.root,workspacePath:r.workspacePath}))).slice(0,4096));
 }
 
 // Active reduction is not retirement: keep the writer, lease, baseline and source.
@@ -60,4 +60,18 @@ export function validateReduction(value, binding, owner, remainingGrowthBytes, n
       !Number.isSafeInteger(value.observedAt) || value.observedAt > now || now - value.observedAt > 15 * 60_000) {
     growthError('stale-growth-reduction', 'active owning lease, source, plan, sample and root must match a fresh binding');
   }
+}
+
+// Preservation-only retained custody may end its historical build operating floor.
+export function validateRetainedHeadroom(value, binding, plan, safety, now=Date.now()) {
+  if (!retainedGrowth(plan) || binding.leaseExpiresAt !== 0 || !['source-only','budgeted'].includes(plan.intent))
+    growthError('retained-headroom-state','priced retired growth and relinquished writing lease required');
+  if (value?.kind !== 'reduce-retained-headroom' || value.retainedUse !== 'source' ||
+      value.growthWriters !== 'none' || value.futureWrites !== 'none' ||
+      value.sourceCustody !== 'remote-verified' || typeof value.sourceEvidence !== 'string' || !value.sourceEvidence.trim() ||
+      !Number.isSafeInteger(value.headroomBytes) || value.headroomBytes < 8*1024**3 || value.headroomBytes >= plan.headroomBytes)
+    growthError('invalid-retained-headroom','explicit preservation-only owner disposition, remote custody and strictly lower >=8GiB floor required');
+  validateRetirement({...value,kind:'retire-future-growth',remainingGrowthBytes:0,writingLease:'retire'},binding,safety,now);
+  if (!Array.isArray(safety.retainedBorrowers) || (safety.retainedBorrowers.length && (!Array.isArray(safety.borrowerCustody) || safety.borrowerCustody.length !== safety.retainedBorrowers.length)))
+    growthError('retained-headroom-borrower','all registered and unregistered borrowers must be absent');
 }

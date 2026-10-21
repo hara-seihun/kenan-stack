@@ -45,7 +45,7 @@ import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError } from
 import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
-import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction } from "./growth-lifecycle.mjs";
+import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction, validateRetainedHeadroom } from "./growth-lifecycle.mjs";
 
 class SourcePreparationRequired extends Error {}
 let sourcePreparationMode = null;
@@ -504,7 +504,12 @@ function maintainReferenceClone(workspace, execute, statePath) {
 }
 
 function register(database, input) {
-  return withWorkspaceLock(database, input.path, () => registerWorkspace(database, input), input.groupId);
+  return withWorkspaceLock(database, input.path, () => {
+    if(!input.retained)return registerWorkspace(database,input);
+    database.exec("BEGIN IMMEDIATE");
+    try{const result=registerWorkspace(database,input);database.exec("COMMIT");return result;}
+    catch(e){database.exec("ROLLBACK");throw e;}
+  }, input.groupId);
 }
 
 function registrationInspection(workspace, statePath) {
@@ -516,7 +521,7 @@ function registrationInspection(workspace, statePath) {
 function registerWorkspace(database, input, inspectedInfo) {
   const now = Date.now();
   const existing = database.prepare(`SELECT workspace.*, ${ASSIGNMENT_SOURCE} FROM workspace WHERE path = ?`).get(path.resolve(input.path));
-  if (existing !== undefined && recordRetainsCustody(database, existing.id)) growthError("growth-admission-required", "retained custody cannot register/adopt until fresh resume-growth admission");
+  if (!input.retained && existing !== undefined && recordRetainsCustody(database, existing.id)) growthError("growth-admission-required", "retained custody cannot register/adopt until fresh resume-growth admission");
   if (existing !== undefined && existing.state !== "released") {
     const recorded = rowToRecord(existing);
     for (const [field, requested] of Object.entries(input.assertMetadata ?? {})) {
@@ -524,8 +529,9 @@ function registerWorkspace(database, input, inspectedInfo) {
     }
   }
   if (existing?.state === "creating") return rowToRecord(existing);
-  if (retainedParent(database,input.path)) growthError("growth-admission-required", "shared Git parent growth is retired");
-  const info = inspectedInfo ?? registrationInspection(input.path, registryPaths.get(database));
+  if (!input.retained && retainedParent(database,input.path)) growthError("growth-admission-required", "shared Git parent growth is retired");
+  const info = inspectedInfo ?? (input.retained ? gitInfo(input.path) : registrationInspection(input.path, registryPaths.get(database)));
+  if (input.retained && existing !== undefined) growthError("retained-registration-existing", "use end-writing with a fresh exact binding for existing rows");
   if (existing !== undefined && existing.state !== "released") {
     if (input.groupId != null && existing.group_id !== null && existing.group_id !== input.groupId) {
       fail(`workspace ${path.resolve(input.path)} already belongs to group ${existing.group_id}; requested ${input.groupId}`);
@@ -553,9 +559,9 @@ function registerWorkspace(database, input, inspectedInfo) {
     cachePaths: input.cachePaths,
     createdAt: now,
     updatedAt: now,
-    leaseExpiresAt: input.leaseExpiresAt ?? now + input.leaseSeconds * 1000,
-    state: "active",
-    detail: "lease registered",
+    leaseExpiresAt: input.retained ? 0 : input.leaseExpiresAt ?? now + input.leaseSeconds * 1000,
+    state: input.retained ? "referenced" : "active",
+    detail: input.retained ? "preservation-only retained custody" : "lease registered",
     groupId: input.groupId ?? null,
   };
   database.prepare(`
@@ -570,6 +576,7 @@ function registerWorkspace(database, input, inspectedInfo) {
     JSON.stringify(record.cachePaths), record.createdAt, record.updatedAt,
     record.leaseExpiresAt, record.state, record.detail, record.groupId,
   );
+  if (input.retained) markSourceRetained(database, record.id);
   return record;
 }
 
@@ -1336,12 +1343,14 @@ function print(value, json) {
 }
 
 function registerCommand(database, args) {
-  assertOnly(args, ["path", "root", "kind", "mode", "owner", "group", "source-commit", "lease-seconds", "cache", "cache-owned", "replace-cache", "json"]);
+  assertOnly(args, ["path", "root", "kind", "mode", "owner", "group", "source-commit", "lease-seconds", "cache", "cache-owned", "replace-cache", "retained", "json"]);
+  if (bool(args,"retained") && one(args,"lease-seconds") !== undefined) growthError("invalid-request","retained registration never takes a writing lease");
   const mode = one(args, "mode", "writer");
   if (!["writer", "review"].includes(mode)) fail("--mode must be writer or review");
   const selectedPath = path.resolve(required(args, "path"));
   const record = register(database, {
     path: selectedPath,
+    retained: bool(args,"retained"),
     root: one(args, "root"),
     kind: one(args, "kind", "agent"),
     mode,
@@ -3074,6 +3083,32 @@ function heartbeatCommand(database, args) {
   print(renewed.length === 1 ? renewed[0] : renewed, bool(args, "json"));
 }
 
+function endWritingCommand(database,args) {
+  assertOnly(args,["id","path","owner","disposition","disposition-sha256","json"]);
+  const record=growthSelected(database,args),deadline=Date.now()+25000;
+  const bytes=readFileSync(required(args,"disposition"),"utf8");
+  if(digest(bytes)!==required(args,"disposition-sha256")) growthError("growth-evidence-changed","disposition changed");
+  const d=JSON.parse(bytes);
+  duringInspection(deadline,()=>withWorkspaceLock(database,record.path,()=>withGrowthBorrowerLocks(database,record,()=>{
+    const b=cacheBinding(database,record.id);
+    if(b.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");
+    if(database.prepare("SELECT 1 FROM workspace_capacity WHERE workspace_id=?").get(record.id))growthError("priced-workspace","use retire-growth for priced workspace");
+    const safety=terminalSafety(database,record,deadline);
+    validateRetirement(d,b,safety);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      validateRetirement(d,cacheBinding(database,record.id),safety);
+      const n=database.prepare("UPDATE workspace SET lease_expires_at=0,state='referenced',detail='preservation-only retained custody',updated_at=? WHERE id=? AND updated_at=? AND lease_expires_at=?").run(Date.now(),record.id,b.updatedAt,b.leaseExpiresAt).changes;
+      if(n!==1)growthError("stale-growth-disposition","lease CAS failed");
+      markSourceRetained(database,record.id);
+      database.exec("CREATE TABLE IF NOT EXISTS workspace_writing_ended(sequence INTEGER PRIMARY KEY, workspace_id TEXT, disposition_json TEXT, safety_json TEXT)");
+      database.prepare("INSERT INTO workspace_writing_ended(workspace_id,disposition_json,safety_json) VALUES(?,?,?)").run(record.id,bytes,JSON.stringify(safety));
+      database.exec("COMMIT");
+      print({ok:true,kind:"writing-ended-source-retained",newWritesAuthorized:false,record:creationRecord(database,record.id),safety},true);
+    }catch(e){database.exec("ROLLBACK");throw e;}
+  },deadline),record.groupId,deadline));
+}
+
 function generatedOnlySourceCustody(database, id) {
   if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_generated_retirement'").get()) return false;
   return database.prepare("SELECT 1 FROM workspace_generated_retirement WHERE workspace_id=? AND json_extract(journal_json,'$.kind')!='workspace-cache-retirement'").get(id) !== undefined;
@@ -3082,7 +3117,12 @@ function generatedRetirementPending(database, id) {
   if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_generated_retirement'").get()) return false;
   return database.prepare("SELECT 1 FROM workspace_generated_retirement WHERE workspace_id=? AND json_extract(journal_json,'$.state')='pending'").get(id) !== undefined;
 }
+function markSourceRetained(database,id) {
+  database.exec("CREATE TABLE IF NOT EXISTS workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)");
+  database.prepare("INSERT OR REPLACE INTO workspace_source_retention VALUES(?,?)").run(id,Date.now());
+}
 function recordRetainsCustody(database, id) {
+  if(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_source_retention'").get() && database.prepare("SELECT 1 FROM workspace_source_retention WHERE workspace_id=?").get(id)) return true;
   if (generatedRetirementPending(database, id)) return true;
   const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(id);
   return row !== undefined && retainedGrowth(JSON.parse(row.plan_json));
@@ -3348,7 +3388,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     const plan = expandingBudget ? { ...oldPlan, ...intent } : sourceCheckoutCapacity(record.path,
       record.durableSourceCommit, intent, statfsSync(record.path).bsize, sparsePatterns);
     if (!expandingBudget) plan.completedAllocationBytes = plan.constructionBytes;
-    if (resume) delete plan.growthLifecycle;
+    if (resume) { delete plan.growthLifecycle; delete plan.retainedHeadroom; }
     withResourceLock(statePath, `capacity:${row.device_id}`, () => {
       const measurement = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!measurement.ok) fail(`capacity repricing requires a fresh allocated-block sample: ${measurement.error}; run measure-capacity first`);
@@ -3423,7 +3463,7 @@ function growthBinding(database, record) {
   const borrowerRows = [...new Set([...dependencies.alternates.filter(value => value.recordId !== record.id && within(record.path,value.objectDirectory)),
     ...dependencies.linkedWorktrees.filter(value => value.recordId !== record.id && within(record.path,value.commonDirectory))].map(value => value.recordId))]
     .sort().map(id => recordBy(database,{id}));
-  const binding = { borrowersSha256:digest(JSON.stringify(borrowerRows)), id: record.id, path: record.path, owner: record.owner, sourceCommit: record.sourceCommit,
+  const binding = { gitInventorySha256:digest(git(record.path,["worktree","list","--porcelain"])+"\n"+git(record.path,["for-each-ref","--format=%(refname) %(objectname)","refs/heads"])), borrowersSha256:digest(JSON.stringify(borrowerRows)), id: record.id, path: record.path, owner: record.owner, sourceCommit: record.sourceCommit,
     durableSourceCommit: record.durableSourceCommit, head:git(record.path, ["rev-parse", "HEAD"]), state: record.state, updatedAt: record.updatedAt,
     leaseExpiresAt: record.leaseExpiresAt, device: row.device_id, inode: String(root.ino),
     planSha256: digest(row.plan_json), sampleSha256: digest(measurement.measurement_json) };
@@ -3490,6 +3530,43 @@ function growthSafety(database, record) {
     // Borrowing Git objects is retention, not a growth writer in the parent's checkout.
     retainedBorrowers,
     observedAt:Date.now()};
+}
+
+function terminalSafety(database,record,deadline) {
+  const safety=growthSafety(database,record);
+  const roots=[record.path,...new Set(safety.retainedBorrowers.map(b=>b.workspacePath))];
+  const isolated=process.env.NODE_TEST_CONTEXT!==undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY==="empty";
+  const native=isolated?{errors:[],references:[],observations:[]}:currentStackQueueReferences(roots,{resourceKind:"physical-checkout",deadline});
+  return {...safety,errors:[...safety.errors,...native.errors],references:[...safety.references,...native.references],nativeObservations:native.observations};
+}
+function verifiedRemoteCustody(record) {
+  const remotes=git(record.path,["remote"]).split("\n").filter(Boolean);
+  if(!remotes.length)growthError("retained-source-unpublished","no remote custody");
+  const durable=[],observations=[];
+  for(const remote of remotes) {
+    const r=command("git",["-C",record.path,"ls-remote","--heads",remote],{timeout:4000});
+    if(r.status!==0)growthError("retained-source-unknown","fresh remote observation failed: "+remote);
+    const remoteShas=[];
+    for(const line of r.stdout.split("\n").filter(Boolean)) {
+      const [sha,ref]=line.split(/\s+/u);
+      if(!/^[a-f0-9]{40,64}$/.test(sha)||!ref?.startsWith("refs/heads/"))growthError("retained-source-unknown","malformed remote refs");
+      remoteShas.push(sha);
+    }
+    if(remoteShas.length) {
+      const checked=command("git",["-C",record.path,"cat-file","--batch-check=%(objectname) %(objecttype)"],{input:remoteShas.join("\n")+"\n",timeout:4000});
+      if(checked.status!==0)growthError("retained-source-unknown","remote object inventory failed");
+      const rows=checked.stdout.split("\n");
+      if(rows.length!==remoteShas.length)growthError("retained-source-unknown","incomplete remote object inventory");
+      for(let i=0;i<rows.length;i++) {
+        if(rows[i]===remoteShas[i]+" commit")durable.push(remoteShas[i]);
+        else if(rows[i]!==remoteShas[i]+" missing")growthError("retained-source-unknown","invalid remote object response");
+      }
+    }
+    observations.push({remote,refsSha256:digest(r.stdout),observedAt:Date.now()});
+  }
+  const candidates=[git(record.path,["rev-parse","HEAD"]),...git(record.path,["for-each-ref","--format=%(objectname)","refs/heads"]).split("\n").filter(Boolean)];
+  if(!durable.length||hasUncoveredCommits((a,o)=>git(record.path,a,o),candidates,durable))growthError("retained-source-unpublished","local HEAD/branches not covered by current remote heads");
+  return observations;
 }
 
 function materializationProcessReferences(roots) {
@@ -3701,6 +3778,65 @@ function retireGrowthCommand(database, args, statePath) {
         if (relinquished !== 1) growthError("stale-growth-disposition", "writing lease CAS failed");
         database.exec("COMMIT");
         print({ok:true, kind:"retired-future-growth", sequence:Number(journal.lastInsertRowid),
+          record:creationRecord(database, record.id), dispositionSha256:evidenceSha256, safety}, bool(args,"json"));
+      } catch (error) { database.exec("ROLLBACK"); throw error; }
+    },deadline),deadline);
+  }, selected.groupId,deadline));
+}
+
+function reduceRetainedHeadroomCommand(database, args, statePath) {
+  assertOnly(args, ["id", "path", "owner", "disposition", "disposition-sha256", "json"]);
+  const selected = growthSelected(database, args);
+  const evidence = readFileSync(required(args, "disposition"), "utf8");
+  const evidenceSha256 = digest(evidence);
+  if (evidenceSha256 !== required(args, "disposition-sha256")) growthError("growth-evidence-changed", "disposition bytes do not match the expected SHA256");
+  let disposition;
+  try { disposition = JSON.parse(evidence); } catch { growthError("invalid-growth-disposition", "disposition must be JSON"); }
+  const deadline = Date.now()+25_000;
+  duringInspection(deadline,()=>withWorkspaceLock(database, selected.path, () => {
+    const record = recordBy(database, {id:selected.id});
+    if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) growthError("invalid-growth-state", `cannot retire growth from ${record.state}`);
+    if (record.owner !== required(args, "owner") || !record.owner || !record.durableSourceCommit) growthError("stale-growth-disposition", "current owning identity and immutable source required");
+    const initial = growthBinding(database, record);
+    withGrowthBorrowerLocks(database,record,()=>withResourceLock(statePath, `capacity:${initial.binding.device}`, () => {
+      const {binding, plan, row, measurement} = growthBinding(database, record);
+      if (!["source-only", "budgeted"].includes(plan.intent)) growthError("invalid-growth-state", "retirement requires an explicitly priced plan");
+      if (!retainedGrowth(plan)) growthError("retained-headroom-state", "retire growth first");
+      const cached = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
+      if (!cached.ok) growthError("growth-sample-required", cached.error);
+      const remoteCustody=verifiedRemoteCustody(record);
+      const safety = terminalSafety(database, record,deadline);
+      safety.remoteCustody=remoteCustody;
+      safety.borrowerCustody=safety.retainedBorrowers.map(b=>{
+        const child=recordBy(database,{id:b.recordId});
+        if(child.leaseExpiresAt>Date.now() || !recordRetainsCustody(database,child.id) && !retainedParent(database,child.path)) growthError("retained-headroom-borrower","borrower requires explicit retained custody");
+        return {binding:cacheBinding(database,child.id),remoteCustody:verifiedRemoteCustody(child)};
+      });
+      if (Date.now() >= deadline) growthError("growth-observation-timeout", "retirement observation budget exhausted");
+      validateRetainedHeadroom(disposition, binding, plan, safety);
+      const next = {...plan, headroomBytes:disposition.headroomBytes,
+        retainedHeadroom:{kind:"terminal-source-headroom",dispositionSha256:evidenceSha256,observedAt:Date.now()}};
+      const reservations=capacityReservations(database,row.device_id,record.path);
+      const priorRequirement=capacityRequirement({...plan,constructionBytes:0,growthBytes:0},reservations.priced,reservations.headroomBytes);
+      const nextRequirement=capacityRequirement({...next,constructionBytes:0,growthBytes:0},reservations.priced,reservations.headroomBytes);
+      if(nextRequirement>priorRequirement) growthError("unsafe-retained-headroom","requirement cannot increase");
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const current = growthBinding(database, recordBy(database, {id:record.id}));
+        validateRetainedHeadroom(disposition, current.binding, current.plan, safety);
+        const fresh = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
+        if (!fresh.ok) growthError("growth-sample-required", fresh.error);
+        database.exec(`CREATE TABLE IF NOT EXISTS workspace_retained_headroom_repricing (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
+          record_json TEXT NOT NULL, old_plan_json TEXT NOT NULL, new_plan_json TEXT NOT NULL,
+          measurement_json TEXT NOT NULL, disposition_json TEXT NOT NULL, safety_json TEXT NOT NULL)`);
+        const changed = database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=? AND plan_json=?")
+          .run(JSON.stringify(next), record.id, row.plan_json).changes;
+        if (changed !== 1) growthError("stale-growth-disposition", "capacity plan CAS failed");
+        const journal = database.prepare("INSERT INTO workspace_retained_headroom_repricing(workspace_id,occurred_at,record_json,old_plan_json,new_plan_json,measurement_json,disposition_json,safety_json) VALUES(?,?,?,?,?,?,?,?)")
+          .run(record.id, Date.now(), JSON.stringify(record), row.plan_json, JSON.stringify(next), measurement.measurement_json, evidence, JSON.stringify(safety));
+        database.exec("COMMIT");
+        print({ok:true, kind:"reduced-retained-headroom", newWritesAuthorized:false, priorRequirement, nextRequirement, sequence:Number(journal.lastInsertRowid),
           record:creationRecord(database, record.id), dispositionSha256:evidenceSha256, safety}, bool(args,"json"));
       } catch (error) { database.exec("ROLLBACK"); throw error; }
     },deadline),deadline);
@@ -3930,7 +4066,10 @@ function help() {
                          [--intent source-only|budgeted --headroom-gib N --growth-mib N]
   agent-workspace job-status --job-id SHA256 [--json]
   agent-workspace source-status --job-id SHA256 [--json]
-  agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache]
+  agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--retained | --lease-seconds N]
+  agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
+  agent-workspace custody-status --id ID --path PATH --json
+  agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
                            --owner ID --source-commit HEAD_SHA --authorization RECEIPT [--json]
   agent-workspace adopt --root PATH [--mode writer|review] [--nested-groups] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--execute]
@@ -3945,6 +4084,7 @@ function help() {
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
                             [--budget-ms 25000]
+  agent-workspace reduce-retained-headroom --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
   agent-workspace growth-status ${selectorSyntax("growth-status")} [--json]
   agent-workspace cache-safety --id ID --path PATH --owner OWNER (--cache RELATIVE|--request FILE --request-sha256 SHA) --json
   agent-workspace cache-plan --id ID --path PATH --owner OWNER --cache RELATIVE --classification node-dependencies|declared-build-cache --operation-id ID --evidence TEXT --json
@@ -4060,7 +4200,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "resume-growth"].includes(commandName)
+    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4069,6 +4209,9 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     }
     if (commandName === "create") createCommand(database, args, statePath);
     else if (commandName === "register") registerCommand(database, args);
+    else if (commandName === "end-writing") endWritingCommand(database,args);
+    else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
+    else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
     else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {
@@ -4087,6 +4230,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "cache-plan" || commandName === "retire-cache") workspaceCacheCommand(database,args,statePath,commandName === "cache-plan");
     else if (commandName === "retire-source-materialization") retireSourceMaterializationCommand(database, args, statePath);
     else if (commandName === "retire-growth") retireGrowthCommand(database, args, statePath);
+    else if (commandName === "reduce-retained-headroom") reduceRetainedHeadroomCommand(database,args,statePath);
     else if (commandName === "resume-growth") repriceCapacityCommand(database, args, statePath, true);
     else if (commandName === "reprice-capacity") repriceCapacityCommand(database, args, statePath);
     else if (commandName === "maintain") maintainCommand(database, args);
@@ -4117,7 +4261,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError ? error.code : error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed",
           detail: error instanceof Error ? error.message : String(error),
