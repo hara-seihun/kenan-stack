@@ -3536,7 +3536,7 @@ function terminalSafety(database,record,deadline) {
   const safety=growthSafety(database,record);
   const roots=[record.path,...new Set(safety.retainedBorrowers.map(b=>b.workspacePath))];
   const isolated=process.env.NODE_TEST_CONTEXT!==undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY==="empty";
-  const native=isolated?{errors:[],references:[],observations:[]}:currentStackQueueReferences(roots,{resourceKind:"source",deadline});
+  const native=isolated?{errors:[],references:[],observations:[]}:currentStackQueueReferences(roots,{resourceKind:"physical-checkout",deadline});
   return {...safety,errors:[...safety.errors,...native.errors],references:[...safety.references,...native.references],nativeObservations:native.observations};
 }
 function verifiedRemoteCustody(record) {
