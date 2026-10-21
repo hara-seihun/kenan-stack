@@ -15,6 +15,8 @@ test('native CLI real Git SQLite terminal headroom and retained registration pre
  let d=disposition('reduce-retained-headroom',b);effect('reduce-retained-headroom',r,{...d,binding:{...b,owner:'wrong'}},false);
  git('--git-dir',remote,'update-ref','-d','refs/heads/main');const refused=effect('reduce-retained-headroom',r,d,false);assert.equal(refused.error.code,'retained-source-unpublished');assert.equal(db.prepare('SELECT count(*) n FROM sqlite_master WHERE name=\'workspace_retained_headroom_repricing\'').get().n,0);git('-C',source,'push','origin','main');
 
+ // Regression: actual original production topology has 12,585 remote heads. One batch, never one subprocess per ref.
+ execFileSync('git',['--git-dir',remote,'update-ref','--stdin'],{input:Array.from({length:12585},(_,i)=>`create refs/heads/fixture-${i} ${head}`).join('\n')+'\n',stdio:['pipe','ignore','pipe']});
  const borrow=path.join(root,'retained-borrower');git('-C',source,'worktree','add','--detach',borrow,head);
  b=run(['growth-status','--id',r.id,'--path',source]).binding;d=disposition('reduce-retained-headroom',b);
  assert.equal(effect('reduce-retained-headroom',r,d,false).error.code,'growth-writer-unknown');

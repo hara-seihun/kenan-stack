@@ -3546,10 +3546,21 @@ function verifiedRemoteCustody(record) {
   for(const remote of remotes) {
     const r=command("git",["-C",record.path,"ls-remote","--heads",remote],{timeout:4000});
     if(r.status!==0)growthError("retained-source-unknown","fresh remote observation failed: "+remote);
+    const remoteShas=[];
     for(const line of r.stdout.split("\n").filter(Boolean)) {
       const [sha,ref]=line.split(/\s+/u);
       if(!/^[a-f0-9]{40,64}$/.test(sha)||!ref?.startsWith("refs/heads/"))growthError("retained-source-unknown","malformed remote refs");
-      if(command("git",["-C",record.path,"cat-file","-e",sha+"^{commit}"]).status===0)durable.push(sha);
+      remoteShas.push(sha);
+    }
+    if(remoteShas.length) {
+      const checked=command("git",["-C",record.path,"cat-file","--batch-check=%(objectname) %(objecttype)"],{input:remoteShas.join("\n")+"\n",timeout:4000});
+      if(checked.status!==0)growthError("retained-source-unknown","remote object inventory failed");
+      const rows=checked.stdout.split("\n");
+      if(rows.length!==remoteShas.length)growthError("retained-source-unknown","incomplete remote object inventory");
+      for(let i=0;i<rows.length;i++) {
+        if(rows[i]===remoteShas[i]+" commit")durable.push(remoteShas[i]);
+        else if(rows[i]!==remoteShas[i]+" missing")growthError("retained-source-unknown","invalid remote object response");
+      }
     }
     observations.push({remote,refsSha256:digest(r.stdout),observedAt:Date.now()});
   }
