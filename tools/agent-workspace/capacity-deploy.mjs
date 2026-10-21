@@ -1,11 +1,11 @@
 // Tools-only immutable selective publication. Executed under host deploy lock and
 // exclusive stable admission lock; no service, product or reservation mutation.
 import fs from 'node:fs';import path from 'node:path';import {execFileSync} from 'node:child_process';import {inventory} from './deploy-custody-gate.mjs';
-const [repo,baseCommit,expected,receipt,rollback]=process.argv.slice(2);
+const [repo,baseCommit,expected,receipt,rollback,sourceRef]=process.argv.slice(2);
 const git=(...a)=>execFileSync('git',['-C',repo,...a],{encoding:'utf8'}).trim();
-if(git('status','--porcelain'))throw Error('unclean source');
+if(!sourceRef&&git('status','--porcelain'))throw Error('unclean source');
 const canonicalBase=git('rev-parse','--verify',baseCommit+'^{commit}');if(canonicalBase!==baseCommit)throw Error('full canonical base SHA required');
-const head=git('rev-parse','HEAD'),dest='/srv/pi/tools';
+const head=git('rev-parse','--verify',(sourceRef??'HEAD')+'^{commit}');if(sourceRef&&head!==sourceRef)throw Error('full canonical source SHA required');const dest='/srv/pi/tools';
 if(fs.realpathSync(dest)!==expected)throw Error('base CAS mismatch');
 const before=inventory(expected),toolBefore=inventory(path.join(expected,'agent-workspace'));
 for(const [name,entry]of Object.entries(toolBefore)){

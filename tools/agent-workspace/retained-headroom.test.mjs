@@ -1,0 +1,11 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';
+import {validateRetainedHeadroom,digest} from './growth-lifecycle.mjs';
+const now=1000000,b={owner:'owner',leaseExpiresAt:0,planSha256:'a'.repeat(64)};
+const p={intent:'budgeted',headroomBytes:20*1024**3,growthLifecycle:{kind:'retired-future-growth',remainingGrowthBytes:0,retainedUse:'source',dispositionSha256:'a'.repeat(64),retiredAt:now-1}};
+const d=()=>({kind:'reduce-retained-headroom',retainedUse:'source',futureWrites:'none',growthWriters:'none',sourceCustody:'remote-verified',sourceEvidence:'actual remote refs',headroomBytes:8*1024**3,reason:'build completed',ownerEvidence:'originalowner terminal confirmation',observedAt:now,binding:{...b}});
+const safe={errors:[],references:[],retainedBorrowers:[]};
+test('preserved source lower floor accepted; caller data unchanged',()=>{const before=digest(JSON.stringify(p));validateRetainedHeadroom(d(),b,p,safe,now);assert.equal(digest(JSON.stringify(p)),before)});
+for(const [name,fn] of [['writer',v=>v.futureWrites='planned'],['missing custody',v=>v.sourceEvidence=''],['higherfloor',v=>v.headroomBytes=21*1024**3],['unsafe floor',v=>v.headroomBytes=1024],['stale owner',v=>v.binding.owner='old'],['future evidence',v=>v.observedAt=now+1],['stale evidence',v=>v.observedAt=0],['runtime',v=>v.retainedUse='runtime'],['missing evidence',v=>v.ownerEvidence='']])test(name,()=>{let v=d();fn(v);assert.throws(()=>validateRetainedHeadroom(v,b,p,safe,now))});
+for(const s of [{...safe,errors:['unreadable census']},{...safe,references:[{pid:1}]},{...safe,retainedBorrowers:[{id:'borrower'}]},{references:[],errors:[]}])test('unknown/active/borrower safety refuses '+JSON.stringify(s),()=>assert.throws(()=>validateRetainedHeadroom(d(),b,p,s,now)));
+test('active lease refuses',()=>assert.throws(()=>validateRetainedHeadroom({...d(),binding:{...b,leaseExpiresAt:now+1}},{...b,leaseExpiresAt:now+1},p,safe,now)));
+test('nonretired refuses',()=>assert.throws(()=>validateRetainedHeadroom(d(),b,{...p,growthLifecycle:undefined},safe,now)));
