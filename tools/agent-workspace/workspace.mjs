@@ -2380,7 +2380,7 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   // Negotiate only independently complete ancestry; damaged/unknown custody needs full refetch.
   const negotiation = bases.length ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
-  run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--update-shallow", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
   publishSourcePhase({ phase: "verifying", commit: resolved });
   return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
 }

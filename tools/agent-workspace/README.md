@@ -560,3 +560,5 @@ lease, reservation, provider outcome or capacity credit is invented.
 A successful Git fetch is object transport, not source custody acceptance. The importer verifies the exact independently owned closure, creates a missing request-bound source ref by no-overwrite CAS, verifies readback, and uses Git object/reference fsync before READY. Crash-left objects may repair only the requested immutable commit; a conflicting ref or missing closure fails without overwriting custody or substituting donor HEAD. Original failed job receipts remain unchanged.
 
 `growth-status --id ID --path PATH` requires both selectors to bind custody. `reprice-capacity (--id ID|--path PATH)` accepts exactly one.
+
+Local shallow donors require explicit `fetch --update-shallow`: Git otherwise exits zero while rejecting the destination ref, leaving unreferenced objects without the donor's shallow boundary. The shared independent mirror imports that explicit boundary, then verifies closure and exact ref readback; it never invents parent objects or treats missing history as complete. Real shallow-donor regression retains this prior RED.
