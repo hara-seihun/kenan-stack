@@ -2325,9 +2325,12 @@ test("a released checkout stays until its owner's input, execution, wait and can
     }
     setMetadata.run("{}");
     writeFileSync(path.join(f.root, "invalid-threads.sqlite3"), "not sqlite");
-    assert.throws(() => run(["release", "--id", created.id, "--json"], {
+    const unknown=JSON.parse(run(["release", "--id", created.id, "--json"], {
       ...env, PI_THREAD_DATABASE: path.join(f.root, "invalid-threads.sqlite3"),
-    }), /file is not a database/);
+    }));
+    assert.equal(unknown.action,"none");assert.equal(unknown.inspection.classification,"blocked");
+    assert.match(unknown.inspection.reason,/file is not a database/);
+    rmSync(path.join(f.root,"invalid-threads.sqlite3"));
     assert.equal(existsSync(created.path), true);
     assert.equal(JSON.parse(run(["release", "--id", created.id, "--json"], env)).action, "released");
     assert.equal(existsSync(created.path), false);
@@ -2354,6 +2357,8 @@ test("creates and releases a clean review checkout", () => {
       ".converge-cache",
       "build",
       "**/build",
+      ".gradle",
+      "**/.gradle",
       "**/__pycache__",
       "**/.pytest_cache",
       "**/.mypy_cache",
@@ -2381,7 +2386,7 @@ test("creates and releases a clean review checkout", () => {
       "--mode", "review", "--min-free-gib", "0", "--json",
     ], f.env));
     const output = run(["release", "--id", plain.id], f.env);
-    assert.equal(output, `${plain.id}\treclaimable\t${plain.path}\treleased\tcheckout remains at its durable source commit`);
+    assert.equal(output, `${plain.id}\treclaimable\t${plain.path}\treleased\tcheckout remains at its durable source commit\tlease:released\tphysical:removed`);
   } finally {
     f.close();
   }
@@ -2632,7 +2637,7 @@ for (const grouped of [false, true]) for (const committed of [false, true])
     } finally { f.close(); }
   });
 
-test("keeps local commits but strips declared caches", () => {
+test("retains unpublished commits and all declared caches until source is recoverable", () => {
   const f = fixture();
   try {
     const created = JSON.parse(run([
@@ -2644,6 +2649,7 @@ test("keeps local commits but strips declared caches", () => {
     writeFileSync(path.join(created.path, "file.txt"), "changed\n");
     git(created.path, "add", "file.txt");
     git(created.path, "commit", "-m", "local work");
+    writeFileSync(path.join(created.path,".git/info/exclude"),"node_modules/\npackages/\napps/\ntools/\nbuild/\n.lake/\n");
     mkdirSync(path.join(created.path, "node_modules", "package"), { recursive: true });
     writeFileSync(path.join(created.path, "node_modules", "package", "index.js"), "generated\n");
     mkdirSync(path.join(created.path, "packages", "api", "node_modules", "package"), { recursive: true });
@@ -2662,13 +2668,13 @@ test("keeps local commits but strips declared caches", () => {
     assert.equal(result.inspection.classification, "repair-required");
     assert.match(result.inspection.reason, /commits absent from remote refs/);
     assert.equal(existsSync(created.path), true);
-    assert.equal(existsSync(path.join(created.path, "node_modules")), false);
-    assert.equal(existsSync(path.join(created.path, "packages", "api", "node_modules")), false);
-    assert.equal(existsSync(path.join(created.path, "apps", "web", "dist")), false);
-    assert.equal(existsSync(path.join(created.path, "apps", "web", ".react-router")), false);
-    assert.equal(existsSync(path.join(created.path, "tools", "__pycache__")), false);
-    assert.equal(existsSync(path.join(created.path, "build")), false);
-    assert.equal(existsSync(path.join(created.path, ".lake")), false);
+    assert.equal(existsSync(path.join(created.path, "node_modules")), true);
+    assert.equal(existsSync(path.join(created.path, "packages", "api", "node_modules")), true);
+    assert.equal(existsSync(path.join(created.path, "apps", "web", "dist")), true);
+    assert.equal(existsSync(path.join(created.path, "apps", "web", ".react-router")), true);
+    assert.equal(existsSync(path.join(created.path, "tools", "__pycache__")), true);
+    assert.equal(existsSync(path.join(created.path, "build")), true);
+    assert.equal(existsSync(path.join(created.path, ".lake")), true);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "changed\n");
   } finally {
     f.close();
@@ -2724,13 +2730,14 @@ test("Gradle classification preserves tracked files and unpublished source", () 
     writeFileSync(path.join(created.path, ".gradle", "source.txt"), "unique source\n");
     git(created.path, "add", ".gradle");
     git(created.path, "commit", "-m", "unpublished tracked Gradle name");
+    writeFileSync(path.join(created.path,".git/info/exclude"),"android/\n");
     mkdirSync(path.join(created.path, "android", ".gradle"), { recursive: true });
     writeFileSync(path.join(created.path, "android", ".gradle", "fixture"), "generated\n");
     const result = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
     assert.equal(result.record.state, "repair-required");
     assert.match(result.inspection.reason, /commits absent from remote refs/);
     assert.equal(readFileSync(path.join(created.path, ".gradle", "source.txt"), "utf8"), "unique source\n");
-    assert.equal(existsSync(path.join(created.path, "android", ".gradle")), false);
+    assert.equal(existsSync(path.join(created.path, "android", ".gradle")), true);
   } finally { f.close(); }
 });
 
