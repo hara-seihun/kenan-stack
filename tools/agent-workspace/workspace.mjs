@@ -1800,6 +1800,14 @@ function remainingCapacityBytes(plan, state, measurement) {
   return Math.max(0, budget - Math.max(0, measurement.bytes - capacityAllocationBaseline(plan, state)));
 }
 
+// What one plan holds in the device ledger: unspent growth plus the headroom it
+// imposes on every other admission. capacityReservations and reprice admission
+// both read a plan through this projection.
+function ledgerLiability(plan, state, measurement) {
+  return { reservedBytes: remainingCapacityBytes(plan, state, measurement),
+    headroomBytes: Math.max(plan.headroomBytes, plan.intent === "unestimated" ? plan.constructionBytes : 0) };
+}
+
 function capacityAllocationBaseline(plan, state) {
   const sourceImportBytes = plan.sourceImportBytes ?? 0;
   if (!Number.isSafeInteger(sourceImportBytes) || sourceImportBytes < 0 || sourceImportBytes > plan.constructionBytes) fail("invalid capacity source import budget");
@@ -1866,14 +1874,13 @@ function capacityReservations(database, device, reservedPath, measure) {
       if (!["source-only", "budgeted", "unestimated"].includes(plan.intent) ||
         !(plan.intent === "unestimated" ? ["unknown"] : ["whole-tree-upper-bound", "git-sparse-upper-bound"]).includes(plan.estimate)) fail("invalid capacity ledger intent or estimate");
       capacityRequirement(plan, []);
-      headroomBytes = Math.max(headroomBytes, plan.headroomBytes,
-        plan.intent === "unestimated" ? plan.constructionBytes : 0);
       const budget = plan.growthBytes + (row.state === "creating" ? plan.constructionBytes : 0);
-      if (retainedGrowth(plan)) return remainingCapacityBytes(plan, row.state, {ok:false});
-      if (budget === 0) return 0;
-      const measurement = measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
-      if (!measurement.ok) measurementFailures.push({ path: row.path, error: measurement.error, reservedBytes: budget });
-      return remainingCapacityBytes(plan, row.state, measurement);
+      const unmeasured = retainedGrowth(plan) || budget === 0;
+      const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
+      if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, error: measurement.error, reservedBytes: budget });
+      const liability = ledgerLiability(plan, row.state, measurement);
+      headroomBytes = Math.max(headroomBytes, liability.headroomBytes);
+      return liability.reservedBytes;
     }).filter(bytes => bytes > 0);
   // Source imports reserve before releasing the device fence. A killed importer
   // retains liability until its original operation reconciles; elapsed time is not credit.
@@ -1911,7 +1918,10 @@ function capacityRefusalDetails(plan, reservations) {
   };
 }
 
-function assertCapacity(root, args, database, reservedPath, plan, replacedPlan) {
+// prior: undefined for a new reservation; {kind:"reduction", plan} for an owner's
+// monotone reduction; {kind:"reprice", liability} when an existing reservation is
+// re-priced, so only its increment over what it already holds is charged.
+function assertCapacity(root, args, database, reservedPath, plan, prior) {
   mkdirSync(root, { recursive: true });
   const maxCount = numberFlag(args, "max-count", DEFAULT_MAX_COUNT);
   if (maxCount > 0) {
@@ -1930,8 +1940,9 @@ function assertCapacity(root, args, database, reservedPath, plan, replacedPlan) 
   const freeBytes = stats.bavail * stats.bsize;
   const minimum = Math.ceil(numberFlag(args, "min-free-gib", DEFAULT_MIN_FREE_GIB) * 1024 ** 3);
   const requirement = capacityRequirement(plan ?? { intent: "unestimated", constructionBytes: minimum, headroomBytes: 0, growthBytes: 0 }, reservations.priced, reservations.headroomBytes);
-  let reductionEvidence;
-  if (replacedPlan !== undefined) {
+  let priorEvidence;
+  if (prior?.kind === "reduction") {
+    const replacedPlan = prior.plan;
     // Both requirements use ONE physical observation and ONE unchanged set of
     // other reservations. This retires existing liability; it creates no space
     // and grants no new writes even when the host is already oversubscribed.
@@ -1944,12 +1955,26 @@ function assertCapacity(root, args, database, reservedPath, plan, replacedPlan) 
         deficitBytesAfter > deficitBytesBefore) {
       growthError("unsafe-growth-reduction", "replacement must strictly lower existing liability without worsening the capacity deficit");
     }
-    reductionEvidence = {kind:"monotone-reduction", previousRequiredBytes, deficitBytesBefore, deficitBytesAfter,
+    priorEvidence = {kind:"monotone-reduction", previousRequiredBytes, deficitBytesBefore, deficitBytesAfter,
       releasedReservationBytes:previousRequiredBytes-requirement, newWritesAuthorized:false};
+  } else if (prior?.kind === "reprice") {
+    // ONE physical observation and ONE set of other reservations price both the
+    // liability this workspace already holds and the one it asks for. A re-price
+    // that adds nothing is admitted even on an oversubscribed device: it cannot
+    // worsen the deficit. Any real increment must fit the whole ledger.
+    const { reservedBytes, headroomBytes } = prior.liability;
+    for (const value of [reservedBytes, headroomBytes]) if (!Number.isSafeInteger(value) || value < 0) fail("invalid prior capacity liability");
+    const previousRequiredBytes = reservedBytes + Math.max(headroomBytes, reservations.headroomBytes) +
+      reservations.priced.reduce((sum, bytes) => sum + bytes, 0);
+    const incrementalBytes = requirement - previousRequiredBytes;
+    priorEvidence = {kind: incrementalBytes <= 0 ? "reprice-within-reservation" : "reprice-increment",
+      previousRequiredBytes, incrementalBytes, deficitBytesBefore: Math.max(0, previousRequiredBytes - freeBytes),
+      deficitBytesAfter: Math.max(0, requirement - freeBytes)};
   }
-  if (replacedPlan === undefined && freeBytes < requirement) {
+  if (prior?.kind !== "reduction" && !(priorEvidence?.kind === "reprice-within-reservation") && freeBytes < requirement) {
     const capacity = { freeBytes, requiredBytes: requirement, device, observedAt: Date.now(),
-      breakdown: capacityRefusalDetails(plan ?? { intent: "unestimated", constructionBytes: minimum, headroomBytes: 0, growthBytes: 0 }, reservations) };
+      breakdown: capacityRefusalDetails(plan ?? { intent: "unestimated", constructionBytes: minimum, headroomBytes: 0, growthBytes: 0 }, reservations),
+      ...(priorEvidence === undefined ? {} : { reprice: priorEvidence }) };
     // The guarded create wrapper preserves stderr but not thrown object fields.
     // Carry the complete typed observation in both retained forecast and stderr,
     // without another filesystem/reservation read or a new admission attempt.
@@ -1959,7 +1984,7 @@ function assertCapacity(root, args, database, reservedPath, plan, replacedPlan) 
   const freeInodes = stats.files > 0 ? 100 * stats.ffree / stats.files : 100;
   const minFreeInodes = numberFlag(args, "min-free-inodes-percent", DEFAULT_MIN_FREE_INODES_PERCENT);
   if (freeInodes < minFreeInodes) fail(`${freeInodes.toFixed(2)}% of inodes are free; ${minFreeInodes.toFixed(2)}% is required`);
-  return { ...reductionEvidence, freeBytes, requiredBytes: requirement, reservedBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
+  return { ...priorEvidence, freeBytes, requiredBytes: requirement, reservedBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     sharedHeadroomBytes: reservations.headroomBytes, unpricedDormant: reservations.unpricedDormant,
     ...(reservations.measurementFailures ? { measurementFailures: reservations.measurementFailures } : {}) };
 }
@@ -3332,9 +3357,14 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
       // cache immutable, and never credit a deletion behind that cache implicitly.
       const currentSample = reducing ? workspaceAllocationSample(record.path, row.device_id, {deadline:deadline - 2_000,maxEntries:2_000_000}) : sample;
       if (!currentSample.ok) growthError("growth-sample-required", currentSample.error);
-      const accountedBytes = Math.max(sample.bytes, currentSample.bytes);
-      const sampledGrowthBytes = Math.max(0, accountedBytes - capacityAllocationBaseline(plan, record.state));
-      plan.growthBytes += sampledGrowthBytes;
+      const baseline = capacityAllocationBaseline(plan, record.state);
+      const sampledGrowthBytes = Math.max(0, Math.max(sample.bytes, currentSample.bytes) - baseline);
+      // The ledger reads growth through the margin-discounted cache, so the bytes
+      // inside that margin are still reserved by the existing plan. Booking the
+      // raw sample on top would charge them twice. A reduction's fresh complete
+      // walk is exact, so it books the raw sample.
+      const accountedGrowthBytes = reducing ? sampledGrowthBytes : Math.max(0, measurement.bytes - baseline);
+      plan.growthBytes += accountedGrowthBytes;
       capacityRequirement(plan, []);
       if (reducing) {
         validateReduction(reduction, growthBinding(database, record).binding, required(args, "owner"), intent.growthBytes);
@@ -3342,10 +3372,12 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
           growthError("unsafe-growth-reduction", "reduction must lower total future budget, preserve headroom and retain the 8 GiB floor");
         }
       }
-      if (expandingBudget && (plan.headroomBytes < oldPlan.headroomBytes || (!resume && !reducing && plan.growthBytes < oldPlan.growthBytes))) {
+      const priorLiability = ledgerLiability(oldPlan, record.state, measurement);
+      if (expandingBudget && (plan.headroomBytes < oldPlan.headroomBytes || (!resume && !reducing &&
+        remainingCapacityBytes(plan, record.state, measurement) < priorLiability.reservedBytes))) {
         fail("budget expansion cannot reduce headroom or total growth budget");
       }
-      plan.repricing = { priorIntent: oldPlan.intent, sampledGrowthBytes, remainingGrowthBytes: intent.growthBytes,
+      plan.repricing = { priorIntent: oldPlan.intent, sampledGrowthBytes, accountedGrowthBytes, remainingGrowthBytes: intent.growthBytes,
         measurementStartedAt: sample.startedAt, measurementCompletedAt: sample.completedAt, marginBytes: measurement.marginBytes };
       if (reducing) {
         plan.repricing.reduction = { ...reduction, sha256: reductionSha256 };
@@ -3353,7 +3385,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
       }
       if (!reducing) plan.admission = assertCapacity(record.root, args, database, record.path, {
         ...plan, constructionBytes: 0, growthBytes: remainingCapacityBytes(plan, record.state, measurement),
-      });
+      }, {kind:"reprice", liability:priorLiability});
       database.exec("BEGIN IMMEDIATE");
       try {
         if (reducing) {
@@ -3363,7 +3395,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
           if (!fresh.ok) growthError("growth-sample-required", fresh.error);
           plan.admission = assertCapacity(record.root, args, database, record.path,
             {...plan, constructionBytes:0, growthBytes:remainingCapacityBytes(plan, current.state, fresh)},
-            {...oldPlan, constructionBytes:0, growthBytes:remainingCapacityBytes(oldPlan, current.state, fresh)});
+            {kind:"reduction", plan:{...oldPlan, constructionBytes:0, growthBytes:remainingCapacityBytes(oldPlan, current.state, fresh)}});
         }
         const changed = database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=? AND plan_json=?")
           .run(JSON.stringify(plan), record.id, row.plan_json).changes;
@@ -3941,7 +3973,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if (argv[0] === "materialization-process-snapshot") {

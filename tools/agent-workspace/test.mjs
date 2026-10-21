@@ -986,7 +986,7 @@ test("fenced capacity repricing preserves live unestimated work and journals sam
     const repriced = JSON.parse(run(args, f.env));
     assert.equal(repriced.capacity.intent, "budgeted");
     assert.equal(repriced.capacity.repricing.remainingGrowthBytes, 8 * 1024 ** 2);
-    assert.equal(repriced.capacity.growthBytes, repriced.capacity.repricing.sampledGrowthBytes + 8 * 1024 ** 2);
+    assert.equal(repriced.capacity.growthBytes, repriced.capacity.repricing.accountedGrowthBytes + 8 * 1024 ** 2);
     assert.equal(repriced.capacity.sourceImportBytes, 0);
     assert.deepEqual(db.prepare("SELECT * FROM workspace WHERE id=?").get(created.id), before);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "dirty live work\n");
@@ -1067,10 +1067,10 @@ for (const priorIntent of ["source-only", "budgeted"]) test(`${priorIntent} buil
       assert.equal(repriced.capacity[key], created.capacity[key]);
     }
     assert.ok(repriced.capacity.repricing.sampledGrowthBytes >= 80 * 1024 ** 2);
-    assert.equal(repriced.capacity.growthBytes, repriced.capacity.repricing.sampledGrowthBytes + 128 * 1024 ** 2);
+    assert.equal(repriced.capacity.growthBytes, repriced.capacity.repricing.accountedGrowthBytes + 128 * 1024 ** 2);
     const remaining = workspaceTesting.remainingCapacityBytes(repriced.capacity, "active",
       workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, oldCapacity.device_id));
-    assert.ok(remaining >= 128 * 1024 ** 2 && remaining <= 192 * 1024 ** 2);
+    assert.equal(remaining, 128 * 1024 ** 2);
     assert.deepEqual(db.prepare("SELECT * FROM workspace WHERE id=?").get(created.id), before);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "unpublished source\n");
     const journal = db.prepare("SELECT * FROM workspace_capacity_repricing WHERE workspace_id=?").all(created.id);
