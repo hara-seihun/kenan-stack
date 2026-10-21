@@ -10,7 +10,8 @@ export function capacityRecovery(terminal, previousJobId, observation, expectedM
   const lock = /^workspace resource busy: capacity:([0-9]+): ([1-9][0-9]*)ms lock budget exhausted$/u.exec(terminal.error.message);
   // Mirror acquisition precedes its action (no fetch/update-ref executed). Bind the
   // exact canonical mirror from the original creation request, not arbitrary prose.
-  const mirrorLock = /^workspace resource busy: mirror:(\/[^\r\n]+): ([1-9][0-9]*)ms lock budget exhausted$/u.exec(terminal.error.message);
+  const mirrorLock = /^workspace resource busy: mirror:(\/[^\r\n]+): ([1-9][0-9]*)ms lock budget exhausted$/u.exec(terminal.error.message)
+    ?? /^workspace resource busy: mirror-source:(\/[^\r\n]+):[0-9a-f]{4,40}: ([1-9][0-9]*)ms lock budget exhausted$/u.exec(terminal.error.message);
   const mirrorRecovery = typeof expectedMirror === "string" && mirrorLock !== null && mirrorLock[1] === expectedMirror;
   if (terminal.error.code === "workspace-mirror-lock-busy" && !mirrorRecovery) return { state: "terminal" };
   const lockRecovery = lock !== null && lock[1] === observation?.device;

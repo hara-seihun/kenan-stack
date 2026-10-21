@@ -58,7 +58,10 @@ function terminal(value) {
   }
   if (value?.state === "failed" && typeof value.error?.code === "string" && value.error.code.length > 0
     && typeof value.error.message === "string" && value.error.message.length > 0) {
-    return { state: "failed", error: { code: value.error.code, message: value.error.message } };
+    const detail = value.error.detail;
+    if (detail !== undefined) canonical(detail);
+    return { state: "failed", error: { code: value.error.code, message: value.error.message,
+      ...(detail && Object.getPrototypeOf(detail) === Object.prototype ? { detail } : {}) } };
   }
   throw Object.assign(new Error("invalid terminal result"), { code: "invalid-result" });
 }

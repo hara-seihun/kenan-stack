@@ -28,7 +28,7 @@ function fixture(t){
 }
 test('actual owning CLI executes only disposable Git effects and checkpoints; exact resume never replays',t=>{
  const f=fixture(t);let run=f.cli(f.args);assert.ok([0,75].includes(run.status),run.stderr);let result=JSON.parse(run.stdout);assert.equal(result.operationId,operation);assert.equal(result.state,'checkpointed');
- const db=new DatabaseSync(path.join(path.dirname(f.state),'maintenance-journal.sqlite3'));const effects=db.prepare('SELECT * FROM maintenance_effect').all();assert.ok(effects.length>5);assert.ok(effects.every(row=>row.state==='settled'));const eventCount=db.prepare('SELECT count(*) AS n FROM maintenance_event').get().n;
+ const db=new DatabaseSync(path.join(path.dirname(f.state),'maintenance-journal.sqlite3'));const effects=db.prepare('SELECT * FROM maintenance_effect').all();const specs=effects.map(row=>JSON.parse(row.spec));assert.ok(specs.some(spec=>spec.kind==='alternates-replacement'));assert.ok(specs.some(spec=>spec.kind==='git'&&spec.input.args.includes('fetch')));assert.ok(effects.every(row=>row.state==='settled'));const eventCount=db.prepare('SELECT count(*) AS n FROM maintenance_event').get().n;
  run=f.cli([...f.args,'--resume']);assert.equal(run.status,0,run.stderr);assert.equal(JSON.parse(run.stdout).state,'settled');assert.equal(db.prepare('SELECT count(*) AS n FROM maintenance_event').get().n,eventCount);assert.equal(f.git('-C',f.borrower,'config','core.commitGraph').trim(),'false');assert.ok(fs.readFileSync(path.join(f.borrower,'.git/objects/info/alternates'),'utf8').includes('/mirrors/'));db.close();
 });
 test('actual CLI cannot accept empty stdout or original retained indeterminate record as a prior journal',t=>{

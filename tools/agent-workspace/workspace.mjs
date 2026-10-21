@@ -8,6 +8,7 @@ import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contrac
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
+import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -2020,17 +2021,34 @@ function withWorkspaceLock(database, workspacePath, action, requestedGroupId, de
   return groupId ? withResourceLock(statePath, `group:${groupId}`, checkout, deadline) : checkout();
 }
 
-function withResourceLock(statePath, key, action, deadline) {
+const heldResourceModes = new Map();
+let sourcePreparationPhase = null;
+
+function publishSourcePhase(value) {
+  sourcePreparationPhase = value.phase;
+  if (sourceJobDirectory !== null) writeSourceJobProgress(sourceJobDirectory, value);
+}
+
+// Shared holders of one key run concurrently; an exclusive holder excludes everyone.
+// A busy wait carries every live recorded holder with its current phase.
+function withResourceLock(statePath, key, action, deadline, { mode = "exclusive", waitMs: budgetMs = 30_000 } = {}) {
   const identity = `${statePath}\0${key}`;
-  if (heldResourceLocks.has(identity)) return action();
+  if (heldResourceLocks.has(identity)) {
+    if (heldResourceModes.get(identity) === "shared" && mode === "exclusive") throw new Error(`defect: lock upgrade requested for ${key}`);
+    return action();
+  }
   const directory = path.join(path.dirname(statePath), "locks");
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const file = path.join(directory, createHash("sha256").update(key).digest("hex"));
+  const name = createHash("sha256").update(key).digest("hex");
+  const file = path.join(directory, name);
+  const holders = path.join(path.dirname(statePath), "lock-holders");
   const descriptor = openSync(file, "a", 0o600);
+  let releaseRecord = null;
   try {
     const effectiveDeadline=maintenanceContext?.journal.deadline ?? deadline;
-    const waitMs = effectiveDeadline === undefined ? 30_000 : Math.max(0, Math.min(100, effectiveDeadline - Date.now()-250));
-    const result = spawnSync("flock", ["--exclusive", "--wait", String(waitMs / 1000), "3"], {
+    const waitMs = effectiveDeadline === undefined ? budgetMs : Math.max(0, Math.min(100, effectiveDeadline - Date.now()-250));
+    const started = Date.now();
+    const result = spawnSync("flock", [mode === "shared" ? "--shared" : "--exclusive", "--wait", String(waitMs / 1000), "3"], {
       stdio: ["ignore", "pipe", "pipe", descriptor], encoding: "utf8", timeout: waitMs + 1000,
     });
     if (result.status !== 0) {
@@ -2038,13 +2056,19 @@ function withResourceLock(statePath, key, action, deadline) {
       // flock exit 1 with no diagnostic is an exhausted wait, not a failed import.
       // Mark only the capacity acquisition boundary, never action() or mirror failures.
       if (/^capacity:[0-9]+$/u.test(key) && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-capacity-lock-busy";
-      if (key.startsWith("mirror:") && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-mirror-lock-busy";
+      if (/^mirror(-source)?:/u.test(key) && result.status === 1 && !result.error && !result.stderr?.trim()) error.code = "workspace-mirror-lock-busy";
+      error.detail = { lock: key, mode, waitedMs: Date.now() - started, waiterPhase: sourcePreparationPhase,
+        waiterJob: sourceJobDirectory, holders: observeLockHolders(holders, name) };
       throw error;
     }
     heldResourceLocks.set(identity, descriptor);
+    heldResourceModes.set(identity, mode);
+    releaseRecord = recordLockHolder(holders, name, { key, mode, job: sourceJobDirectory, phase: sourcePreparationPhase });
     return action();
   } finally {
+    releaseRecord?.();
     heldResourceLocks.delete(identity);
+    heldResourceModes.delete(identity);
     closeSync(descriptor);
   }
 }
@@ -2080,7 +2104,7 @@ function stabilizeObjectCustody(workspace, alternates, execute, statePath) {
   const upstream = repositoryRemotes(workspace);
   const mirror = mirrorFor(statePath, upstream.fetch);
   withResourceLock(statePath, `mirror:${mirror}`, () => {
-    prepareMirror(mirror, workspace, upstream);
+    prepareMirror(statePath, mirror, workspace, upstream);
     const collectObjects = () => [...new Set([
       git(workspace, ["rev-parse", "--verify", "HEAD"]),
       ...git(workspace, ["for-each-ref", "--format=%(objectname)"]).split("\n"),
@@ -2161,7 +2185,9 @@ function hasObjectClosure(mirror, commit, sparsePatterns = []) {
     try { sourceTree(mirror, commit, sparsePatterns); verified = true; }
     catch (error) { if (!(error instanceof CliError)) throw error; return false; }
   }
-  if (!verified || objectStoreStamp(mirror) !== before) return false;
+  if (!verified) return false;
+  // Concurrent imports only add objects; a moved stamp invalidates memoization, not the proof.
+  if (objectStoreStamp(mirror) !== before) return true;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}`;
   writeFileSync(temporary, JSON.stringify({ version: 1, commit, sparsePatterns, stamp: before }), { mode: 0o600 });
@@ -2196,11 +2222,32 @@ function resolveRequestedSource(repository, ref) {
   return ref;
 }
 
+// The mirror object store is shared custody: imports of different commits hold it
+// shared and run concurrently (Git object writes are content-addressed and atomic).
+// Only one import per commit runs; its peers wait for that in-flight result instead
+// of failing a fixed budget. Exclusive mirror holders (maintenance import) still fence all.
+const SOURCE_IMPORT_TIMEOUT_MS = 1_800_000;
+
+function mirrorSourceLock(statePath, mirror, ref, action) {
+  const foreground = sourcePreparationMode === "foreground";
+  const deadline = foreground ? sourcePreparationDeadline : undefined;
+  try {
+    return withResourceLock(statePath, `mirror:${mirror}`, () =>
+      withResourceLock(statePath, `mirror-source:${mirror}:${ref}`, action, deadline,
+        { waitMs: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS + 60_000 : 30_000 }),
+    deadline, { mode: "shared" });
+  } catch (error) {
+    if (foreground && error instanceof ResourceBusyError) throw new SourcePreparationRequired();
+    throw error;
+  }
+}
+
 function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatterns = []) {
   ref = resolveRequestedSource(repository, ref);
   const cached = cachedImmutableSource(mirror, repository, ref, sparsePatterns);
   if (cached !== null) return cached;
-  return withResourceLock(statePath, `mirror:${mirror}`, () => {
+  publishSourcePhase({ phase: "awaiting-mirror", commit: ref });
+  return mirrorSourceLock(statePath, mirror, ref, () => {
     const shared = cachedImmutableSource(mirror, repository, ref, sparsePatterns);
     if (shared !== null) return shared;
     if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
@@ -2210,36 +2257,54 @@ function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatte
       return ref;
     }
     if (sourcePreparationMode === "foreground") throw new SourcePreparationRequired();
-    if (sourceJobDirectory !== null) writeSourceJobProgress(sourceJobDirectory, { phase: "importing", commit: ref });
-    prepareMirror(mirror, repository, upstream);
+    publishSourcePhase({ phase: "importing", commit: ref });
+    prepareMirror(statePath, mirror, repository, upstream);
     if (/^[0-9a-f]{4,39}$/u.test(ref)) {
-      run("git", ["--git-dir", mirror, "fetch", "--prune", "--no-tags", "origin"], { timeout: 120_000 });
+      withResourceLock(statePath, `mirror-origin:${mirror}`, () =>
+        run("git", ["--git-dir", mirror, "fetch", "--prune", "--no-tags", "--no-write-fetch-head", "origin"], { timeout: 120_000 }));
     }
     return fetchSource(mirror, repository, ref, sparsePatterns);
   });
 }
 
-function prepareMirror(mirror, repository, upstream) {
+function prepareMirror(statePath, mirror, repository, upstream) {
   maintenanceEffect('mirror-directory',{directory:path.dirname(mirror)},()=>{mkdirSync(path.dirname(mirror), { recursive: true, mode: 0o700 });return null;});
-  if (!existsSync(mirror)) run("git", ["init", "--bare", mirror]);
-  if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
-  for (const [name, value] of Object.entries({ ...REFERENCE_CLONE_CONFIG, "fetch.unpackLimit": "1" })) {
-    run("git", ["--git-dir", mirror, "config", "--local", name, value]);
-  }
-  for (const [name, url] of [["origin", upstream.fetch], ["workspace-source", repository]]) {
-    const observeRemote=()=>command("git", ["--git-dir", mirror, "remote", "get-url", name]);
-    const existing = maintenanceContext ? maintenanceContext.journal.freeze(`remote:${mirror}:${name}`,observeRemote) : observeRemote();
-    if (existing.status !== 0 && existing.status !== 2) {
-      fail(`cannot read mirror remote ${name}: ${existing.stderr || existing.error?.message || `exit ${existing.status}`}`);
+  const configure = () => {
+    if (!existsSync(mirror)) run("git", ["init", "--bare", mirror]);
+    if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
+    const readConfig = () => {
+      const listed = command("git", ["--git-dir", mirror, "config", "--local", "--list", "-z"]);
+      if (listed.status !== 0) fail(`cannot read mirror configuration: ${listed.stderr || listed.error?.message || `exit ${listed.status}`}`);
+      const values = new Map();
+      for (const entry of listed.stdout.split("\0").filter(Boolean)) {
+        const split = entry.indexOf("\n");
+        const name = split < 0 ? entry : entry.slice(0, split);
+        values.set(name, [...(values.get(name) ?? []), split < 0 ? "" : entry.slice(split + 1)]);
+      }
+      return values;
+    };
+    // Observed under the configuration fence each time, so a resumed operation writes only what is still missing.
+    const current = readConfig();
+    const has = (name, value) => { const values = current.get(name.toLowerCase()); return values?.length === 1 && values[0] === value; };
+    for (const [name, value] of Object.entries({ ...REFERENCE_CLONE_CONFIG, "fetch.unpackLimit": "1" })) {
+      if (!has(name, value)) run("git", ["--git-dir", mirror, "config", "--local", name, value]);
     }
-    run("git", ["--git-dir", mirror, "remote", existing.status === 0 ? "set-url" : "add", name, url]);
-  }
-  configurePushUrl(["--git-dir", mirror], upstream);
-  run("git", ["--git-dir", mirror, "config", "remote.origin.mirror", "false"]);
-  run("git", [
-    "--git-dir", mirror, "config", "--replace-all", "remote.origin.fetch",
-    "+refs/heads/*:refs/remotes/origin/*",
-  ]);
+    for (const [name, url] of [["origin", upstream.fetch], ["workspace-source", repository]]) {
+      if (has(`remote.${name}.url`, url)) continue;
+      run("git", ["--git-dir", mirror, "remote", current.has(`remote.${name}.url`) ? "set-url" : "add", name, url]);
+    }
+    const explicitPush = upstream.explicitPush || upstream.push !== upstream.fetch;
+    if (explicitPush ? !has("remote.origin.pushurl", upstream.push) : current.has("remote.origin.pushurl")) {
+      configurePushUrl(["--git-dir", mirror], upstream);
+    }
+    if (!has("remote.origin.mirror", "false")) run("git", ["--git-dir", mirror, "config", "remote.origin.mirror", "false"]);
+    if (!has("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")) run("git", [
+      "--git-dir", mirror, "config", "--replace-all", "remote.origin.fetch",
+      "+refs/heads/*:refs/remotes/origin/*",
+    ]);
+  };
+  // Git's config.lock refuses concurrent writers; mirror configuration has its own short fence.
+  return statePath ? withResourceLock(statePath, `mirror-config:${mirror}`, configure) : configure();
 }
 
 function fetchSource(mirror, repository, ref, sparsePatterns) {
@@ -2254,7 +2319,9 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   const bases = existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : [];
   // Negotiate only independently complete ancestry; damaged/unknown custody needs full refetch.
   const negotiation = bases.length ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
-  run("git", ["--git-dir", mirror, "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "workspace-source", `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? 1_800_000 : 120_000 });
+  // Fetch the request's own repository, not the shared remote name another import may be rewriting.
+  run("git", ["--git-dir", mirror, "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  publishSourcePhase({ phase: "verifying", commit: resolved });
   const commit = run("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
   if (!hasObjectClosure(mirror, commit, sparsePatterns)) fail(`fetched source has incomplete object closure: ${commit}`);
   return commit;
@@ -2276,7 +2343,7 @@ function cloneSourceTag(statePath, mirror, sourceCommit) {
   const read = () => command("git", ["--git-dir", mirror, "rev-parse", "--verify", ref]);
   const existing = read();
   if (existing.status === 0 && existing.stdout === sourceCommit) return name;
-  return withResourceLock(statePath, `mirror:${mirror}`, () => {
+  return mirrorSourceLock(statePath, mirror, sourceCommit, () => {
     const current = read();
     if (current.status === 0 && current.stdout !== sourceCommit) fail(`clone source custody differs at ${ref}`);
     if (current.status !== 0) run("git", ["--git-dir", mirror, "update-ref", ref, sourceCommit, ""]);
@@ -2324,7 +2391,7 @@ function prepareSharedSourceClone(destination, repository, sourceCommit, input, 
 
 function prepareSourceValue(database, args, request) {
   const { statePath, root, destination, repository, upstream, mirror, intent, sparsePatterns, sourceCommit } = request;
-  if (sourceJobDirectory !== null) writeSourceJobProgress(sourceJobDirectory, { phase: "forecasting", commit: sourceCommit });
+  publishSourcePhase({ phase: "forecasting", commit: sourceCommit });
   const blockSize = statfsSync(root).bsize;
   const forecastPath = `${request.receipt}.forecast.json`;
   const inputs = { version: 4, repository, sourceCommit, intent, sparsePatterns, blockSize, stamp: objectStoreStamp(mirror) };
@@ -2428,7 +2495,7 @@ function prepareCreationSource(database, args, input) {
     command: [process.execPath, new URL(import.meta.url).pathname, "source-prepare"], env: {}, waitMs: 2000, restartInterrupted: true });
   const accepted = job => {
     if (job.jobId && pointer.jobId !== job.jobId) writePreparationReceipt(pointerPath, { ...pointer, jobId: job.jobId });
-    if (job.state === "failed" || job.state === "interrupted") fail(`source preparation ${job.state}: ${job.error?.code}: ${job.error?.message}; job ${pointer.jobId}; progress ${job.progressPath ?? path.join(directory, "jobs", pointer.jobId, "progress.json")}`);
+    if (job.state === "failed" || job.state === "interrupted") fail(`source preparation ${job.state}: ${job.error?.code}: ${job.error?.message}; job ${pointer.jobId}; progress ${job.progressPath ?? path.join(directory, "jobs", pointer.jobId, "progress.json")}${job.error?.detail ? `; lock detail ${JSON.stringify(job.error.detail)}` : ""}`);
     return job;
   };
   if (pointer !== null && !pointer.jobId) {
@@ -2497,8 +2564,12 @@ function prepareCreationSource(database, args, input) {
   pointer = { ...pointer, jobId: sourceJobId(key, jobRequest) };
   writePreparationReceipt(pointerPath, pointer);
   const job = accepted(observeJob());
-  if (job.state === "ready" && job.value.stamp !== objectStoreStamp(input.mirror)) fail("source changed during preparation; repeat the original request");
-  return job;
+  if (job.state !== "ready" || job.value.stamp === objectStoreStamp(input.mirror)) return job;
+  // Concurrent imports of other commits move the shared stamp; re-prove this source instead of failing.
+  const refreshed = revalidatePreparedSource(job.value, input, sourceCommit);
+  if (refreshed === null) fail("source changed during preparation; repeat the original request");
+  writePreparationReceipt(receipt, refreshed);
+  return { ...job, value: refreshed };
 }
 
 function writePreparationReceipt(file, value) {
@@ -2522,7 +2593,8 @@ function sourcePreparationWorker() {
     const result = finishSourceJob(directory, { state: "ready", value });
     if (!result.ok) fail(result.error.message);
   } catch (error) {
-    finishSourceJob(directory, { state: "failed", error: { code: ["workspace-capacity-refused", "workspace-capacity-lock-busy", "workspace-mirror-lock-busy"].includes(error.code) ? error.code : "source-preparation-failed", message: error.message } });
+    finishSourceJob(directory, { state: "failed", error: { code: ["workspace-capacity-refused", "workspace-capacity-lock-busy", "workspace-mirror-lock-busy"].includes(error.code) ? error.code : "source-preparation-failed", message: error.message,
+      ...(error instanceof ResourceBusyError && error.detail ? { detail: error.detail } : {}) } });
     throw error;
   } finally { database.close(); }
 }
@@ -4021,7 +4093,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         } })}\n`);
       }
     }
-    process.stderr.write(`agent-workspace: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`agent-workspace: ${error instanceof Error ? error.message : String(error)}\n${error instanceof ResourceBusyError && error.detail ? `agent-workspace: lock detail ${JSON.stringify(error.detail)}\n` : ""}`);
     process.exit(error instanceof ResourceBusyError ? 75 : (error instanceof CliError || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) ? 2 : 1);
   }
 }
