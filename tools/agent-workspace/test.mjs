@@ -1684,7 +1684,7 @@ test("budgeted source creation shares existing objects and records immutable spa
     const partialGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device).bytes - beforeGrowth.bytes - 64 * 1024 ** 2;
     assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const unavailable = workspaceTesting.capacityReservations(db, device, undefined, () => ({ ok: false, error: "unreadable fixture" }));
-    assert.deepEqual(unavailable, { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0,
+    assert.deepEqual(unavailable, { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [],
       measurementFailures: [{ path: created.path, error: "unreadable fixture", reservedBytes: 8 * 1024 ** 2 }] });
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(80 * 1024 ** 2));
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
