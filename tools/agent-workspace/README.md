@@ -534,3 +534,23 @@ Before the existing 16 lexical mirror-tip fallback, import pricing checks at mos
 The narrow capacity publisher optionally accepts a full source commit after its reservation-aware rollback argument, allowing immutable bootstrap source custody without checking out or modifying a shared canonical writer. Installed preimage, complete other-tool inventory, exclusive admission and deploy fence still apply.
 
 Terminal headroom is a no-file-effect, no-new-writing capacity transition. Its queue check uses current streaming tool reservations (`physical-checkout`) rather than historical conversational source intent (`source`); merely discussing a path is not a current writer. Complete privileged current process/FD, units/containers, exact lease/borrower locks and future admission fences remain mandatory. `terminal-safety --id ID --path PATH --owner OWNER --json` observes these conditions without mutation. Launch exact CLI directly from the native Bash tool when possible: detached systemd loses authenticated caller ancestry and conservatively includes that tool as a competing reference. Physical deletion/source retirement keeps its original stricter source-intent check.
+
+### Terminal source job abandonment
+`source-job-abandon --job-id SHA256 --owner OWNER --permit-sha256 SHA256 --json`
+is an explicit terminal **ABANDONED**, never a completed preparation. A finite
+root-owned mode600 permit in `/etc/pi-stack/source-job-abandon/JOB.json` binds
+one original request/attempt byte SHA, unit, adopted workspace, actual native
+applying agent/goal and channel. The repair operator creates this permit only
+from authenticated manager custody. It is not a generic retry/cleanup grant.
+The native streaming Bash caller, supported owner adoption, retired zero-lease
+custody and HEAD must match. Live/unknown unit/process/FD/cgroup holders refuse.
+An absent collected unit alone is not proof: retained prior PID0/empty-cgroup
+custody plus fresh privileged whole-host and cgroup census are required.
+The original submission lock serializes abandonment with restart admission.
+The exclusive immutable result retains prior progress and uncertainty as
+`historicalEffects: UNKNOWN_RETAINED`, `automaticRetry: false`; all original
+request/attempt/command/progress bytes stay untouched. Matching reapplication
+returns the original result without another effect. `job-status` shows abandoned
+with exit2, never ready; create cannot retry the same abandoned identity. The
+contention producer clears via its normal immutable-result check. No source,
+lease, reservation, provider outcome or capacity credit is invented.

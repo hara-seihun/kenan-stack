@@ -52,6 +52,7 @@ function readJson(filename) {
 }
 
 function terminal(value) {
+  if (value?.state === "abandoned" && value.outcome === "ABANDONED" && value.historicalEffects === "UNKNOWN_RETAINED" && value.automaticRetry === false && value.settlement?.permitSha256) { canonical(value); return value; }
   if (value?.state === "ready" && Object.hasOwn(value, "value")) {
     canonical(value.value);
     return { state: "ready", value: value.value };
@@ -182,7 +183,7 @@ function systemCommand(executable, args) {
 }
 
 function unitState(unit) {
-  const result = systemCommand("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus"]);
+  const result = systemCommand("systemctl", ["--user", "show", unit, "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,MainPID,ControlGroup"]);
   if (!result.ok) return result;
   // A missing unit still produces LoadState=not-found. A missing user bus produces no properties.
   const properties = Object.fromEntries(result.stdout.trim().split("\n").filter(line => line.includes("=")).map(line => {
@@ -373,6 +374,39 @@ export function runSourceJob({ directory, key, request, command, env = {}, waitM
       database.close();
     }
   }
+}
+
+// Uses the same SQLite submit lock as runSourceJob; no process may be launched in the CAS window.
+export function abandonSourceJob({directory,jobId,requestSha256,attemptSha256,validate,observe}) {
+ let database;
+ try {
+  if(path.basename(directory)!==jobId||realpathSync(directory)!==directory)throw Error('abandon-job-identity');
+  const stat=lstatSync(directory);if(stat.uid!==process.getuid()||(stat.mode&0o077))throw Error('abandon-job-owner');
+  database=new DatabaseSync(path.join(directory,'lock.sqlite3'));database.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE');
+  const requestBytes=readFileSync(path.join(directory,'request.json')),attemptBytes=readFileSync(path.join(directory,'attempt.json'));
+  const sha=b=>createHash('sha256').update(b).digest('hex');
+  if(sha(requestBytes)!==requestSha256||sha(attemptBytes)!==attemptSha256)throw Error('abandon-request-changed');
+  const request=JSON.parse(requestBytes),attempt=JSON.parse(attemptBytes);
+  const custody=validate(request,attempt);
+  const recorded=readTerminal(directory);
+  if(recorded){
+   if(recorded.state!=='abandoned'||recorded.settlement.permitSha256!==custody.permitSha256)throw Error('abandon-terminal-conflict');
+   return {ok:true,idempotent:true,...recorded};
+  }
+  const observed=unitState(attempt.unit);
+  if(!observed.ok||!['stopped','absent'].includes(observed.state)||!['inactive','failed'].includes(observed.properties.ActiveState)||observed.properties.MainPID!=='0'||observed.properties.ControlGroup!=='')throw Error('abandon-unit-unknown');
+  const safety=observe(attempt.unit);
+  if(!safety||safety.errors?.length||safety.references?.length||!safety.cgroup?.complete||safety.cgroup.members.length)throw Error('abandon-live-or-unknown-holders');
+  // Validate current custody again after the expensive census and before exclusive result commit.
+  const final=validate(request,attempt);if(canonical(custody)!==canonical(final))throw Error('abandon-custody-changed');
+  if(sha(readFileSync(path.join(directory,'request.json')))!==requestSha256||sha(readFileSync(path.join(directory,'attempt.json')))!==attemptSha256)throw Error('abandon-request-changed');
+  const value={state:'abandoned',outcome:'ABANDONED',historicalEffects:'UNKNOWN_RETAINED',automaticRetry:false,
+   settlement:{...custody,requestSha256,attemptSha256,originalAttempt:attempt,unitObservation:observed,safety,settledAt:new Date().toISOString()},
+   originalProgress:readJson(path.join(directory,'progress.json')).value??null};
+  atomicJson(path.join(directory,'result.json'),value,true);
+  return {ok:true,idempotent:false,...value};
+ }catch(error){return {ok:false,error:{code:error.code??(error.message.startsWith('abandon-')?error.message:'abandon-io'),message:error.message}};}
+ finally {if(database){try{database.exec('ROLLBACK');}finally{database.close();}}}
 }
 
 async function sourceWorker(directory) {
