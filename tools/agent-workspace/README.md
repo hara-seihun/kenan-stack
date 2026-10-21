@@ -554,3 +554,9 @@ returns the original result without another effect. `job-status` shows abandoned
 with exit2, never ready; create cannot retry the same abandoned identity. The
 contention producer clears via its normal immutable-result check. No source,
 lease, reservation, provider outcome or capacity credit is invented.
+
+### Source import commit boundary
+
+A successful Git fetch is object transport, not source custody acceptance. The importer verifies the exact independently owned closure, creates a missing request-bound source ref by no-overwrite CAS, verifies readback, and uses Git object/reference fsync before READY. Crash-left objects may repair only the requested immutable commit; a conflicting ref or missing closure fails without overwriting custody or substituting donor HEAD. Original failed job receipts remain unchanged.
+
+`growth-status --id ID --path PATH` requires both selectors to bind custody. `reprice-capacity (--id ID|--path PATH)` accepts exactly one.

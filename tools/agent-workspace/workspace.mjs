@@ -2289,8 +2289,7 @@ function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatte
     if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
     if (/^[0-9a-f]{40}$/u.test(ref) && existsSync(mirror)
       && hasObjectClosure(mirror, ref, sparsePatterns)) {
-      run("git", ["--git-dir", mirror, "update-ref", sourceRefFor(repository, ref), ref]);
-      return ref;
+      return ensureSourceCustody(mirror, repository, ref, ref, sparsePatterns);
     }
     if (sourcePreparationMode === "foreground") throw new SourcePreparationRequired();
     publishSourcePhase({ phase: "importing", commit: ref });
@@ -2343,6 +2342,31 @@ function prepareMirror(statePath, mirror, repository, upstream) {
   return statePath ? withResourceLock(statePath, `mirror-config:${mirror}`, configure) : configure();
 }
 
+// A successful fetch is object transport, not a durable source-ref commit. An
+// interrupted import may have all objects but no ref. Recover only the exact
+// independently verified closure, never a mutable donor HEAD or another ref.
+function ensureSourceCustody(mirror, repository, ref, expected, sparsePatterns = []) {
+  if (!/^[0-9a-f]{40}$/u.test(expected) || !hasObjectClosure(mirror, expected, sparsePatterns)) {
+    fail(`fetched source has incomplete object closure: ${expected}`);
+  }
+  const sourceRef = sourceRefFor(repository, ref);
+  const current = command("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+  if (current.status === 0 && current.stdout !== expected) fail(`source custody conflict at ${sourceRef}: expected ${expected}, observed ${current.stdout}`);
+  if (current.status !== 0) {
+    // No blind overwrite: another producer's publication must agree. Fsync the
+    // reference transaction (and imported objects) before publishing READY.
+    const published = command("git", ["-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync",
+      "--git-dir", mirror, "update-ref", sourceRef, expected, ""]);
+    if (published.status !== 0) {
+      const peer = command("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+      if (peer.status !== 0 || peer.stdout !== expected) fail(`source custody publication failed at ${sourceRef}: ${commandFailureDetail(published)}`);
+    }
+  }
+  const committed = run("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+  if (committed !== expected) fail(`source custody changed at ${sourceRef}: expected ${expected}, observed ${committed}`);
+  return expected;
+}
+
 function fetchSource(mirror, repository, ref, sparsePatterns) {
   let resolved = ref;
   if (/^[0-9a-f]{4,39}$/u.test(ref)) {
@@ -2356,11 +2380,9 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   // Negotiate only independently complete ancestry; damaged/unknown custody needs full refetch.
   const negotiation = bases.length ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
-  run("git", ["--git-dir", mirror, "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
   publishSourcePhase({ phase: "verifying", commit: resolved });
-  const commit = run("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
-  if (!hasObjectClosure(mirror, commit, sparsePatterns)) fail(`fetched source has incomplete object closure: ${commit}`);
-  return commit;
+  return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
 }
 
 // Clone uses a temporary source remote, so Git does not create origin's fetch mapping.
@@ -3473,8 +3495,8 @@ function growthBinding(database, record) {
   return { binding, row, plan, measurement };
 }
 
-function growthSelected(database, args) {
-  const selected=selectedArguments('retire-growth',{id:one(args,'id'),path:one(args,'path')});
+function growthSelected(database, args, commandName = 'retire-growth') {
+  const selected=selectedArguments(commandName,{id:one(args,'id'),path:one(args,'path')});
   if(!selected.ok)throw Object.assign(new GrowthLifecycleError(selected.error.code,selected.error.detail),{nextAction:selected.error.nextAction});
   const record = recordBy(database, { id: required(args, "id") });
   if (record.path !== path.resolve(required(args, "path"))) growthError("growth-identity-changed", "id and path do not name the same workspace");
@@ -3483,7 +3505,7 @@ function growthSelected(database, args) {
 
 function growthStatusCommand(database, args, statePath) {
   assertOnly(args, ["id", "path", "json"]);
-  const selected = growthSelected(database, args);
+  const selected = growthSelected(database, args, "growth-status");
   withWorkspaceLock(database, selected.path, () => {
     const {binding, plan, measurement} = growthBinding(database, recordBy(database, {id:selected.id}));
     const sampleStatus = cachedWorkspaceAllocation(database, selected.id, selected.path, binding.device);
@@ -4117,7 +4139,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='source-job-abandon-permit') {
@@ -4188,6 +4210,10 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const args = parseArgs(rest);
   if (args.positional.length > 0) fail(`unexpected argument: ${args.positional[0]}`);
+  if (commandName === 'maintain') {
+    const selected = selectedArguments(commandName, {id:one(args,'id'),path:one(args,'path')});
+    if (!selected.ok) throw Object.assign(new CliError(selected.error.detail), {code:selected.error.code,nextAction:selected.error.nextAction});
+  }
   if (commandName === "source-status" || commandName === "job-status") {
     assertOnly(args, ["job-id", "json"]);
     const jobId = required(args, "job-id");
