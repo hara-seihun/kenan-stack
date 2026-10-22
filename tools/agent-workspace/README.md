@@ -630,3 +630,7 @@ Publication uses the existing tools-only `install-capacity-host` selective
 installer and exact installed-base CAS. No provider/product publication follows.
 Rollback the tool selection only after explicitly reconciling/thawing any new
 frozen snapshots; older tooling does not understand their intent markers.
+
+### Exact native caller identity
+
+Kenan Stack propagates SDK `callId` through `KENAN_TOOL_CALL_ID` for each owner tool invocation (concurrent invocations use independent async contexts). The workspace observer reads the initial environment of the direct child of the root-owned current-channel server, then matches exact agent/conversation and streaming message part callId. An ambiguous match exempts nothing. Shell substitution, quoting and final exec do not become competing writers; another worker or another same-agent tool call remains protected. There is no command-substring identity fallback. Install the native runtime propagation before this observer; an older runtime remains conservative and may report its own tool as a reference until upgraded.
