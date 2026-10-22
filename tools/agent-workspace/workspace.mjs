@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {hasUncoveredCommits} from './release-reachability.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
@@ -1901,6 +1902,14 @@ function capacityReservations(database, device, reservedPath, measure) {
     capacityRequirement(plan, []);
     headroomBytes = Math.max(headroomBytes, plan.headroomBytes, plan.intent === "unestimated" ? plan.constructionBytes : 0);
     priced.push(plan.growthBytes + (plan.intent === "unestimated" ? 0 : plan.constructionBytes));
+  }
+  // Non-Git execution reservations share this exact device ledger and fence.
+  // Charge the full operator budget until native cessation AND physical cleanup;
+  // no TTL, cached measurement or process restart silently grants capacity.
+  for (const execution of executionRows(database, device)) {
+    if (execution.state === "released") continue;
+    priced.push(execution.growthBytes);
+    headroomBytes = Math.max(headroomBytes, execution.headroomBytes);
   }
   return { priced, headroomBytes, unpricedDormant, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
@@ -4111,6 +4120,9 @@ function help() {
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
                             [--budget-ms 25000]
   agent-workspace reduce-retained-headroom --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
+  agent-workspace execution-reserve --root ABS_EMPTY_DIRECTORY --owner OWNER --operation-id UUID --growth-mib N --headroom-gib N --holder-pid PID --json
+  agent-workspace execution-status --id execution:UUID --json
+  agent-workspace execution-release --id execution:UUID --owner OWNER --expected-plan-sha256 SHA256 --json
   agent-workspace growth-status ${selectorSyntax("growth-status")} [--json]
   agent-workspace cache-safety --id ID --path PATH --owner OWNER (--cache RELATIVE|--request FILE --request-sha256 SHA) --json
   agent-workspace cache-plan --id ID --path PATH --owner OWNER --cache RELATIVE --classification node-dependencies|declared-build-cache --operation-id ID --evidence TEXT --json
@@ -4142,6 +4154,10 @@ Records outlive the directory, so status explains what became of a checkout that
 export const workspaceTesting = { ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
+  if(argv[0]==='execution-cessation') {
+    const args=parseArgs(argv.slice(1));assertOnly(args,['holder']);
+    print(executionCessation(JSON.parse(required(args,'holder'))),true);return;
+  }
   if(argv[0]==='source-job-abandon-permit') {
     if(process.getuid?.()!==0)refuse('abandon-permit-unsafe','root permit reader required');
     const args=parseArgs(argv.slice(1));assertOnly(args,['job-id']);print(readPermit(required(args,'job-id')),true);return;
@@ -4269,14 +4285,25 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
         : database.prepare("SELECT id FROM workspace WHERE root=?").all(path.resolve(scopedRoot)).map(row => row.id);
       drainGc(statePath, scopedIds);
     }
-    if (commandName === "create") createCommand(database, args, statePath);
+    if (["execution-reserve","execution-status","execution-release"].includes(commandName)) {
+      if(args.positional.length)growthError("execution-invalid-request","no positional arguments accepted");
+      print(executionCommand({database,args:args.named,command:commandName,statePath,
+        lock:(device,action)=>withResourceLock(statePath,`capacity:${device}`,action),
+        reservations:device=>capacityReservations(database,device),requirement:capacityRequirement,
+        observe:holder=>{
+          const result=command("sudo",["-n",process.execPath,new URL(import.meta.url).pathname,"execution-cessation","--holder",JSON.stringify(holder)],{timeout:7000});
+          if(result.status!==0)growthError(result.stderr?.includes("execution-holder-live")?"execution-holder-live":"execution-cessation-unknown",result.stderr?.trim()||"trusted observer failed");
+          try{return JSON.parse(result.stdout);}catch{growthError("execution-cessation-unknown","invalid observer output");}
+        }}),true);
+    }
+    else if (commandName === "create") createCommand(database, args, statePath);
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
@@ -4330,7 +4357,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError ? error.code : error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed",
           detail: error instanceof Error ? error.message : String(error),
