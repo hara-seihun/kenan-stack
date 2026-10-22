@@ -1,6 +1,7 @@
 // Ephemeral execution capacity lives in workspace_capacity, not a Git workspace or a second ledger.
 import fs from 'node:fs';
 import path from 'node:path';
+import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {GrowthLifecycleError} from './growth-lifecycle.mjs';
 const error=(code,detail)=>{throw new GrowthLifecycleError(code,code+': '+detail);};
@@ -12,7 +13,7 @@ export function executionHolder(pid) {
  const startTime=read(), cgroups=fs.readFileSync(`/proc/${pid}/cgroup`,'utf8');
  const cgroup=cgroups.split('\n').find(line=>line.startsWith('0::'))?.slice(3);
  if(!cgroup||!cgroup.startsWith('/')||cgroup.split('/').includes('..')||!cgroup.split('/').some(part=>part.endsWith('.service')||part.endsWith('.scope'))||read()!==startTime)error('execution-holder-unknown','stable native service cgroup required');
- return {pid,startTime,bootId:boot(),cgroup};
+ return {pid,startTime,bootId:boot(),cgroup,uid:fs.statSync(`/proc/${pid}`).uid};
 }
 // Trusted observer. Unknown/inaccessible process or cgroup state is never cessation.
 export function executionCessation(holder) {
@@ -30,7 +31,18 @@ export function executionCessation(holder) {
  const root='/sys/fs/cgroup'+holder.cgroup;
  try{const pending=[root];let count=0;while(pending.length){const current=pending.pop();if(++count>4096||Date.now()>deadline)error('execution-cessation-unknown','cgroup census deadline');const events=fs.readFileSync(path.join(current,'cgroup.events'),'utf8');if(!/^populated 0$/m.test(events)||fs.readFileSync(path.join(current,'cgroup.procs'),'utf8').trim())error('execution-holder-live','native cgroup remains populated');for(const e of fs.readdirSync(current,{withFileTypes:true}))if(e.isDirectory())pending.push(path.join(current,e.name));}}
  catch(e){if(e.code!=='ENOENT')throw e;/* removed cgroup + complete /proc census is cessation */}
- return {complete:true,members:[],bootId:holder.bootId,cgroup:holder.cgroup,observedAt:Date.now()};
+ const unit=holder.cgroup.split('/').filter(part=>part.endsWith('.service')||part.endsWith('.scope')).at(-1);
+ if(!Number.isSafeInteger(holder.uid)||holder.uid<0)error('execution-cessation-unknown','holder UID missing');
+ const user=holder.cgroup.includes('/user.slice/');
+ const command=user?'runuser':'systemctl';
+ const account=spawnSync('getent',['passwd',String(holder.uid)],{encoding:'utf8',timeout:1000}).stdout?.split(':')[0];
+ if(user&&!account)error('execution-cessation-unknown','holder account unavailable');
+ const commandArgs=user?['-u',account,'--','env',`XDG_RUNTIME_DIR=/run/user/${holder.uid}`,'systemctl','--user','show',unit,'--property=LoadState,ActiveState,SubState,MainPID,ControlPID']:['show',unit,'--property=LoadState,ActiveState,SubState,MainPID,ControlPID'];
+ const result=spawnSync(command,commandArgs,{encoding:'utf8',timeout:3000});
+ if(result.error||(![0,1].includes(result.status)))error('execution-cessation-unknown','native holder terminal state unavailable');
+ const native=Object.fromEntries(result.stdout.trim().split('\n').map(line=>line.split('=')));
+ if(!['inactive','failed'].includes(native.ActiveState)||Number(native.MainPID||0)!==0||Number(native.ControlPID||0)!==0||!['loaded','not-found'].includes(native.LoadState))error('execution-cessation-unknown','holder unit not terminal; auto-restart or activation may retain liability');
+ return {complete:true,members:[],bootId:holder.bootId,cgroup:holder.cgroup,nativeUnit:{unit,...native},observedAt:Date.now()};
 }
 export function executionRows(database,device) {
  return database.prepare("SELECT workspace_id,plan_json FROM workspace_capacity WHERE device_id=? AND workspace_id LIKE 'execution:%'").all(device).map(row=>{const plan=JSON.parse(row.plan_json);if(plan.kind!=='execution-capacity'||!['reserved','released'].includes(plan.state)||!Number.isSafeInteger(plan.growthBytes)||plan.growthBytes<0||!Number.isSafeInteger(plan.headroomBytes)||plan.headroomBytes<8*1024**3)error('execution-plan-invalid','invalid execution liability');return plan;});
