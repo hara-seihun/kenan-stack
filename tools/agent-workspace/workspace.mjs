@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
 import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {hasUncoveredCommits} from './release-reachability.mjs';
@@ -1381,6 +1382,7 @@ function reassignWorkspace(database, input) {
   const row = database.prepare(`SELECT workspace.*, ${ASSIGNMENT_SOURCE} FROM workspace WHERE id = ?`).get(input.id);
   if (row === undefined) return refuse("workspace-not-registered", input.id);
   const record = rowToRecord(row);
+  if (!input.frozenSourceTransfer && existsSync(path.join(record.path,".git","pi-frozen-handoff.json"))) return refuse("state-not-reassignable","frozen source snapshot; use freeze-source transfer or explicit thaw-source");
   if (recordRetainsCustody(database, record.id)) return refuse("growth-admission-required", "resume-growth admission required before reassignment");
   if (record.path !== input.path) return refuse("path-mismatch", `recorded ${record.path}, requested ${input.path}`);
   if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) {
@@ -1426,6 +1428,63 @@ function reassignWorkspace(database, input) {
   // source_commit stays immutable so clients from an earlier release cannot discard a new, unpublished baseline.
   database.prepare("UPDATE workspace SET owner = ?, updated_at = ? WHERE id = ?").run(input.owner, transfer.occurredAt, record.id);
   return { ok: true, record: recordBy(database, { id: record.id }), transfer: { sequence: Number(event.lastInsertRowid), ...transfer } };
+}
+
+function thawSourceCommand(database,args) {
+  assertOnly(args,["id","path","owner","expected-head","json"]);
+  const input={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head")};
+  return withWorkspaceLock(database,input.path,()=>{
+    const record=recordBy(database,{id:input.id});
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    const stat=lstatSync(input.path);
+    const result=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"rollback-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
+    if(result.status!==0) fail("snapshot-rollback-unaccepted: "+(result.stderr||result.error?.message));
+    rmSync(path.join(input.path,".git","pi-frozen-handoff.json"));
+    print({ok:true,binding:input,rollback:JSON.parse(result.stdout),ownerUnchanged:true},true);
+  });
+}
+
+function freezeSourceCommand(database,args) {
+  assertOnly(args,["id","path","owner","expected-head","recipient","authorization","json"]);
+  const input={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head")};
+  return withWorkspaceLock(database,input.path,()=>{
+    const record=recordBy(database,{id:input.id}), marker=path.join(input.path,".git","pi-frozen-handoff.json");
+    const previous=existsSync(marker)?JSON.parse(readFileSync(marker,"utf8")):null;
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    if (recordRetainsCustody(database,record.id)||retainedParent(database,record.path)) fail("writer-growth-admission-required");
+    if (realpathSync(input.path)!==input.path || lstatSync(path.join(input.path,".git")).isSymbolicLink()) fail("snapshot-private-git-required");
+    const clean=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
+    if (clean.status!==0 || clean.stdout) fail("snapshot-clean-source-required; no generated/build files allowed");
+    if (previous && (previous.id!==input.id||previous.head!==input.head)) fail("snapshot-marker-conflict");
+    const recipient=required(args,"recipient"), authorization=required(args,"authorization");
+    if(recipient===input.owner||!authorization.trim()) fail("snapshot-recipient-transfer-required");
+    const stat=lstatSync(input.path);
+    if(!previous) writeFileSync(marker,JSON.stringify({kind:"frozen-source-intent",id:input.id,path:input.path,head:input.head,ownerAtFreeze:input.owner})+"\n",{flag:"wx",mode:0o600});
+    const helper=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"freeze-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino,uid:stat.uid}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
+    if(helper.status!==0) fail("snapshot-freeze-unaccepted: "+(helper.stderr||helper.error?.message));
+    const after=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
+    if(gitInfo(input.path).head!==input.head||after.status!==0||after.stdout) fail("snapshot-head-raced; immutable source retained for reconciliation");
+    database.exec("BEGIN IMMEDIATE");
+    let transfer;
+    try {
+      transfer=reassignWorkspace(database,{id:input.id,path:input.path,fromOwner:input.owner,fromSourceCommit:record.sourceCommit,fromState:record.state,owner:recipient,sourceCommit:input.head,authorization,frozenSourceTransfer:true});
+      if(!transfer.ok) fail("snapshot-transfer-failed: "+transfer.error.code);
+      database.exec("COMMIT");
+    }catch(error){database.exec("ROLLBACK");throw error;}
+    print({ok:true,binding:{...input,owner:recipient},transfer:transfer.transfer,snapshot:JSON.parse(helper.stdout),nextAction:"create a separately admitted writable build workspace from this frozen exact Git source; never bootstrap this snapshot"},true);
+  });
+}
+
+function writerRunCommand(database, args) {
+  assertOnly(args, ["id", "path", "owner", "expected-head", "command-json", "timeout-ms", "json"]);
+  const input = writerRequest(Object.fromEntries([...args.named].map(([k]) => [k, one(args,k)])));
+  return withWorkspaceLock(database, input.path, () => {
+    const record = recordBy(database, {id:input.id});
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head, frozen: existsSync(path.join(input.path,".git","pi-frozen-handoff.json"))});
+    if (recordRetainsCustody(database,record.id) || retainedParent(database,record.path)) fail("writer-growth-admission-required");
+    const result = runWriter(input,[...heldResourceLocks.values()]);
+    print(result,true); process.exitCode = result.ok ? 0 : result.exitCode || 1;
+  });
 }
 
 function reassignCommand(database, args) {
@@ -4105,6 +4164,9 @@ function help() {
   agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
   agent-workspace custody-status --id ID --path PATH --json
   agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
+  agent-workspace thaw-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA [--json]
+  agent-workspace freeze-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA --recipient OWNER --authorization EVIDENCE [--json]
+  agent-workspace writer-run --id ID --path PATH --owner OWNER --expected-head SHA --command-json '["executable","arg"]' --timeout-ms N [--json]
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
                            --owner ID --source-commit HEAD_SHA --authorization RECEIPT [--json]
   agent-workspace adopt --root PATH [--mode writer|review] [--nested-groups] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--execute]
@@ -4285,7 +4347,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4308,6 +4370,9 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "end-writing") endWritingCommand(database,args);
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
     else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
+    else if (commandName === "thaw-source") thawSourceCommand(database,args);
+    else if (commandName === "freeze-source") freezeSourceCommand(database,args);
+    else if (commandName === "writer-run") writerRunCommand(database,args);
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
     else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {
@@ -4357,9 +4422,9 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
-          code: error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError ? error.code : error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed",
+          code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
           ...(error.nextAction === undefined ? {} : {nextAction:error.nextAction}),
         } })}\n`);

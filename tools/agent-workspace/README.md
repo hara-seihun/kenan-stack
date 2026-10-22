@@ -572,3 +572,61 @@ Persist the returned `id`, `owner`, `root`, `planSha256` and `holder` in the con
 After stopping the producer and deleting its disposable state, call `execution-release --id execution:UUID --owner OWNER --expected-plan-sha256 SHA --json`. **Inside a still-live native holder it must refuse**. The outer native qualification finalizer calls it after observing the original job terminal. Release independently requires root absence plus privileged complete original-cgroup/process census (including descendants), not a caller assertion or PG-PID-only observation. Unknown state or a changed boot retains the full reservation; no timer clears it. Released rows retain the original plan, admission and cessation receipt, and contribute zero future liability. This is cooperative disk admission, not a filesystem quota or a measured workload-size guarantee. Consumer admission failure must prevent `initdb`; abandoned/still-live state remains owned repair work.
 
 Regression: `node --test tools/agent-workspace/execution-capacity.test.mjs` covers actual concurrent CLI admission, shared workspace accounting, restart, identity conflicts, invalid budgets/roots, live cgroups and conservative unknown cessation. Installation uses the maintained selective `install-capacity-host`/`capacity-deploy.mjs` path; the serial rollback stays execution-reservation-aware.
+
+## Frozen source handoff and scoped writer custody
+
+A handoff announcement, owner row, or compiler seal does not revoke filesystem
+write access. `writer-run` is the supported mutable-workspace writer: it requires
+exact `--id --path --owner --expected-head`, `--command-json '["exe","arg"]'`
+and `--timeout-ms N` (1..3600000). It checks active lease/writer/growth custody
+under the existing group/checkout locks and retains those locks through the
+foreground child. Children inherit lock descriptions; bounded process-group
+cessation precedes release. `reassign` uses the same locks. Another checkout is
+not locked. Child exit/output is returned in the result, not inferred success.
+This is cooperative writer admission, **not protection against raw editors**.
+
+For an actual immutable handoff, prepare a **separately admitted source-only
+snapshot workspace** at the exact source SHA with enough budget for independent
+Git custody; ordinary create may use alternates, which must first be safely
+fully dissociated within that budget. No borrowed objects, worktrees, hardlinked
+regular files, nested mounts, external symlinks, generated/ignored/untracked
+files are accepted. Do not freeze a compiler/build workspace.
+
+```
+agent-workspace freeze-source --id SNAPSHOT_ID --path SNAPSHOT_PATH \
+  --owner SOURCE_OWNER --expected-head FULL_SHA --recipient BUILD_OWNER \
+  --authorization HANDOFF_EVIDENCE --json
+```
+
+Under that same lock, this freezes the complete private snapshot's regular
+files/directories using Linux immutable flags and transfers recorded custody
+only after post-freeze HEAD/clean-tree validation. Ordinary raw writes, Git
+commits, deletes and renames fail with EPERM, without chmod/chown or touching
+other writers. Internal symlinks are not followed; their immutable parent
+protects names. Root/sudo remains an authorized operator, not a defended-against
+adversary. A privileged, fsynced original-flags journal is retained at
+`/var/lib/agent-workspace/frozen-source/`; failures roll back only immutable bits
+this transaction added, preserving existing flags. Interrupted operations retain
+the original journal and fail closed via the `.git/pi-frozen-handoff.json`
+intent. Never delete that marker to manufacture a completed freeze.
+
+The consumer must create a separately admitted **writable build workspace** from
+this frozen exact Git source with the normal build growth allowance; it retains
+bootstrap source pins and actual HEAD checks. Compile there, not in the frozen
+snapshot. `writer-run` refuses the frozen source even for the recipient.
+7ed's next-new-root handoff uses this source-snapshot/build-root separation;
+existing a7 compiler roots and in-flight receipts are explicitly unchanged.
+The snapshot and its lifetime have independent preservation custody, not capacity
+credit. Cleanup cannot silently remove immutable source. Explicit rollback:
+`thaw-source --id SNAPSHOT_ID --path SNAPSHOT_PATH --owner CURRENT_OWNER
+--expected-head FULL_SHA --json` replays only that exact original-flags journal,
+under custody locks, and keeps recipient ownership. It is a deliberate new
+mutable-source operation, never a timer-based waiver.
+
+Focused qualification: `node --test tools/agent-workspace/writer-custody.test.mjs
+ tools/agent-workspace/bounded-command.test.mjs` and
+`sudo -n python3 tools/agent-workspace/frozen-source.test.py`.
+Publication uses the existing tools-only `install-capacity-host` selective
+installer and exact installed-base CAS. No provider/product publication follows.
+Rollback the tool selection only after explicitly reconciling/thawing any new
+frozen snapshots; older tooling does not understand their intent markers.
