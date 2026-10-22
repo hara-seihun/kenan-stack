@@ -35,3 +35,5 @@ test('native original service positive cessation and root cleanup qualify releas
   const done=f.run('execution-release',release,{observe:observer});assert.equal(done.state,'released');assert.equal(done.cessation.complete,true);assert.deepEqual(done.cessation.members,[]);
  }finally {spawnSync('systemctl',['--user','stop',unit],{timeout:10000});f.clean();}
 });
+
+test('ordinary stale workspace pruning cannot erase live execution liability or its released receipt',()=>{const f=fixture();try{f.database.exec("CREATE TABLE workspace(id TEXT,path TEXT,root TEXT,state TEXT,updated_at INTEGER);CREATE TABLE workspace_capacity_measurement(workspace_id TEXT,measurement_json TEXT)");const p=f.run('execution-reserve');workspaceTesting.pruneReleased(f.database);assert.equal(f.run('execution-status',{id:p.id}).state,'reserved');fs.rmSync(f.state,{recursive:true});f.run('execution-release',{id:p.id,owner:p.owner,'expected-plan-sha256':p.planSha256});workspaceTesting.pruneReleased(f.database);assert.equal(f.run('execution-status',{id:p.id}).state,'released');}finally{f.clean();}});

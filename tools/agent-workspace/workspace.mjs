@@ -3377,7 +3377,7 @@ function pruneReleased(database, now = Date.now(), root) {
     remove.run(row.id);
     pruned += 1;
   }
-  database.exec("DELETE FROM workspace_capacity WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity.workspace_id)");
+  database.exec("DELETE FROM workspace_capacity WHERE workspace_id NOT LIKE 'execution:%' AND NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity.workspace_id)");
   database.exec("DELETE FROM workspace_capacity_measurement WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity_measurement.workspace_id)");
   return pruned;
 }
@@ -4151,7 +4151,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
