@@ -2,6 +2,14 @@
 # Converge-only narrow tools installation; no Kenan runtime publication.
 set -euo pipefail
 repo=$1; base=$2; expected=$3; receipt=$4
+# The outer installer may be invoked with sudo. Preserve the invoking operator's
+# command discovery rather than silently writing /root or failing after mutation.
+operator_home=$HOME
+if (( EUID == 0 )) && [[ ${5:-} != locked ]]; then
+ [[ ${SUDO_USER:-} && $SUDO_USER != root ]] || { echo 'outer installer requires an invoking operator (run without sudo)' >&2; exit 64; }
+ operator_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+ [[ -d $operator_home/.local/bin ]] || { echo 'invoking operator command directory missing' >&2; exit 64; }
+fi
 if [[ ${5:-} != locked ]]; then
  # Install stable discovery from this committed source before fencing. All future
  # CLI calls share admission; detached originals are drained below, never killed.
@@ -9,7 +17,7 @@ if [[ ${5:-} != locked ]]; then
  sudo touch /run/lock/agent-workspace-admission.lock
  sudo chmod 0666 /run/lock/agent-workspace-admission.lock
  sudo ln -sfn /usr/local/libexec/agent-workspace-admission /usr/local/bin/agent-workspace
- ln -sfn /usr/local/libexec/agent-workspace-admission "$HOME/.local/bin/agent-workspace"
+ ln -sfn /usr/local/libexec/agent-workspace-admission "$operator_home/.local/bin/agent-workspace"
  sudo install -m644 "$repo/tools/agent-workspace/admission-tmpfiles.conf" /etc/tmpfiles.d/agent-workspace.conf
  exec sudo flock --exclusive --nonblock /srv/pi/.pi-stack-deploy.lock timeout 150 flock --exclusive --wait 30 /run/lock/agent-workspace-admission.lock "$0" "$repo" "$base" "$expected" "$receipt" locked
 fi
