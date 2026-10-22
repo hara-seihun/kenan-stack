@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {spawn,spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {executionCommand,executionRows,executionHolder,executionCessation} from './execution-capacity.mjs';
+import {referenceSummaries} from './generated-retirement.mjs';
 import {workspaceTesting} from './workspace.mjs';
 const entry=new URL('./main',import.meta.url).pathname;
 const args=o=>new Map(Object.entries(o).map(([k,v])=>[k,[String(v)]]));
@@ -37,3 +38,5 @@ test('native original service positive cessation and root cleanup qualify releas
 });
 
 test('ordinary stale workspace pruning cannot erase live execution liability or its released receipt',()=>{const f=fixture();try{f.database.exec("CREATE TABLE workspace(id TEXT,path TEXT,root TEXT,state TEXT,updated_at INTEGER);CREATE TABLE workspace_capacity_measurement(workspace_id TEXT,measurement_json TEXT)");const p=f.run('execution-reserve');workspaceTesting.pruneReleased(f.database);assert.equal(f.run('execution-status',{id:p.id}).state,'reserved');fs.rmSync(f.state,{recursive:true});f.run('execution-release',{id:p.id,owner:p.owner,'expected-plan-sha256':p.planSha256});workspaceTesting.pruneReleased(f.database);assert.equal(f.run('execution-status',{id:p.id}).state,'released');}finally{f.clean();}});
+
+test('capacity cleanup refusal identifies retained Git borrowers rather than empty objects',()=>{const borrower={recordId:'managed-child',workspacePath:'/retained/child',commonDirectory:'/retained/parent/.git',unrelatedPrivate:'omit'};assert.deepEqual(referenceSummaries([borrower]),[{recordId:'managed-child',workspacePath:'/retained/child',commonDirectory:'/retained/parent/.git'}]);});
