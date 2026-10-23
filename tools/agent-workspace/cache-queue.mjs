@@ -26,7 +26,7 @@ function procArgv(pid){return fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').spl
 function procParent(pid){const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');return Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);}
 // Identity lives in a root-created system-manager scope, never in shell argv/env.
 // The observed cgroup and unit ControlGroup must agree with the actual caller.
-export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),query=(unit)=>boundedCommand('systemctl',['show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState'],{encoding:'utf8',timeout:2000,maxBuffer:8192})}={}){
+export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),query=(unit)=>boundedCommand('/usr/bin/systemctl',['--system','show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState'],{encoding:'utf8',timeout:2000,maxBuffer:8192,env:{PATH:'/usr/sbin:/usr/bin:/sbin:/bin',LC_ALL:'C',SYSTEMD_COLORS:'0'}})}={}){
  const rows=read(pid).trim().split('\n');
  const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
  if(!group||!/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??''))return null;
