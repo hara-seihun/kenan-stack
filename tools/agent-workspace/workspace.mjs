@@ -3949,7 +3949,9 @@ function measureCapacityCommand(database, args, statePath) {
   const deadline = Date.now() + budgetMs;
   const selected = one(args, "id") !== undefined || one(args, "path") !== undefined ? recordBy(database, selectorFrom(args, 'measure-capacity')).id : null;
   const root = one(args, "root") === undefined ? null : path.resolve(one(args, "root"));
-  return withResourceLock(statePath, "capacity-measurement", () => {
+  // Sampling serializes only the actual checkout, never the entire pool.
+  // A long tree walk must not hold a global lock across unrelated records.
+  {
     const rows = database.prepare(`SELECT w.id,w.path,w.state,w.group_id,c.device_id,c.plan_json FROM workspace w
       JOIN workspace_capacity c ON c.workspace_id=w.id LEFT JOIN workspace_capacity_measurement m ON m.workspace_id=w.id
       WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)
@@ -3970,12 +3972,12 @@ function measureCapacityCommand(database, args, statePath) {
         sample = withWorkspaceLock(database, row.path, () => store(workspaceAllocationSample(row.path, row.device_id, {
           deadline: Math.min(deadline, Date.now() + 60_000), maxEntries: 2_000_000,
           excludedPaths: paths.filter(candidate => candidate.startsWith(`${row.path}${path.sep}`)),
-        })), row.group_id);
+        })), row.group_id, deadline);
       } catch (error) { sample = store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
       results.push({ path: row.path, status: sample.ok ? "measured" : "error", ...sample });
     }
     print(results, bool(args, "json"));
-  });
+  }
 }
 
 function reconcileCommand(database, args, statePath) {
@@ -4428,7 +4430,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),

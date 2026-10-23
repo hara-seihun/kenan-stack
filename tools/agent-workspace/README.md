@@ -636,3 +636,51 @@ frozen snapshots; older tooling does not understand their intent markers.
 ### Exact native caller identity
 
 Kenan Stack binds SDK `callId`, actual agent and channel into the description of the root-created system-manager scope **before** dropping privileges. The workspace observer reads the actual caller's `/proc` cgroup and its system-manager scope Description/ControlGroup/Transient/ActiveState, requiring a matching root server ancestor and exact channel. It then matches exact agent/conversation and streaming message part callId. Ambiguous matches exempt nothing. Shell expansion, quoting and final exec cannot change that operation identity; editable shell environment grants no exemption. Another worker or another same-agent tool call remains protected. There is no command-substring fallback. Install native scope-identity propagation locally before this observer; an older runtime remains conservative and may report its own tool as a reference until upgraded.
+
+## Owner-directed terminal preparation finalizer
+
+`node tools/agent-workspace/terminal-finalizer.mjs REQUEST.json SHA256` is the
+non-deleting preparation-finalizer entry point. Call it from the **outer**
+preparation owner after its native job has completed, not from the live holder.
+It does not infer completion from an expired lease, archived worker, or elapsed
+time. The publication owner adopts this entry point in its next maintenance
+qualification; adding source does not claim deployment or activate any timer.
+
+The hash-bound request is `kind: "terminal-growth-finalization"`, exact `owner`
+and absolute `path`, `frozen: false`, `futureWrites: "none"`,
+`deleteSource: false`, the original execution `holder` (PID/startTime/bootId/
+cgroup/UID as recorded at launch), `units: [{unit, manager: "user" | "system",
+invocationId}]`, and `disposition`: the **unchanged current** native
+`retire-future-growth` owner disposition, including full `growth-status.binding`,
+`observedAt`, source retention and evidence. Obtain a fresh complete allocation
+sample before sealing the binding. Missing/changed/frozen/foreign custody refuses.
+Do not fabricate a holder from a PID observed after the fact.
+
+Every declared unit must be the exact successful `oneshot`, `RemainAfterExit=yes`,
+`Restart=no`, active/exited invocation with MainPID=ControlPID=0 and empty cgroup,
+no stop hooks and no trigger relationships. All units are preflighted; each is
+rechecked immediately before `stop` to clear only an inert completed registration.
+The original holder must be one declared unit. A privileged complete original
+cgroup/process census then proves cessation; native terminal safety observes
+processes, queued tools and borrowers again. `retire-growth` rechecks the exact
+owner, source/plan/sample/root binding under existing locks, CAS and durable
+journal. An unknown observation or a concurrent writer retains the reservation.
+A same-custody already-retired result performs no unit effects. A partial unit
+cleanup followed by refusal remains source-preserving; obtain current terminal
+custody rather than replaying any original job.
+
+This entry point never invokes `release`, deletes source, strips dependencies,
+lowers the operating floor or changes a producer, queue or application. Unpushed
+source and rollback remain on disk; growth retirement is not reclaimed disk bytes.
+Frozen/operator readers are not eligible unless their owner explicitly ends that
+preservation contract; an automatic finalizer must not manufacture that decision.
+
+Capacity sampling now fences each **individual checkout/group** and carries its
+absolute requested deadline into that acquisition. It no longer takes a global
+`capacity-measurement` lock around a pool walk. A 240-second sampler cannot trap
+an unrelated targeted refresh behind a 30-second global wait. Same-root concurrent
+observations serialize; busy/deadline/partial observations store failure, not
+capacity credit. Admission still consumes only complete, current identity-bound
+samples and retains full liability on failed measurement.
+
+Focused checks: `node --test tools/agent-workspace/{terminal-finalizer,measurement-isolation,growth-lifecycle}.test.mjs`.
