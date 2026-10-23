@@ -94,7 +94,7 @@ export function currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadl
    const observed=JSON.parse(result.stdout),rows=observed?.references;
    if(!Array.isArray(rows)||rows.length>=65||!Number.isSafeInteger(observed.self)||rows.some(r=>!r||typeof r.id!=='string'||!['tool_call','agent'].includes(r.kind)||typeof r.state!=='string'))throw new Error('Kenan Stack queue observation incomplete: '+channel);
    references.push(...rows.filter(r=>resourceKind!=='generated-cache'||!isSourceOnlyRead(r,cacheRoots)).map(r=>({...r,channel,roots})));
-   observations.push({channel,roots,count:rows.length,callerToolCalls:observed.self});
+   observations.push({channel,roots,count:rows.length,callerToolCalls:observed.self,callerIdentity:self?.channel===channel?{state:'authenticated-system-scope',agentId:self.agentId,callId:self.callId}:{state:'not-exempted',code:'CALLER_IDENTITY_UNAVAILABLE',nextAction:'Use a current locally deployed native runtime with root scope identity; all unmatched streaming tools remain protected.'}});
   }
   return {errors:[],references,observations,resourceKind,observedAt:Date.now()};
  }catch(error){return {errors:[String(error.message)],references:[],observations:[],observedAt:Date.now()};}
