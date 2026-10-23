@@ -38,6 +38,26 @@ Before dropping any single/group writing lease, ordinary release atomically reco
 
 `status --limit` accepts integers **1..500**, with initial page size100. JSON `nextAfter` feeds `--after` with the same filters; stop at null. Status does not execute, renew, retry, or settle a release.
 
+## Ordinary release settles retained future growth
+
+An explicit ordinary `release` ending in lease0/repair-required retained source
+now attempts a separately journalled future-growth settlement. Dirty/unpublished
+source, branches, generated dependencies and all runtime bytes remain untouched;
+existing headroom remains charged. This is an explicit end-writing request, not
+an archive/expiry inference. The same locked `retire-growth` transition performs
+fresh privileged process/writable-FD, systemd, container, native queue and borrower
+observations, current sample validation and exact source/plan/root/lease CAS.
+Native queue observation is also required by direct `retire-growth`.
+
+`futureGrowthSettlement.kind` distinguishes `retired` (journal sequence and evidence
+hash) from `retained` (typed cause and supported observe/settle commands). Failed,
+stale, live, uncertain or active-borrower evidence retains the full allowance;
+release success alone never implies capacity credit. Original release settlement
+and retirement journal survive a lost stdout. Repeating release after repairing
+cessation reobserves the same retained tree; already retired custody remains
+non-destructive and cannot silently resume writes. Resume needs supported full
+capacity admission. No source publication or actual freed disk bytes are claimed.
+
 ## Terminal release and bounded queue observation
 
 An explicit ordinary release transfers source intent to its durable Git/task custody; every single/group physical inspection keeps that resource scope. Actual reserved tools, native executions, unknown operations, FD/cwd readers and Git borrowers still retain the checkout. Dirty/unpublished source remains protected.
