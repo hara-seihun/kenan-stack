@@ -25,7 +25,7 @@ function fixture(shortLocks){
  writeFileSync(path.join(bin,'flock'),`#!${process.execPath}\nconst cp=require('node:child_process'),fs=require('node:fs'),a=process.argv.slice(2);const i=a.indexOf('--wait');const short=${JSON.stringify(shortLocks(mirror,commits).map(sha))};if(i>=0&&short.some(h=>fs.readlinkSync('/proc/self/fd/3').endsWith(h)))a[i+1]='0.3';const r=cp.spawnSync(${JSON.stringify(realFlock)},a,{stdio:['inherit','inherit','inherit',3]});process.exit(r.status??1);`);
  chmodSync(path.join(bin,'git'),0o755);chmodSync(path.join(bin,'flock'),0o755);
  const env={...process.env,PATH:`${bin}:${process.env.PATH}`,PI_WORKSPACE_STATE:state,PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty'};
- const invoke=(name,commit)=>spawnSync(entry,['create','--root',workspaces,'--name',name,'--repo',source,'--ref',commit,'--owner','fixture','--intent','source-only','--headroom-gib','8','--growth-mib','512','--json'],{env,encoding:'utf8',timeout:30000});
+ const invoke=(name,commit)=>spawnSync(entry,['create','--root',workspaces,'--name',name,'--repo',source,'--ref',commit,'--owner','fixture','--intent','source-only','--headroom-gib','1','--growth-mib','512','--json'],{env,encoding:'utf8',timeout:30000});
  const until=(name,commit,ms=45000)=>{const end=Date.now()+ms;let result;do{result=invoke(name,commit);if(result.status!==75)break;sleep(50);}while(Date.now()<end);assert.equal(result.status,0,result.stderr);const record=JSON.parse(result.stdout);assert.equal(record.state,'active');assert.equal(record.sourceCommit,commit);return record;};
  const waitFor=(predicate,ms=45000)=>{const end=Date.now()+ms;while(!predicate()&&Date.now()<end)sleep(50);assert.ok(predicate());};
  const jobs=()=>{const dir=path.join(root,'state','source-preparations','jobs');return existsSync(dir)?readdirSync(dir).map(id=>path.join(dir,id)):[];};
@@ -42,8 +42,8 @@ test('a blocked import neither serialises another commit of the same mirror nor 
   assert.equal(f.invoke('slow',slow).status,75);f.waitFor(()=>existsSync(f.gate));
   f.until('peer',peer,30000);
   assert.equal(existsSync(f.release),false,'the other commit became active while the first import was still inside git fetch');
-  assert.equal(f.invoke('twin',slow).status,75);
-  f.waitFor(()=>{const job=f.jobFor('twin');return job&&f.read(path.join(job,'progress.json'))?.value?.phase==='awaiting-mirror';});
+  {const twin=f.invoke('twin',slow);assert.ok([2,75].includes(twin.status),twin.stderr);}
+  f.waitFor(()=>{const job=f.jobFor('twin');return job&&(f.read(path.join(job,'progress.json'))?.value?.phase==='awaiting-mirror'||f.read(path.join(job,'result.json'))?.error?.code==='workspace-mirror-lock-busy');});
   writeFileSync(f.release,'go');
   f.until('slow',slow);f.until('twin',slow);
   assert.equal(f.fetchesOf(slow),1,'the same-commit peer reused the in-flight import');

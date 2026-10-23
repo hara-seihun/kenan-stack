@@ -2371,7 +2371,9 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   const sourceRef = sourceRefFor(repository, ref);
   const bases = existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : [];
   // Negotiate only independently complete ancestry; damaged/unknown custody needs full refetch.
-  const negotiation = bases.length ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
+  // Git skips wanting a commit object it already has, so a present commit with missing trees or blobs is never repaired by negotiation.
+  const commitPresent = /^[0-9a-f]{40,64}$/u.test(resolved) && command("git", ["--git-dir", mirror, "cat-file", "-e", `${resolved}^{commit}`]).status === 0;
+  const negotiation = bases.length && !commitPresent ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
   run("git", ["--git-dir", mirror, "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
   publishSourcePhase({ phase: "verifying", commit: resolved });

@@ -3961,7 +3961,8 @@ test("qualified ancestral custody prices and fetches only receiver delta", () =>
     git(damaged, "update-ref", "refs/heads/main", base);
     rmSync(path.join(damaged, "objects", blob.slice(0, 2), blob.slice(2)));
     const conservative = workspaceTesting.sourceCapacityPlan(f.source, receiver, intent, 4096, damaged);
-    assert.deepEqual(conservative.sourceImportBaseCommits, []);
-    assert.equal(conservative.sourceImportBytes, full.sourceImportBytes);
+    // An older complete ancestor is a valid base; the damaged one must not be, and its missing blob must still be priced.
+    assert.ok(!conservative.sourceImportBaseCommits.includes(base));
+    assert.ok(conservative.sourceImportBytes > 2 * 1024 ** 2);
   } finally { f.close(); }
 });
