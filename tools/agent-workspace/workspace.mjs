@@ -3472,6 +3472,12 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     if (retainedParent(database,record.path)) growthError("growth-admission-required", "shared Git parent requires resume-growth admission");
     if (retired !== resume) growthError("growth-admission-required", retired ? "use explicit resume-growth admission" : "growth is not retired");
     if (resume && (record.owner !== required(args, "owner") || digest(row.plan_json) !== required(args, "expected-plan-sha256"))) growthError("stale-growth-disposition", "resume owner or plan changed");
+    if (reducing && oldPlan.intent === "budgeted" && intent.intent === "source-only") {
+      throw Object.assign(new GrowthLifecycleError("capacity-intent-downgrade", "active budget reduction does not prove build/database writers ceased; preserve budgeted intent and reduce only the remaining allowance"), {
+        nextAction: {kind:"preserve-active-intent", intent:"budgeted", newWritesAuthorized:false,
+          detail:"Read a fresh growth-status binding; submit owner-bound reduction with --intent budgeted. Zero-future-growth completed work uses retire-growth."}
+      });
+    }
     const expandingBudget = ["source-only", "budgeted"].includes(oldPlan.intent) && (intent.intent === "budgeted" || (reducing && intent.intent === oldPlan.intent) || (resume && oldPlan.intent === "source-only" && intent.intent === "source-only"));
     if (oldPlan.intent !== "unestimated" && !expandingBudget) growthError("invalid-capacity-transition", resume ? "resume-growth accepts retired source-only to source-only or source-only/budgeted to budgeted admission" : "reprice-capacity accepts unestimated plans or source-only/budgeted to budgeted expansion");
     capacityRequirement(oldPlan, []);

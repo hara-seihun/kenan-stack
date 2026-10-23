@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-const {queueReferenceSql,currentStackQueueReferences,callerToolCall,kenanChannels,channelDatabase}=await import(process.env.WORKSPACE_QUEUE_MODULE||'./cache-queue.mjs');
+const {queueReferenceSql,currentStackQueueReferences,callerToolCall,procScope,kenanChannels,channelDatabase}=await import(process.env.WORKSPACE_QUEUE_MODULE||'./cache-queue.mjs');
 const literal=x=>"'"+x.replaceAll("'","''")+"'";
 const json=x=>literal(JSON.stringify(x))+'::jsonb';
 
@@ -95,15 +95,25 @@ test('every installed channel is observed against one absolute deadline and fail
  assert.equal(calls,1);assert.equal(late.errors.length,1);assert.equal(late.references.length,0);
 });
 
-test('caller identity comes from the direct server child environment, never command substrings or descendant overrides',()=>{
- const tree={10:{argv:['node','agent-workspace'],parent:19},19:{argv:['bash','-c','exec agent-workspace --sha $(compute)'],parent:9},9:{argv:['node','/srv/kenan/beta/dist/server/main.js'],parent:1},30:{argv:['node'],parent:1}};
- const io={uid:()=>0,argv:pid=>tree[pid].argv,parent:pid=>tree[pid].parent,environment:pid=>pid===19?{KENAN_TOOL_CALL_ID:'native-call',KENAN_AGENT:'caller'}:{KENAN_TOOL_CALL_ID:'forged-descendant',KENAN_AGENT:'other'}};
+test('caller identity uses root system-scope metadata, rejecting editable env, foreign channels and missing scopes',()=>{
+ const tree={10:{argv:['node','agent-workspace'],parent:19},19:{argv:['bash','-c','exec env KENAN_TOOL_CALL_ID=forged agent-workspace --sha $(compute)'],parent:9},9:{argv:['node','/srv/kenan/beta/dist/server/main.js'],parent:1},30:{argv:['node'],parent:1}};
+ const actual={version:1,channel:'beta',callId:'native-call',agentId:'caller',unit:'agent-tool-beta-00000000-0000-4000-8000-000000000000.scope'};
+ const io={uid:()=>0,argv:pid=>tree[pid].argv,parent:pid=>tree[pid].parent,scope:()=>actual};
  assert.deepEqual(callerToolCall({...io,pid:10}),{channel:'beta',callId:'native-call',agentId:'caller'});
- const execIo={...io,parent:pid=>pid===10?9:io.parent(pid),environment:()=>({KENAN_TOOL_CALL_ID:'native-call',KENAN_AGENT:'caller'})};
- assert.deepEqual(callerToolCall({...execIo,pid:10}),{channel:'beta',callId:'native-call',agentId:'caller'});
+ assert.deepEqual(callerToolCall({...io,pid:10,parent:pid=>pid===10?9:io.parent(pid)}),{channel:'beta',callId:'native-call',agentId:'caller'});
  assert.equal(callerToolCall({...io,pid:30}),null);
  assert.equal(callerToolCall({...io,pid:10,uid:()=>1002}),null);
- assert.equal(callerToolCall({...io,pid:10,environment:()=>({})}),null);
- assert.equal(callerToolCall({...io,pid:10,environment:()=>({KENAN_TOOL_CALL_ID:'x\n',KENAN_AGENT:'caller'})}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>null}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>({...actual,channel:'production'})}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>({...actual,callId:'x\n'})}),null);
  assert.throws(()=>queueReferenceSql('/source',['literal-argv'],'physical-checkout'),/caller tool identity/);
+});
+
+test('system-scope parser requires exact active transient root-unit ControlGroup, never a lookalike or sibling',()=>{
+ const group='/system.slice/agent-tool-beta-00000000-0000-4000-8000-000000000000.scope';
+ const props={Description:'kenan-tool-call:'+JSON.stringify({version:1,channel:'beta',callId:'actual',agentId:'owner'}),ControlGroup:group,Transient:'yes',ActiveState:'active'};
+ const observe=patch=>procScope(100,{read:()=>`0::${group}\n`,query:unit=>({status:0,stdout:Object.entries({...props,...patch}).map(([k,v])=>`${k}=${v}`).join('\n')})});
+ assert.equal(observe({}).callId,'actual');
+ for(const patch of [{ControlGroup:group+'/sibling'},{Transient:'no'},{ActiveState:'inactive'},{Description:'editable-env'}]) assert.equal(observe(patch),null);
+ assert.equal(procScope(100,{read:()=>`0::/user.slice/lookalike.scope\n`,query:()=>{throw Error('must not query')}}),null);
 });

@@ -24,17 +24,28 @@ export const channelDatabase=channel=>'kenan_'+channel.replaceAll('-','_');
 
 function procArgv(pid){return fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').split('\0').slice(0,-1);}
 function procParent(pid){const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');return Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);}
-// Read the initial environment of the direct child launched by the authenticated root
-// server, not this command's mutable argv/environment. Shell expansion and final exec
-// cannot change the launcher's exact call identity; no command-substring exemption.
-function procEnvironment(pid){return Object.fromEntries(fs.readFileSync(`/proc/${pid}/environ`,'utf8').split('\0').filter(Boolean).map(v=>{const at=v.indexOf('=');return [v.slice(0,at),v.slice(at+1)];}));}
+// Identity lives in a root-created system-manager scope, never in shell argv/env.
+// The observed cgroup and unit ControlGroup must agree with the actual caller.
+export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),query=(unit)=>boundedCommand('systemctl',['show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState'],{encoding:'utf8',timeout:2000,maxBuffer:8192})}={}){
+ const rows=read(pid).trim().split('\n');
+ const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
+ if(!group||!/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??''))return null;
+ const r=query(unit);
+ if(r.status!==0||r.error)return null;
+ const props=Object.fromEntries(r.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
+ if(props.ControlGroup!==group||props.Transient!=='yes'||props.ActiveState!=='active'||!props.Description?.startsWith('kenan-tool-call:'))return null;
+ const v=JSON.parse(props.Description.slice('kenan-tool-call:'.length));
+ return {...v,unit,group};
+}
 function identity(v){return v&&typeof v==='object'&&typeof v.callId==='string'&&v.callId.length>0&&v.callId.length<=256&&!/[\x00-\x1f]/.test(v.callId)&&typeof v.agentId==='string'&&/^[a-zA-Z0-9:_-]{1,128}$/.test(v.agentId);}
-export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,environment=procEnvironment,uid=p=>fs.statSync(`/proc/${p}`).uid}={}) {
+export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,scope=procScope,uid=p=>fs.statSync(`/proc/${p}`).uid}={}) {
  try{
+  const observed=scope(pid);
+  if(!identity(observed)||observed.version!==1||!CHANNEL.test(observed.channel)||!observed.unit.startsWith(`agent-tool-${observed.channel}-`))return null;
   for(let current=pid,depth=0;current>1&&depth<64;depth++){
    const up=parent(current);if(!(up>1))return null;
    const server=argv(up)[1]?.match(SERVER);
-   if(server&&uid(up)===0){const env=environment(current),value={callId:env.KENAN_TOOL_CALL_ID,agentId:env.KENAN_AGENT};return identity(value)?{channel:server[1],...value}:null;}
+   if(server&&uid(up)===0)return server[1]===observed.channel?{channel:server[1],callId:observed.callId,agentId:observed.agentId}:null;
    current=up;
   }
  }catch{}

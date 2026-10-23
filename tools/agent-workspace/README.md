@@ -336,9 +336,11 @@ another workspace or work outside its allocation. Hash the exact JSON bytes.
 
 ```
 agent-workspace reprice-capacity --id ID --path PATH --owner OWNER \
-  --intent source-only --headroom-gib 8 --growth-mib 64 \
+  --intent budgeted --headroom-gib 8 --growth-mib 64 \
   --reduction /absolute/reduction.json --reduction-sha256 SHA256 --json
 ```
+
+The example preserves an existing **budgeted** intent. For an already source-only writer use `--intent source-only`; reducing an allowance never proves that a build or database writer stopped. Active reduction supports source-only→source-only, source-only→budgeted and budgeted→budgeted only. Budgeted→source-only returns typed `capacity-intent-downgrade` with a supported next action, without changing any record. Completed work with no future writes uses `retire-growth`, not an intent downgrade.
 
 This opt-in extends the existing repricing interface, not a second ledger. It requires
 an active unexpired owning lease, positive remaining allowance, a lower total growth
@@ -633,4 +635,4 @@ frozen snapshots; older tooling does not understand their intent markers.
 
 ### Exact native caller identity
 
-Kenan Stack propagates SDK `callId` through `KENAN_TOOL_CALL_ID` for each owner tool invocation (concurrent invocations use independent async contexts). The workspace observer reads the initial environment of the direct child of the root-owned current-channel server, then matches exact agent/conversation and streaming message part callId. An ambiguous match exempts nothing. Shell substitution, quoting and final exec do not become competing writers; another worker or another same-agent tool call remains protected. There is no command-substring identity fallback. Install the native runtime propagation before this observer; an older runtime remains conservative and may report its own tool as a reference until upgraded.
+Kenan Stack binds SDK `callId`, actual agent and channel into the description of the root-created system-manager scope **before** dropping privileges. The workspace observer reads the actual caller's `/proc` cgroup and its system-manager scope Description/ControlGroup/Transient/ActiveState, requiring a matching root server ancestor and exact channel. It then matches exact agent/conversation and streaming message part callId. Ambiguous matches exempt nothing. Shell expansion, quoting and final exec cannot change that operation identity; editable shell environment grants no exemption. Another worker or another same-agent tool call remains protected. There is no command-substring fallback. Install native scope-identity propagation locally before this observer; an older runtime remains conservative and may report its own tool as a reference until upgraded.

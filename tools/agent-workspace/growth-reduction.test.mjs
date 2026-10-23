@@ -39,6 +39,14 @@ for (const [priorIntent, nextIntent] of [['source-only','budgeted'],['source-onl
  assert.throws(()=>run(args.filter((_,i)=>i!==3 && i!==4)),/cannot reduce headroom or total growth|to budgeted expansion/); // retained refusal, before explicit reduction
  const beforeRecord=db.prepare('SELECT * FROM workspace WHERE id=?').get(rec.id);
  const beforePlan=JSON.stringify(plan),beforeSample=JSON.stringify(sample);
+ if(priorIntent==='budgeted'){
+  const downgrade={...disposition(get().binding)},raw=JSON.stringify(downgrade);writeFileSync(file,raw);
+  const bad=[...args];bad[bad.indexOf(nextIntent)]='source-only';
+  assert.throws(()=>run([...bad,'--owner','owner','--reduction',file,'--reduction-sha256',digest(raw)]),error=>error.code==='capacity-intent-downgrade'&&error.nextAction.intent==='budgeted'&&error.nextAction.newWritesAuthorized===false);
+  assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json,JSON.stringify(plan));
+  assert.deepEqual(db.prepare('SELECT * FROM workspace WHERE id=?').get(rec.id),beforeRecord);
+ }
+
  let d=disposition(get().binding);
  const reduce=(value,overrides=[])=>{const bytes=JSON.stringify(value);writeFileSync(file,bytes);return run([...args,...overrides,'--owner','owner','--reduction',file,'--reduction-sha256',digest(bytes)]);};
  const untouched=()=>{assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json,beforePlan);assert.equal(db.prepare('SELECT count(*) n FROM workspace_capacity_repricing').get().n,0);};
