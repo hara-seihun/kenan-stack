@@ -37,6 +37,8 @@ export function retireWorkspaceCache(context,request){
   const prior=db.prepare('SELECT request_sha256 FROM workspace_cache_retirement WHERE operation_id=?').get(operation);
   if(prior&&prior.request_sha256!==sha)refuse('cache-operation-conflict','operation identity already has different request bytes');
   if(!prior)db.prepare('INSERT INTO workspace_cache_retirement VALUES(?,?,?,?)').run(operation,request.binding.id,sha,JSON.stringify(context.original()));
+  db.exec('CREATE TABLE IF NOT EXISTS workspace_cache_retirement_request(operation_id TEXT PRIMARY KEY, request_json TEXT NOT NULL)');
+  db.prepare('INSERT OR IGNORE INTO workspace_cache_retirement_request VALUES(?,?)').run(operation,JSON.stringify(request));
   const result=retireGeneratedOnly({...context,journalKind:'workspace-cache-retirement',inventoryPolicy:'unlink-cache-links',binding:()=>{current();return inner.binding;},custody:current,declarations:()=>[request.cachePath],safety:stages=>{
    const safety=context.safety(stages);
    if(!Number.isSafeInteger(safety?.observedAt)||Date.now()-safety.observedAt>60000||safety.observedAt>Date.now())refuse('cache-safety-unknown','fresh complete native and queued-work observation required');
@@ -45,4 +47,22 @@ export function retireWorkspaceCache(context,request){
   if(!result.ok)return result;
   return {ok:true,value:{...result.value,kind:'workspace-cache-retired',sourcePreserved:true,lifecycleAndPlanPreserved:true}};
  }catch(error){return {ok:false,error:{code:error instanceof CacheRetirementError?error.code:'cache-retirement-io-error',detail:String(error.message)}};}
+}
+
+const tableExists=(db,name)=>Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
+/** Read-only view of cache retirement journals, selected by workspace id or staging directory name. */
+export function cacheRetirementStatus(db,selector){
+ if(selector.workspaceId===undefined===(selector.stage===undefined))return {ok:false,error:{code:'invalid-cache-request',detail:'exactly one of --id or --stage required'}};
+ if(!tableExists(db,'workspace_generated_retirement'))return {ok:true,value:{operations:[]}};
+ const cacheRows=tableExists(db,'workspace_cache_retirement'),requestRows=tableExists(db,'workspace_cache_retirement_request');
+ const rows=db.prepare("SELECT operation_id,workspace_id,journal_json FROM workspace_generated_retirement WHERE json_extract(journal_json,'$.kind')='workspace-cache-retirement' AND "+(selector.workspaceId!==undefined?'workspace_id=?':"EXISTS(SELECT 1 FROM json_each(journal_json,'$.entries') WHERE json_extract(value,'$.stage') LIKE '%/' || ?)")+' ORDER BY rowid').all(selector.workspaceId??selector.stage);
+ const operations=rows.map(row=>{
+  const journal=JSON.parse(row.journal_json),operation=row.operation_id;
+  const requestSha256=cacheRows?db.prepare('SELECT request_sha256 FROM workspace_cache_retirement WHERE operation_id=?').get(operation)?.request_sha256??null:null;
+  const stored=requestRows?db.prepare('SELECT request_json FROM workspace_cache_retirement_request WHERE operation_id=?').get(operation)?.request_json??null:null;
+  const entries=journal.entries.map(e=>({relative:e.relative,stage:e.stage,phase:e.phase,stagePresent:fs.existsSync(e.stage),inventoryEntries:e.files.length,allocatedBytes:e.allocatedBytes,freedBytesSoFar:(e.freed?.measuredBytes??0)+(e.freed?.estimatedBytes??0)}));
+  const resume=journal.state==='pending'?{command:`agent-workspace retire-cache --id ${journal.request.binding.id} --path ${journal.request.binding.path} --owner ${journal.request.binding.owner} --request REQUEST_FILE --request-sha256 ${requestSha256} --json`,requestFile:stored===null?'the original request file (its bytes must hash to requestSha256)':'write storedRequest byte-exactly to an absolute single-link file outside the workspace'}:null;
+  return {operationId:operation,workspaceId:row.workspace_id,owner:journal.request.binding.owner,path:journal.request.binding.path,requestSha256,state:journal.state,entries,result:journal.result??null,resume,storedRequest:stored};
+ });
+ return {ok:true,value:{operations}};
 }

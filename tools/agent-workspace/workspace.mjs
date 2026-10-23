@@ -42,7 +42,7 @@ import { CensusFailure, withCensusDeadline, processAncestry, readLink, within } 
 import { pathToFileURL } from "node:url";
 import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourceJob, sourceJobId, abandonSourceJob } from "./source-job.mjs";
 import { capacityRecovery } from "./capacity-recovery.mjs";
-import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError } from "./cache-retirement.mjs";
+import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
@@ -4114,6 +4114,7 @@ function help() {
   agent-workspace cache-safety --id ID --path PATH --owner OWNER (--cache RELATIVE|--request FILE --request-sha256 SHA) --json
   agent-workspace cache-plan --id ID --path PATH --owner OWNER --cache RELATIVE --classification node-dependencies|declared-build-cache --operation-id ID --evidence TEXT --json
   agent-workspace retire-cache --id ID --path PATH --owner OWNER --request FILE --request-sha256 SHA --json
+  agent-workspace retire-cache-status (--id ID|--stage STAGING_NAME) --json
   agent-workspace retire-source-materialization --id ID --path PATH --owner OWNER --request ABS_FILE --request-sha256 SHA --json
   agent-workspace retire-growth ${selectorSyntax("retire-growth")} --owner OWNER --disposition FILE --disposition-sha256 SHA [--json]
   agent-workspace resume-growth ${selectorSyntax("resume-growth")} --owner OWNER --expected-plan-sha256 SHA --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
@@ -4264,7 +4265,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4292,6 +4293,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "growth-status") growthStatusCommand(database, args, statePath);
     else if (commandName === "cache-safety") cacheSafetyCommand(database,args,statePath);
     else if (commandName === "cache-plan" || commandName === "retire-cache") workspaceCacheCommand(database,args,statePath,commandName === "cache-plan");
+    else if (commandName === "retire-cache-status") { assertOnly(args,["id","stage","json"]); const result=cacheRetirementStatus(database,{workspaceId:one(args,"id"),stage:one(args,"stage")}); print(result,true); if(!result.ok) process.exitCode=2; }
     else if (commandName === "retire-source-materialization") retireSourceMaterializationCommand(database, args, statePath);
     else if (commandName === "retire-growth") retireGrowthCommand(database, args, statePath);
     else if (commandName === "reduce-retained-headroom") reduceRetainedHeadroomCommand(database,args,statePath);

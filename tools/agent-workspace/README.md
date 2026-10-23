@@ -432,9 +432,31 @@ caller-selected exclusion.
 
 Each operation has a35s observation/lock budget and1000000-entry inventory limit;
 limit or safety failures retain the request/journal for an explicit same-operation
-continuation. Exit0 means completed, exit2 is explicit refusal/error. Reported
-unshared blocks are the pre-removal inventory, not actual filesystem recovery:
-measure free bytes separately. `node tools/agent-workspace/cache-retirement-installed.mjs`
+continuation. Exit0 means completed, exit2 is explicit refusal/error.
+
+The journal (registry table `workspace_generated_retirement`) is written before
+the move and records the operation, workspace, request SHA256, staging path and
+each entry's phase (planned, deleting, removed). After a crash at any point,
+re-running the identical `retire-cache` command (same request bytes and SHA,
+same owner) resumes: it moves the cache if the move had not happened, then
+deletes only the inventoried entries of that staging directory. Different
+request bytes for the same operation, a second operation on a workspace with a
+pending one, or another owner are refused. A completed operation replays its
+receipt (`replayed: true`). `removedAllocatedBytes` is the pre-move inventory;
+`freedBytes` is what deletion actually freed: the blocks of every inode whose
+last link it removed, read at unlink time and checkpointed every 2 s. Entries an
+interrupted run removed after its last checkpoint are counted from the inventory
+and reported separately as `freedBytesEstimatedAfterInterruption`.
+`filesystemAvailableBytesAfter` is the free space seen at completion.
+
+`retire-cache-status (--id ID|--stage STAGING_NAME) --json` is read-only. It
+lists cache retirement journals for a workspace, or the one owning a staging
+directory under `generated-retirement/`, with phase, whether staging is still
+present, the receipt, and for a pending operation the exact resume command and
+the stored request bytes (requests recorded from this version on), so a lost
+request file can be rewritten byte-exactly. `cache-retirement-crash.test.mjs`
+kills the process before the move, right after it and mid-delete, and proves the
+resume, the freed bytes, the refusals and the third-run replay. `node tools/agent-workspace/cache-retirement-installed.mjs`
 runs a disposable native read-FD refusal then cache-only preservation proof.
 
 `cache-safety --id ID --path PATH --owner OWNER --cache RELATIVE --json` is the read-only current

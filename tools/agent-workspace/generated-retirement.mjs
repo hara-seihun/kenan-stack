@@ -1,4 +1,4 @@
-import {constants,fchmodSync,fstatSync,lstatSync,readdirSync,realpathSync,renameSync,rmSync,mkdirSync,openSync,closeSync,fsyncSync,readlinkSync,unlinkSync,rmdirSync} from 'node:fs';
+import {constants,fchmodSync,fstatSync,lstatSync,readdirSync,realpathSync,renameSync,rmSync,mkdirSync,openSync,closeSync,fsyncSync,readlinkSync,unlinkSync,rmdirSync,statfsSync} from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 
@@ -52,15 +52,34 @@ function remainingInventorySafe(original,remaining) {
   const known=new Map(original.map(e=>[e.path,e]));
   return remaining.every(e=>{const old=known.get(e.path);return old!==undefined&&sameEntry(old,e);});
 }
-function removeManifest(context,stage,files) {
- const known=new Map(files.map(entry=>[entry.path,entry]));
+const checkpointMs=2000;
+function freedLedger(e) {
+ const counted=Buffer.alloc(Math.ceil(e.files.length/8));
+ if(e.freed?.counted) Buffer.from(e.freed.counted,'base64').copy(counted);
+ return {measuredBytes:e.freed?.measuredBytes??0,estimatedBytes:e.freed?.estimatedBytes??0,counted};
+}
+const persistLedger=(e,ledger)=>{e.freed={measuredBytes:ledger.measuredBytes,estimatedBytes:ledger.estimatedBytes,counted:ledger.counted.toString('base64')};};
+// Entries absent from staging and never counted were removed by an interrupted run after its last checkpoint; their bytes come from the manifest.
+function settleUncounted(e,ledger) {
+ e.files.forEach((entry,index)=>{
+  if(ledger.counted[index>>3]&(1<<(index&7))) return;
+  ledger.counted[index>>3]|=1<<(index&7);
+  if(!entry.shared) ledger.estimatedBytes+=Number(entry.blocks)*512;
+ });
+}
+function removeManifest(context,e,checkpoint) {
+ const stage=e.stage,files=e.files;
+ const known=new Map(files.map((entry,index)=>[entry.path,{entry,index}]));
+ const ledger=freedLedger(e);let lastCheckpoint=Date.now();
+ const count=(index,bytes)=>{ledger.counted[index>>3]|=1<<(index&7);ledger.measuredBytes+=bytes;if(Date.now()-lastCheckpoint>=checkpointMs){persistLedger(e,ledger);checkpoint();lastCheckpoint=Date.now();}};
  const visit=(relative,target)=>{
   if(context.deadline!==undefined&&Date.now()>=context.deadline)refuse('generated-io-error','bounded deletion paused; resume the same pending operation');
-  const expected=known.get(relative),stat=optionalStat(target);if(stat===null)return;
-  if(!expected)refuse('generated-identity-changed','unlisted staging entry');
+  const listed=known.get(relative),stat=optionalStat(target);if(stat===null)return;
+  if(!listed)refuse('generated-identity-changed','unlisted staging entry');
+  const expected=listed.entry;
   const current={path:relative,...identity(stat),type:stat.isSymbolicLink()?'symlink':stat.isDirectory()?'directory':stat.isFile()?'file':'special',size:String(stat.size),blocks:String(stat.blocks),mtime:String(stat.mtimeNs),...(stat.isSymbolicLink()?{linkTarget:readlinkSync(target)}:{})};
   if(!sameEntry(expected,current))refuse('generated-identity-changed','staging entry changed during bounded deletion');
-  if(expected.type!=='directory'){unlinkSync(target);context.afterEntryRemoval?.(relative,context);return;}
+  if(expected.type!=='directory'){unlinkSync(target);count(listed.index,stat.nlink===1n?Number(stat.blocks)*512:0);context.afterEntryRemoval?.(relative,context);return;}
   const fd=openSync(target,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);
   try {
    const pinned=fstatSync(fd,{bigint:true});if(String(pinned.dev)!==expected.device||String(pinned.ino)!==expected.inode)refuse('generated-identity-changed','staging directory changed during open');
@@ -70,12 +89,19 @@ function removeManifest(context,stage,files) {
    for(const name of names)visit(path.join(relative,name),descriptor+'/'+name);
    const latest=optionalStat(target);if(latest===null||String(latest.dev)!==expected.device||String(latest.ino)!==expected.inode)refuse('generated-identity-changed','staging directory replaced during removal');
    if(context.deadline!==undefined&&Date.now()>=context.deadline)refuse('generated-io-error','bounded deletion paused; resume the same pending operation');
-   rmdirSync(target);context.afterEntryRemoval?.(relative,context);
+   rmdirSync(target);count(listed.index,Number(latest.blocks)*512);context.afterEntryRemoval?.(relative,context);
   } finally {closeSync(fd);}
  };
- visit('',stage);
+ try {visit('',stage);}
+ catch(error) {persistLedger(e,ledger);checkpoint();throw error;}
+ settleUncounted(e,ledger);persistLedger(e,ledger);
 }
 
+function freedReceipt(entries,stageRoot) {
+  const measured=entries.reduce((s,e)=>s+(e.freed?.measuredBytes??0),0),estimated=entries.reduce((s,e)=>s+(e.freed?.estimatedBytes??0),0);
+  const fs=statfsSync(stageRoot,{bigint:true});
+  return {freedBytes:measured+estimated,freedBytesMeasured:measured,freedBytesEstimatedAfterInterruption:estimated,freedMeasurement:'blocks of every inode whose last link this operation removed, read at unlink; entries an interrupted run removed after its last checkpoint are counted from the pre-move inventory',filesystemAvailableBytesAfter:Number(fs.bavail*fs.bsize),completedAt:Date.now()};
+}
 export function generatedStagingRoots(request,stateDirectory) {
   return request.paths.map(relative=>path.join(stateDirectory,'generated-retirement',hash([request.operationId,relative])));
 }
@@ -170,13 +196,15 @@ function execute(context,request) {
       if(!manifestRemoval&&!remainingInventorySafe(e.files,remaining)) refuse('generated-identity-changed','staging changed before removal');
       authorize(context,request);
       context.beforeRemoval?.(e);
-      removeManifest(context,e.stage,e.files);
+      removeManifest(context,e,save);
       syncDirectory(stageRoot);
       context.afterRemoval?.(e);
+    } else {
+      const ledger=freedLedger(e);settleUncounted(e,ledger);persistLedger(e,ledger);
     }
     e.phase='removed';save();
   }
   journal.state='completed';
-  journal.result={kind:context.journalKind==='workspace-cache-retirement'?'workspace-cache-retired':'generated-only-retired',...(context.journalKind==='workspace-cache-retirement'?{cacheState:{kind:'retired-regenerable',paths,sourceIntentDisposition:'retained in canonical input/task and durable source; regenerate dependencies under a new admitted writing lease'}}:{}),operationId:request.operationId,workspaceId:request.binding.id,removedPaths:paths,removedLogicalBytes:journal.entries.reduce((s,e)=>s+e.logicalBytes,0),removedAllocatedBytes:journal.entries.reduce((s,e)=>s+e.allocatedBytes,0),measurement:'sum of observed unshared inode blocks before retirement; shared hardlinks excluded; not filesystem free-space delta',workspacePreserved:true};
+  journal.result={kind:context.journalKind==='workspace-cache-retirement'?'workspace-cache-retired':'generated-only-retired',...(context.journalKind==='workspace-cache-retirement'?{cacheState:{kind:'retired-regenerable',paths,sourceIntentDisposition:'retained in canonical input/task and durable source; regenerate dependencies under a new admitted writing lease'}}:{}),operationId:request.operationId,workspaceId:request.binding.id,removedPaths:paths,removedLogicalBytes:journal.entries.reduce((s,e)=>s+e.logicalBytes,0),removedAllocatedBytes:journal.entries.reduce((s,e)=>s+e.allocatedBytes,0),measurement:'sum of observed unshared inode blocks before retirement; shared hardlinks excluded; not filesystem free-space delta',...freedReceipt(journal.entries,stageRoot),workspacePreserved:true};
   save();return {...journal.result,replayed:false};
 }
