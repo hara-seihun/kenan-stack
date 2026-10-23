@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
+import {withStdoutFile, foldRecords} from './stdout-records.mjs';
 import {hasUncoveredCommits} from './release-reachability.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
@@ -203,17 +204,27 @@ function command(executable, commandArgs, options = {}) {
   if (remaining <= 0) fail(creationDeadline === undefined
     ? "workspace inspection budget exhausted; no safety verdict was established"
     : "creation budget exhausted; checkout retained; repeat the same create command to resume");
-  const result = spawnSync(executable, commandArgs, {
+  const launch = stdout => spawnSync(executable, commandArgs, {
     // Git operands are resolved before launch; a released caller directory may vanish mid-command.
     cwd: options.cwd ?? homedir(),
     encoding: "utf8",
     input: options.input,
-    stdio: ["pipe", "pipe", "pipe", ...heldResourceLocks.values()],
+    stdio: ["pipe", stdout ?? "pipe", "pipe", ...heldResourceLocks.values()],
     env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: "0" },
     maxBuffer: 16 * 1024 * 1024,
     timeout: Math.max(1, Math.min(options.timeout ?? 30_000, maintenanceContext ? 2000 : Infinity, remaining)),
     ...(inspectionDeadline === undefined ? {} : { killSignal: "SIGKILL" }),
   });
+  let result;
+  if (options.records === undefined) result = launch(undefined);
+  else {
+    const { separator, onRecord } = options.records;
+    result = withStdoutFile(descriptor => {
+      const launched = launch(descriptor);
+      if (launched.status === 0 && !launched.error) foldRecords(descriptor, separator, onRecord);
+      return launched;
+    });
+  }
   if (sourcePreparationMode === "foreground" && result.error?.code === "ETIMEDOUT") throw new SourcePreparationRequired();
   if (inspectionDeadline !== undefined && result.error?.code === "ETIMEDOUT") {
     fail(`workspace inspection timed out: ${executable} ${commandArgs.join(" ")}; no safety verdict was established`);
@@ -242,6 +253,10 @@ function run(executable, commandArgs, options = {}) {
     fail(`${executable} ${commandArgs.join(" ")} failed: ${detail}`);
   }
   return result.stdout;
+}
+
+function streamRecords(executable, commandArgs, separator, onRecord, options = {}) {
+  run(executable, commandArgs, { ...options, records: { separator, onRecord } });
 }
 
 function git(workspace, args, options = {}) {
@@ -1728,7 +1743,8 @@ function importBaseCommits(repository, sourceCommit, mirror) {
 function sourceImportCapacity(repository, sourceCommit, mirror, sparsePatterns) {
   if (mirror && existsSync(mirror) && hasObjectClosure(mirror, sourceCommit, sparsePatterns)) return { bytes: 0, baseCommits: [sourceCommit] };
   const baseCommits = importBaseCommits(repository, sourceCommit, mirror);
-  const objects = git(repository, ["rev-list", "--objects", "--no-object-names", sourceCommit, ...baseCommits.map(tip => `^${tip}`)]);
+  const objects = [];
+  streamRecords("git", ["-C", repository, "rev-list", "--objects", "--no-object-names", sourceCommit, ...baseCommits.map(tip => `^${tip}`)], "\n", id => { if (id.trim() !== "") objects.push(id.trim()); });
   const bytes = historyImportBytes(objects, input => command("git", ["-C", repository, "cat-file", "--batch-check=%(objectsize)"], { input }));
   return { bytes, baseCommits };
 }
@@ -2180,12 +2196,13 @@ function objectStoreStamp(mirror) {
 }
 
 function sourceTree(repository, commit, sparsePatterns) {
-  const entries = git(repository, ["ls-tree", "-rz", commit], { env: closureEnvironment }).split("\0").filter(Boolean).map(entry => {
+  const entries = [];
+  streamRecords("git", ["-C", repository, "ls-tree", "-rz", commit], "\0", entry => {
     const match = entry.match(/^(\d+) (blob|commit) ([0-9a-f]+)\t(.+)$/su);
     if (match === null) fail("source capacity estimate unknown: malformed Git tree entry");
     const [, mode, type, hash, name] = match;
-    return { mode, type, hash, name };
-  });
+    entries.push({ mode, type, hash, name });
+  }, { env: closureEnvironment });
   const selected = sparseSourcePaths(entries, sparsePatterns);
   const needed = entries.filter(entry => entry.type === "blob" && (selected === null || selected.has(entry.name) || entry.name.endsWith(".gitattributes")));
   const result = command("git", ["-C", repository, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
@@ -2777,7 +2794,8 @@ function createWorkspace(database, args, statePath) {
     : path.join(root, `.${name}.creating-${row.id}`);
   if (staged && process.env.PI_WORKSPACE_CHECKOUT_JOB !== row.id) {
     if (!args.named.has("creation-timeout-seconds")) {
-      const fileCount = git(mirror, ["ls-tree", "-r", "--name-only", "-z", sourceCommit]).split("\0").filter(Boolean).length;
+      let fileCount = 0;
+      streamRecords("git", ["-C", mirror, "ls-tree", "-r", "--name-only", "-z", sourceCommit], "\0", name => { if (name !== "") fileCount++; });
       const plan = JSON.parse(database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(row.id).plan_json);
       const bytes = plan.intent === "unestimated" ? 0 : plan.constructionBytes;
       args.named.set("creation-timeout-seconds", [String(Math.min(86400,
@@ -2914,12 +2932,13 @@ function resumeCloneCheckout(destination, input, sourceCommit, upstream, checkou
   if (input.mode === "writer" && branch.status === 0 && branch.stdout !== sourceCommit) {
     refuse("reserved branch has different source");
   }
-  const entries = git(destination, ["ls-tree", "-rz", sourceCommit]).split("\0").filter(Boolean);
-  const tree = new Map(entries.map(entry => {
+  const tree = new Map();
+  streamRecords("git", ["-C", destination, "ls-tree", "-rz", sourceCommit], "\0", entry => {
+    if (entry === "") return;
     const [metadata, name] = entry.split(/\t(.*)/su);
     const [mode, type, object] = metadata.split(" ");
-    return [name, { mode, type, object }];
-  }));
+    tree.set(name, { mode, type, object });
+  });
   const index = git(destination, ["ls-files", "--stage", "-z"]).split("\0").filter(Boolean);
   // A killed first checkout leaves no index, or the completed reserved tree, never arbitrary staging.
   if (index.length && (index.length !== tree.size || index.some(entry => {

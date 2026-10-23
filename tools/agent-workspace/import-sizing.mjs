@@ -8,7 +8,7 @@ export function commandFailureDetail(result) {
  return `${reason}${diagnostic ? `: ${diagnostic}` : ''} (stdoutBytes=${Buffer.byteLength(result.stdout || '')})`;
 }
 export function historyImportBytes(objects, inspect) {
- const ids = objects.trim() ? objects.trim().split('\n') : [];
+ const ids = Array.isArray(objects) ? objects : objects.trim() ? objects.trim().split('\n') : [];
  if (ids.some(id => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(id))) throw Error('source capacity estimate unknown: invalid history object identity');
  let bytes = 16 * 1024 ** 2;
  for (let at = 0; at < ids.length; at += HISTORY_SIZE_BATCH) {
