@@ -2262,6 +2262,23 @@ test("systemd malformed discovery refuses safety instead of omitting units", () 
   }
 });
 
+test("a finished RemainAfterExit wrapper is not a workspace reference unless something can still run in it", () => {
+  const workspace = "/srv/workspaces/agent-one";
+  const inert = `SubState=exited\nMainPID=0\nControlPID=0\nControlGroup=\nExecStop=\nExecStopPost=\nTriggeredBy=`;
+  const unit = (id, extra) => `Id=${id}\nActiveState=active\nWorkingDirectory=${workspace}\nExecStart={ path=/bin/bash ; argv[]=/bin/bash -c exec ${workspace}/run ; }\n${extra}`;
+  const cases = [
+    ["finished.service", inert, false],
+    ["running.service", inert.replace("SubState=exited", "SubState=running").replace("MainPID=0", "MainPID=42"), true],
+    ["leftover.service", inert.replace("ControlGroup=", "ControlGroup=/user.slice/leftover.service"), true],
+    ["stopper.service", inert.replace("ExecStop=", "ExecStop={ path=/bin/sh ; argv[]=/bin/sh -c rm ; }"), true],
+    ["timer-driven.service", inert.replace("TriggeredBy=", "TriggeredBy=timer-driven.timer"), true],
+    ["older-manager.service", "SubState=exited\nMainPID=0", true],
+  ];
+  const units = workspaceTesting.parseSystemdUnits(cases.map(([id, extra]) => unit(id, extra)).join("\n\n"), "user");
+  const references = workspaceTesting.systemdReferences(workspace, { units, available: true }).references.map(({ id }) => id);
+  assert.deepEqual(references, cases.filter(([, , reference]) => reference).map(([id]) => id));
+});
+
 test("classifies active systemd workspace references", () => {
   const workspace = "/srv/workspaces/agent-one";
   const units = workspaceTesting.parseSystemdUnits(`Id=worker.service\nActiveState=active\nExecStart={ path=/usr/bin/node ; argv[]=/usr/bin/node ${workspace}/server.js ; }\nWorkingDirectory=${workspace}\n\nId=finished.service\nActiveState=inactive\nExecStart={ path=/bin/true ; argv[]=/bin/true ; }\nWorkingDirectory=${workspace}\n`, "user");

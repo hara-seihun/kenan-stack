@@ -203,6 +203,16 @@ export function dockerSnapshot(execute = run, { env = process.env, endpointScope
   return { containers, available: true };
 }
 
+// A finished RemainAfterExit unit stays "active (exited)" until someone stops it. With no process, no control group,
+// nothing that runs when it is stopped and nothing that starts it again, it can no longer touch any path, so it is not a
+// reference (2026-10-24 converge-kenan: seven such wrappers kept completed workspaces referenced, so a 4 GiB admission
+// was refused). Each property must be present and exactly inert; anything else keeps the unit a reference.
+export function inertCompletedUnit(properties) {
+  return properties.get("ActiveState") === "active" && properties.get("SubState") === "exited"
+    && properties.get("MainPID") === "0" && properties.get("ControlPID") === "0" && properties.get("ControlGroup") === ""
+    && properties.get("ExecStop") === "" && properties.get("ExecStopPost") === "" && properties.get("TriggeredBy") === "";
+}
+
 export function parseSystemdUnits(output, manager) {
   return output.split(/\n\s*\n/u).flatMap((block) => {
     const properties = new Map(block.split("\n").flatMap((line) => {
@@ -212,6 +222,7 @@ export function parseSystemdUnits(output, manager) {
     const id = properties.get("Id");
     const activeState = properties.get("ActiveState");
     if (id === undefined || activeState === undefined || !["active", "activating", "reloading", "deactivating"].includes(activeState)) return [];
+    if (inertCompletedUnit(properties)) return [];
     const rawWorkingDirectory = properties.get("WorkingDirectory") ?? "";
     return [{
       id,
@@ -252,7 +263,8 @@ export function systemdManagerSnapshot(manager, execute = run) {
   if (unitIds.length === 0) return { units: [], available: true };
   const shown = execute("systemctl", [
     ...managerArgs, "show", "--property=Id", "--property=ActiveState", "--property=WorkingDirectory",
-    "--property=ExecStart", "--property=MainPID", "--", ...unitIds,
+    "--property=ExecStart", "--property=MainPID", "--property=SubState", "--property=ControlPID",
+    "--property=ControlGroup", "--property=ExecStop", "--property=ExecStopPost", "--property=TriggeredBy", "--", ...unitIds,
   ], { timeout: 20_000 });
   if (shown.status !== 0) return { units: [], available: true, error: shown.stderr || shown.stdout || "systemctl show failed" };
   return { units: parseSystemdUnits(shown.stdout, manager), available: true };
