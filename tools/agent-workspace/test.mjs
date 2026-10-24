@@ -1132,7 +1132,8 @@ test("capacity caches survive retained source inspection and invalidate only bef
     assert.deepEqual(cached(), generatedMeasurement);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "dirty retained source\n");
     git(created.path,"checkout","--","file.txt");
-    const cleaned=JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    const growth=JSON.parse(run(["growth-status", "--id", created.id, "--path", created.path, "--json"], f.env));
+    const cleaned=JSON.parse(run(["release", "--id", created.id, "--end-retention", "--owner", created.owner, "--expected-plan-sha256", growth.binding.planSha256, "--json"], f.env));
     assert.equal(cached(), undefined,JSON.stringify(cleaned));
     assert.equal(existsSync(path.join(created.path, "node_modules")), false);
     assert.equal(existsSync(created.path),false);

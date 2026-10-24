@@ -4,6 +4,7 @@ import {executionCommand, executionRows, executionCessation} from './execution-c
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {withStdoutFile, foldRecords} from './stdout-records.mjs';
 import {hasUncoveredCommits} from './release-reachability.mjs';
+import {classifyLocalMerges,disposedMergesCoverRelease,recordMergeDisposal} from './local-merge-disposal.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
 import {boundedCommand} from './bounded-command.mjs';
@@ -804,6 +805,12 @@ function gitDisposition(record, nestedWorkspaces = []) {
   if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
   const uncovered = () => hasUncoveredCommits((args, options) => git(record.path, args, options), candidates, durable);
   const initiallyUncovered = uncovered();
+  // Recorded disposal of candidate-local merges: never covers ordinary commits, edits or
+  // conflict resolutions; re-verified against current durable remote tips on every call.
+  const recordedMergesCover = () => {
+    try { return disposedMergesCoverRelease((args, options) => git(record.path, args, options), path.resolve(record.path, git(record.path, ["rev-parse", "--git-common-dir"])), candidates, durable); }
+    catch { return false; }
+  };
   if (initiallyUncovered && refs.length) {
     const remotes = git(record.path, ["remote"]).split("\n").filter(Boolean);
     for (const remote of remotes) {
@@ -815,8 +822,8 @@ function gitDisposition(record, nestedWorkspaces = []) {
         if (knownHeads.get(ref) === sha) durable.push(sha);
       }
     }
-    if (uncovered()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
-  } else if (initiallyUncovered) {
+    if (uncovered() && !recordedMergesCover()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
+  } else if (initiallyUncovered && !recordedMergesCover()) {
     return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
   if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
@@ -3881,6 +3888,34 @@ function retireSourceMaterializationCommand(database, args, statePath) {
   if (!result.ok) process.exitCode = 2;
 }
 
+// Explicit, owner-bound, recorded disposal of candidate-local merge commits whose
+// parents are durable on remotes. Verification refuses unique source; see
+// local-merge-disposal.mjs. Records a receipt only; nothing is deleted here.
+function disposeLocalMergesCommand(database, args) {
+  assertOnly(args, ["id", "path", "owner", "json"]);
+  const selected = growthSelected(database, args, "dispose-local-merges");
+  const owner = required(args, "owner");
+  withWorkspaceLock(database, selected.path, () => {
+    const record = recordBy(database, {id: selected.id});
+    if (!record.owner || record.owner !== owner) growthError("stale-merge-disposal", "current owning identity required");
+    if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) growthError("invalid-merge-disposal-state", `cannot dispose merges of a ${record.state} workspace`);
+    const head = git(record.path, ["rev-parse", "HEAD"]);
+    const inventory = git(record.path, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes"])
+      .split("\n").filter(Boolean).map(line => line.split(" "));
+    const candidates = [...inventory.filter(([ref]) => ref.startsWith("refs/heads/")).map(([, sha]) => sha), head];
+    const durable = inventory.filter(([ref]) => ref.startsWith("refs/remotes/")).map(([, sha]) => sha);
+    if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
+    const gitRun = (a, o) => git(record.path, a, o);
+    const verdict = classifyLocalMerges(gitRun, candidates, durable);
+    if (!verdict.ok) growthError("merge-disposal-refused", `${verdict.reason}; unique source is never disposed`);
+    if (verdict.merges.length === 0) { print({ok: true, workspaceId: record.id, disposed: [], reason: "no commits are absent from remotes; nothing to dispose"}, bool(args, "json")); return; }
+    const commonDir = path.resolve(record.path, git(record.path, ["rev-parse", "--git-common-dir"]));
+    const recorded = recordMergeDisposal({gitCommonDir: commonDir, workspaceId: record.id, owner, head, merges: verdict.merges, durable});
+    print({ok: true, workspaceId: record.id, disposed: verdict.merges, receipt: recorded.file, receiptSha256: recorded.sha256,
+      next: "release re-verifies these merges against remote tips; no source was deleted"}, bool(args, "json"));
+  }, selected.groupId);
+}
+
 function retireGrowthCommand(database, args, statePath) {
   assertOnly(args, ["id", "path", "owner", "disposition", "disposition-sha256", "json"]);
   const selected = growthSelected(database, args);
@@ -4238,7 +4273,8 @@ function help() {
   agent-workspace cancel-creation (--id ID|--path PATH)
   agent-workspace finalize-creation (--id ID|--path PATH)
   agent-workspace heartbeat ${selectorSyntax("heartbeat")} [--lease-seconds N]
-  agent-workspace release (--id ID|--path PATH) [--reap-expired] [--preserve-runtime]
+  agent-workspace release ${selectorSyntax("release")} [--reap-expired] [--preserve-runtime]
+  agent-workspace dispose-local-merges ${selectorSyntax("dispose-local-merges")} --owner OWNER [--json]
   agent-workspace release ${selectorSyntax("release")} --end-retention --owner OWNER --expected-plan-sha256 SHA [--json]
   agent-workspace reconcile [--root PATH] [--execute] [--reap-expired] [--preserve-runtime]
                             [--budget-ms 20000] [--max-groups 32] [--after ID|start]
@@ -4413,7 +4449,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4458,6 +4494,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "retire-cache-status") { assertOnly(args,["id","stage","json"]); const result=cacheRetirementStatus(database,{workspaceId:one(args,"id"),stage:one(args,"stage")}); print(result,true); if(!result.ok) process.exitCode=2; }
     else if (commandName === "retire-source-materialization") retireSourceMaterializationCommand(database, args, statePath);
     else if (commandName === "retire-growth") retireGrowthCommand(database, args, statePath);
+    else if (commandName === "dispose-local-merges") disposeLocalMergesCommand(database, args);
     else if (commandName === "reduce-retained-headroom") reduceRetainedHeadroomCommand(database,args,statePath);
     else if (commandName === "resume-growth") repriceCapacityCommand(database, args, statePath, true);
     else if (commandName === "reprice-capacity") repriceCapacityCommand(database, args, statePath);
@@ -4489,7 +4526,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),

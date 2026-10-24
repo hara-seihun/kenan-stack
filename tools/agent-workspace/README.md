@@ -726,3 +726,9 @@ capacity credit. Admission still consumes only complete, current identity-bound
 samples and retains full liability on failed measurement.
 
 Focused checks: `node --test tools/agent-workspace/{terminal-finalizer,measurement-isolation,growth-lifecycle}.test.mjs`.
+
+## Recorded disposal of candidate-local merges
+
+A candidate checkout often holds merge commits that combine leaves already durable on a remote (for example pull-request heads merged into a staging candidate). Those merges are never pushed, so release retains the checkout as having "commits absent from remote refs". `agent-workspace dispose-local-merges --id ID --path PATH --owner OWNER --json` records an owner-bound disposal for them. It succeeds only when every commit absent from remote refs and durable source ancestry is a two-parent merge whose parents are remote-durable (or are themselves such merges) and whose tree is exactly the conflict-free merge of those parents. Ordinary commits, octopus merges, conflict resolutions and merges carrying any extra edit are unique source and are refused. The command only writes a receipt under the repository's common git directory (`agent-workspace-merge-disposals/`); it deletes and moves nothing. Every later release re-verifies against current remote tips, so work added after the disposal stays protected. Checks: `node --test tools/agent-workspace/local-merge-disposal.test.mjs`.
+
+`release` takes exactly one selector, `(--id ID|--path PATH)`; its help line is generated from the same CLI contract that validates it, and a test fails if a help line and the contract diverge.
