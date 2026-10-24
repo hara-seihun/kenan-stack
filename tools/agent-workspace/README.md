@@ -38,6 +38,26 @@ Before dropping any single/group writing lease, ordinary release atomically reco
 
 `status --limit` accepts integers **1..500**, with initial page size100. JSON `nextAfter` feeds `--after` with the same filters; stop at null. Status does not execute, renew, retry, or settle a release.
 
+## Ordinary release settles retained future growth
+
+An explicit ordinary `release` ending in lease0/repair-required retained source
+now attempts a separately journalled future-growth settlement. Dirty/unpublished
+source, branches, generated dependencies and all runtime bytes remain untouched;
+existing headroom remains charged. This is an explicit end-writing request, not
+an archive/expiry inference. The same locked `retire-growth` transition performs
+fresh privileged process/writable-FD, systemd, container, native queue and borrower
+observations, current sample validation and exact source/plan/root/lease CAS.
+Native queue observation is also required by direct `retire-growth`.
+
+`futureGrowthSettlement.kind` distinguishes `retired` (journal sequence and evidence
+hash) from `retained` (typed cause and supported observe/settle commands). Failed,
+stale, live, uncertain or active-borrower evidence retains the full allowance;
+release success alone never implies capacity credit. Original release settlement
+and retirement journal survive a lost stdout. Repeating release after repairing
+cessation reobserves the same retained tree; already retired custody remains
+non-destructive and cannot silently resume writes. Resume needs supported full
+capacity admission. No source publication or actual freed disk bytes are claimed.
+
 ## Terminal release and bounded queue observation
 
 An explicit ordinary release transfers source intent to its durable Git/task custody; every single/group physical inspection keeps that resource scope. Actual reserved tools, native executions, unknown operations, FD/cwd readers and Git borrowers still retain the checkout. Dirty/unpublished source remains protected.
@@ -336,9 +356,11 @@ another workspace or work outside its allocation. Hash the exact JSON bytes.
 
 ```
 agent-workspace reprice-capacity --id ID --path PATH --owner OWNER \
-  --intent source-only --headroom-gib 8 --growth-mib 64 \
+  --intent budgeted --headroom-gib 8 --growth-mib 64 \
   --reduction /absolute/reduction.json --reduction-sha256 SHA256 --json
 ```
+
+The example preserves an existing **budgeted** intent. For an already source-only writer use `--intent source-only`; reducing an allowance never proves that a build or database writer stopped. Active reduction supports source-only→source-only, source-only→budgeted and budgeted→budgeted only. Budgeted→source-only returns typed `capacity-intent-downgrade` with a supported next action, without changing any record. Completed work with no future writes uses `retire-growth`, not an intent downgrade.
 
 This opt-in extends the existing repricing interface, not a second ledger. It requires
 an active unexpired owning lease, positive remaining allowance, a lower total growth
@@ -576,3 +598,131 @@ returns the original result without another effect. `job-status` shows abandoned
 with exit2, never ready; create cannot retry the same abandoned identity. The
 contention producer clears via its normal immutable-result check. No source,
 lease, reservation, provider outcome or capacity credit is invented.
+
+### Source import commit boundary
+
+A successful Git fetch is object transport, not source custody acceptance. The importer verifies the exact independently owned closure, creates a missing request-bound source ref by no-overwrite CAS, verifies readback, and uses Git object/reference fsync before READY. Crash-left objects may repair only the requested immutable commit; a conflicting ref or missing closure fails without overwriting custody or substituting donor HEAD. Original failed job receipts remain unchanged.
+
+`growth-status --id ID --path PATH` requires both selectors to bind custody. `reprice-capacity (--id ID|--path PATH)` accepts exactly one.
+
+Local shallow donors require explicit `fetch --update-shallow`: Git otherwise exits zero while rejecting the destination ref, leaving unreferenced objects without the donor's shallow boundary. The shared independent mirror imports that explicit boundary, then verifies closure and exact ref readback; it never invents parent objects or treats missing history as complete. Real shallow-donor regression retains this prior RED.
+
+### Ephemeral execution capacity (non-Git)
+
+Use `execution-reserve --root ABS_EMPTY_OWNED_DIRECTORY --owner OWNER --operation-id UUID --growth-mib N --headroom-gib 8 --holder-pid PID --json` **before starting a producer**. The PID must have a stable native service/scope cgroup. The explicit positive growth allowance is an `operator-budget`, not a measured peak (`measuredPeakBytes: null`); unknown/unestimated growth is refused until an operator supplies a conservative allowance. This reserves future growth on the root's actual filesystem in the existing `workspace_capacity` table and under the exact device admission lock. Ordinary workspace creators, source imports and repricing consume it too. No Git workspace registration, new registry, lease expiry, measurement-based credit, capacity waiver or PG execution occurs.
+
+Persist the returned `id`, `owner`, `root`, `planSha256` and `holder` in the consumer's existing operation receipt. `execution-status --id execution:UUID --json` reads that exact original. Replaying an identical operation returns its original result; changed parameters conflict and a released operation cannot authorize a new run. Root must be empty, owned and canonical, with unchanged device/inode and holder identity at admission.
+
+After stopping the producer and deleting its disposable state, call `execution-release --id execution:UUID --owner OWNER --expected-plan-sha256 SHA --json`. **Inside a still-live native holder it must refuse**. The outer native qualification finalizer calls it after observing the original job terminal. Release independently requires root absence plus privileged complete original-cgroup/process census (including descendants), not a caller assertion or PG-PID-only observation. Unknown state or a changed boot retains the full reservation; no timer clears it. Released rows retain the original plan, admission and cessation receipt, and contribute zero future liability. This is cooperative disk admission, not a filesystem quota or a measured workload-size guarantee. Consumer admission failure must prevent `initdb`; abandoned/still-live state remains owned repair work.
+
+Regression: `node --test tools/agent-workspace/execution-capacity.test.mjs` covers actual concurrent CLI admission, shared workspace accounting, restart, identity conflicts, invalid budgets/roots, live cgroups and conservative unknown cessation. Installation uses the maintained selective `install-capacity-host`/`capacity-deploy.mjs` path; the serial rollback stays execution-reservation-aware.
+
+## Frozen source handoff and scoped writer custody
+
+A handoff announcement, owner row, or compiler seal does not revoke filesystem
+write access. `writer-run` is the supported mutable-workspace writer: it requires
+exact `--id --path --owner --expected-head`, `--command-json '["exe","arg"]'`
+and `--timeout-ms N` (1..3600000). It checks active lease/writer/growth custody
+under the existing group/checkout locks and retains those locks through the
+foreground child. Children inherit lock descriptions; bounded process-group
+cessation precedes release. `reassign` uses the same locks. Another checkout is
+not locked. Child exit/output is returned in the result, not inferred success.
+This is cooperative writer admission, **not protection against raw editors**.
+
+For an actual immutable handoff, prepare a **separately admitted source-only
+snapshot workspace** at the exact source SHA with enough budget for independent
+Git custody; ordinary create may use alternates, which must first be safely
+fully dissociated within that budget. No borrowed objects, worktrees, hardlinked
+regular files, nested mounts, external symlinks, generated/ignored/untracked
+files are accepted. Do not freeze a compiler/build workspace.
+
+```
+agent-workspace freeze-source --id SNAPSHOT_ID --path SNAPSHOT_PATH \
+  --owner SOURCE_OWNER --expected-head FULL_SHA --recipient BUILD_OWNER \
+  --authorization HANDOFF_EVIDENCE --json
+```
+
+Under that same lock, this freezes the complete private snapshot's regular
+files/directories using Linux immutable flags and transfers recorded custody
+only after post-freeze HEAD/clean-tree validation. Ordinary raw writes, Git
+commits, deletes and renames fail with EPERM, without chmod/chown or touching
+other writers. Internal symlinks are not followed; their immutable parent
+protects names. Root/sudo remains an authorized operator, not a defended-against
+adversary. A privileged, fsynced original-flags journal is retained at
+`/var/lib/agent-workspace/frozen-source/`; failures roll back only immutable bits
+this transaction added, preserving existing flags. Interrupted operations retain
+the original journal and fail closed via the `.git/pi-frozen-handoff.json`
+intent. Never delete that marker to manufacture a completed freeze.
+
+The consumer must create a separately admitted **writable build workspace** from
+this frozen exact Git source with the normal build growth allowance; it retains
+bootstrap source pins and actual HEAD checks. Compile there, not in the frozen
+snapshot. `writer-run` refuses the frozen source even for the recipient.
+7ed's next-new-root handoff uses this source-snapshot/build-root separation;
+existing a7 compiler roots and in-flight receipts are explicitly unchanged.
+The snapshot and its lifetime have independent preservation custody, not capacity
+credit. Cleanup cannot silently remove immutable source. Explicit rollback:
+`thaw-source --id SNAPSHOT_ID --path SNAPSHOT_PATH --owner CURRENT_OWNER
+--expected-head FULL_SHA --json` replays only that exact original-flags journal,
+under custody locks, and keeps recipient ownership. It is a deliberate new
+mutable-source operation, never a timer-based waiver.
+
+Focused qualification: `node --test tools/agent-workspace/writer-custody.test.mjs
+ tools/agent-workspace/bounded-command.test.mjs` and
+`sudo -n python3 tools/agent-workspace/frozen-source.test.py`.
+Publication uses the existing tools-only `install-capacity-host` selective
+installer and exact installed-base CAS. No provider/product publication follows.
+Rollback the tool selection only after explicitly reconciling/thawing any new
+frozen snapshots; older tooling does not understand their intent markers.
+
+### Exact native caller identity
+
+Kenan Stack binds SDK `callId`, actual agent and channel into the description of the root-created system-manager scope **before** dropping privileges. The workspace observer reads the actual caller's `/proc` cgroup and its system-manager scope Description/ControlGroup/Transient/ActiveState, requiring a matching root server ancestor and exact channel. It then matches exact agent/conversation and streaming message part callId. Ambiguous matches exempt nothing. Shell expansion, quoting and final exec cannot change that operation identity; editable shell environment grants no exemption. Another worker or another same-agent tool call remains protected. There is no command-substring fallback. Install native scope-identity propagation locally before this observer; an older runtime remains conservative and may report its own tool as a reference until upgraded.
+
+## Owner-directed terminal preparation finalizer
+
+`node tools/agent-workspace/terminal-finalizer.mjs REQUEST.json SHA256` is the
+non-deleting preparation-finalizer entry point. Call it from the **outer**
+preparation owner after its native job has completed, not from the live holder.
+It does not infer completion from an expired lease, archived worker, or elapsed
+time. The publication owner adopts this entry point in its next maintenance
+qualification; adding source does not claim deployment or activate any timer.
+
+The hash-bound request is `kind: "terminal-growth-finalization"`, exact `owner`
+and absolute `path`, `frozen: false`, `futureWrites: "none"`,
+`deleteSource: false`, the original execution `holder` (PID/startTime/bootId/
+cgroup/UID as recorded at launch), `units: [{unit, manager: "user" | "system",
+invocationId}]`, and `disposition`: the **unchanged current** native
+`retire-future-growth` owner disposition, including full `growth-status.binding`,
+`observedAt`, source retention and evidence. Obtain a fresh complete allocation
+sample before sealing the binding. Missing/changed/frozen/foreign custody refuses.
+Do not fabricate a holder from a PID observed after the fact.
+
+Every declared unit must be the exact successful `oneshot`, `RemainAfterExit=yes`,
+`Restart=no`, active/exited invocation with MainPID=ControlPID=0 and empty cgroup,
+no stop hooks and no trigger relationships. All units are preflighted; each is
+rechecked immediately before `stop` to clear only an inert completed registration.
+The original holder must be one declared unit. A privileged complete original
+cgroup/process census then proves cessation; native terminal safety observes
+processes, queued tools and borrowers again. `retire-growth` rechecks the exact
+owner, source/plan/sample/root binding under existing locks, CAS and durable
+journal. An unknown observation or a concurrent writer retains the reservation.
+A same-custody already-retired result performs no unit effects. A partial unit
+cleanup followed by refusal remains source-preserving; obtain current terminal
+custody rather than replaying any original job.
+
+This entry point never invokes `release`, deletes source, strips dependencies,
+lowers the operating floor or changes a producer, queue or application. Unpushed
+source and rollback remain on disk; growth retirement is not reclaimed disk bytes.
+Frozen/operator readers are not eligible unless their owner explicitly ends that
+preservation contract; an automatic finalizer must not manufacture that decision.
+
+Capacity sampling now fences each **individual checkout/group** and carries its
+absolute requested deadline into that acquisition. It no longer takes a global
+`capacity-measurement` lock around a pool walk. A 240-second sampler cannot trap
+an unrelated targeted refresh behind a 30-second global wait. Same-root concurrent
+observations serialize; busy/deadline/partial observations store failure, not
+capacity credit. Admission still consumes only complete, current identity-bound
+samples and retains full liability on failed measurement.
+
+Focused checks: `node --test tools/agent-workspace/{terminal-finalizer,measurement-isolation,growth-lifecycle}.test.mjs`.

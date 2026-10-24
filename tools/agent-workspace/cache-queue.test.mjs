@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-const {queueReferenceSql,currentStackQueueReferences,callerToolCall,kenanChannels,channelDatabase}=await import(process.env.WORKSPACE_QUEUE_MODULE||'./cache-queue.mjs');
+const {queueReferenceSql,currentStackQueueReferences,callerToolCall,procScope,kenanChannels,channelDatabase}=await import(process.env.WORKSPACE_QUEUE_MODULE||'./cache-queue.mjs');
 const literal=x=>"'"+x.replaceAll("'","''")+"'";
 const json=x=>literal(JSON.stringify(x))+'::jsonb';
 
@@ -46,7 +46,10 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   const query=sql=>pg('psql',['-X','-qAt','--host',root,'--username','fixture','--dbname','postgres','--set=ON_ERROR_STOP=1','--command',sql]);
   query(sql);
   const observe=(kind,self)=>JSON.parse(query(queueReferenceSql(source,self,kind)));
-  const self=['release','--path',source];
+  const self={callId:'call-19',agentId:'caller'};
+  // The actual SDK call ID is independent of the expanded command.
+  query(`UPDATE message SET parts=jsonb_set(parts,'{0,callId}','\"computed-call\"') WHERE id=${literal(ids.caller)};`);
+  self.callId='computed-call';
   const physical=observe('physical-checkout',self),sourceScope=observe('source',self),anonymous=observe('physical-checkout',null);
   assert.equal(physical.self,1);assert.equal(anonymous.self,0);
   const keys=rows=>rows.references.map(r=>r.kind+':'+r.id).sort();
@@ -57,7 +60,13 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   assert.equal(physical.references.find(r=>r.id===ids['running-read']).resourceClass,'reserved-tool-call');
   assert.equal(sourceScope.references.find(r=>r.id==='live').resourceClass,'source-intent');
   // A different invocation that merely mentions agent-workspace is not the caller.
-  assert.equal(observe('physical-checkout',['heartbeat','--path',source]).self,0);
+  assert.equal(observe('physical-checkout',{...self,agentId:'live'}).self,0);
+  assert.equal(observe('physical-checkout',{...self,callId:'wrong-call'}).self,0);
+  const sibling=uuid();query(`INSERT INTO message SELECT ${literal(sibling)},conversation_id,role,text,jsonb_set(parts,'{0,callId}','\"other-call\"'),state FROM message WHERE id=${literal(ids.caller)};`);
+  assert.ok(observe('physical-checkout',self).references.some(r=>r.id===sibling));
+  query(`DELETE FROM message WHERE id=${literal(sibling)};`);
+  query(`INSERT INTO message SELECT ${literal(uuid())},conversation_id,role,text,parts,state FROM message WHERE id=${literal(ids.caller)};`);
+  assert.equal(observe('physical-checkout',self).self,0); // ambiguous duplicate stays protected
   assert.equal(observe('physical-checkout',null).references.length,observe('generated-cache',null).references.length);
  }finally{if(started)pg('pg_ctl',['-D',data,'-m','immediate','-w','stop']);fs.rmSync(root,{recursive:true,force:true});}
 });
@@ -71,12 +80,12 @@ test('every installed channel is observed against one absolute deadline and fail
   fs.rmSync(path.join(stack,'beta'),{recursive:true});fs.rmSync(path.join(stack,'production'),{recursive:true});
   assert.throws(()=>kenanChannels(stack),/channel inventory missing/);
  }finally{fs.rmSync(stack,{recursive:true,force:true});}
- const channels=()=>['beta','production'],caller=()=>({channel:'production',args:['release','--path','/source']}),user=()=>'kenan';
+ const channels=()=>['beta','production'],caller=()=>({channel:'production',callId:'exact-call',agentId:'caller'}),user=()=>'kenan';
  const seen=[];
  const ok=currentStackQueueReferences(['/source'],{resourceKind:'physical-checkout',deadline:Date.now()+10000,channels,caller,user,execute:(name,args)=>{
   assert.equal(name,'psql');assert.deepEqual(args.slice(args.indexOf('--host'),args.indexOf('--host')+6),['--host','/run/kenan/pg','--username','kenan','--dbname',args[args.indexOf('--dbname')+1]]);
   const db=args[args.indexOf('--dbname')+1];seen.push(db);const sql=args.at(-1);assert.match(sql,/statement_timeout='4000ms'/);assert.match(sql,/BEGIN READ ONLY/);
-  assert.equal(/strpos\(p->'args'->>'command','release'\)/.test(sql),db==='kenan_production');
+  assert.equal(sql.includes("p->>'callId'='exact-call'"),db==='kenan_production');
   return {status:0,stdout:JSON.stringify({self:db==='kenan_production'?1:0,references:db==='kenan_beta'?[{kind:'tool_call',id:'running',state:'running',resourceClass:'reserved-tool-call'}]:[]})};}});
  assert.deepEqual(ok.errors,[]);assert.deepEqual(seen,['kenan_beta','kenan_production']);assert.equal(ok.references[0].channel,'beta');assert.equal(ok.observations[1].callerToolCalls,1);
  assert.equal(currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,channels,caller,user,execute:()=>({status:2,stdout:'',stderr:'FATAL: role "kenan" does not exist'})}).errors.length,1);
@@ -86,12 +95,25 @@ test('every installed channel is observed against one absolute deadline and fail
  assert.equal(calls,1);assert.equal(late.errors.length,1);assert.equal(late.references.length,0);
 });
 
-test('caller identity requires a Kenan Stack server ancestor and survives bash exec of the final command',()=>{
- const tree={10:{argv:['node','/usr/local/bin/agent-workspace','release'],parent:9},9:{argv:['/usr/local/bin/node','/srv/kenan/beta/dist/server/main.js','/etc/kenan/beta.json'],parent:1},
-  20:{argv:['node','agent-workspace'],parent:19},19:{argv:['/bin/bash','-c','x && agent-workspace release'],parent:9},30:{argv:['node'],parent:29},29:{argv:['systemd','--user'],parent:1}};
- const io={argv:pid=>tree[pid].argv,parent:pid=>tree[pid].parent};
- assert.deepEqual(callerToolCall({...io,pid:10,args:['release','--path','/x']}),{channel:'beta',args:['release','--path','/x']});
- assert.deepEqual(callerToolCall({...io,pid:20,args:['release']}),{channel:'beta',args:['release']});
- assert.equal(callerToolCall({...io,pid:30,args:['reconcile']}),null);
- assert.equal(callerToolCall({...io,pid:10,args:[]}),null);
+test('caller identity uses root system-scope metadata, rejecting editable env, foreign channels and missing scopes',()=>{
+ const tree={10:{argv:['node','agent-workspace'],parent:19},19:{argv:['bash','-c','exec env KENAN_TOOL_CALL_ID=forged agent-workspace --sha $(compute)'],parent:9},9:{argv:['node','/srv/kenan/beta/dist/server/main.js'],parent:1},30:{argv:['node'],parent:1}};
+ const actual={version:1,channel:'beta',callId:'native-call',agentId:'caller',unit:'agent-tool-beta-00000000-0000-4000-8000-000000000000.scope'};
+ const io={uid:()=>0,argv:pid=>tree[pid].argv,parent:pid=>tree[pid].parent,scope:()=>actual};
+ assert.deepEqual(callerToolCall({...io,pid:10}),{channel:'beta',callId:'native-call',agentId:'caller'});
+ assert.deepEqual(callerToolCall({...io,pid:10,parent:pid=>pid===10?9:io.parent(pid)}),{channel:'beta',callId:'native-call',agentId:'caller'});
+ assert.equal(callerToolCall({...io,pid:30}),null);
+ assert.equal(callerToolCall({...io,pid:10,uid:()=>1002}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>null}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>({...actual,channel:'production'})}),null);
+ assert.equal(callerToolCall({...io,pid:10,scope:()=>({...actual,callId:'x\n'})}),null);
+ assert.throws(()=>queueReferenceSql('/source',['literal-argv'],'physical-checkout'),/caller tool identity/);
+});
+
+test('system-scope parser requires exact active transient root-unit ControlGroup, never a lookalike or sibling',()=>{
+ const group='/system.slice/agent-tool-beta-00000000-0000-4000-8000-000000000000.scope';
+ const props={Description:'kenan-tool-call:'+JSON.stringify({version:1,channel:'beta',callId:'actual',agentId:'owner'}),ControlGroup:group,Transient:'yes',ActiveState:'active'};
+ const observe=patch=>procScope(100,{read:()=>`0::${group}\n`,query:unit=>({status:0,stdout:Object.entries({...props,...patch}).map(([k,v])=>`${k}=${v}`).join('\n')})});
+ assert.equal(observe({}).callId,'actual');
+ for(const patch of [{ControlGroup:group+'/sibling'},{Transient:'no'},{ActiveState:'inactive'},{Description:'editable-env'}]) assert.equal(observe(patch),null);
+ assert.equal(procScope(100,{read:()=>`0::/user.slice/lookalike.scope\n`,query:()=>{throw Error('must not query')}}),null);
 });

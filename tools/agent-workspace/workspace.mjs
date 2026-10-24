@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
+import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {withStdoutFile, foldRecords} from './stdout-records.mjs';
 import {hasUncoveredCommits} from './release-reachability.mjs';
@@ -1395,6 +1397,7 @@ function reassignWorkspace(database, input) {
   const row = database.prepare(`SELECT workspace.*, ${ASSIGNMENT_SOURCE} FROM workspace WHERE id = ?`).get(input.id);
   if (row === undefined) return refuse("workspace-not-registered", input.id);
   const record = rowToRecord(row);
+  if (!input.frozenSourceTransfer && existsSync(path.join(record.path,".git","pi-frozen-handoff.json"))) return refuse("state-not-reassignable","frozen source snapshot; use freeze-source transfer or explicit thaw-source");
   if (recordRetainsCustody(database, record.id)) return refuse("growth-admission-required", "resume-growth admission required before reassignment");
   if (record.path !== input.path) return refuse("path-mismatch", `recorded ${record.path}, requested ${input.path}`);
   if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) {
@@ -1440,6 +1443,63 @@ function reassignWorkspace(database, input) {
   // source_commit stays immutable so clients from an earlier release cannot discard a new, unpublished baseline.
   database.prepare("UPDATE workspace SET owner = ?, updated_at = ? WHERE id = ?").run(input.owner, transfer.occurredAt, record.id);
   return { ok: true, record: recordBy(database, { id: record.id }), transfer: { sequence: Number(event.lastInsertRowid), ...transfer } };
+}
+
+function thawSourceCommand(database,args) {
+  assertOnly(args,["id","path","owner","expected-head","json"]);
+  const input={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head")};
+  return withWorkspaceLock(database,input.path,()=>{
+    const record=recordBy(database,{id:input.id});
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    const stat=lstatSync(input.path);
+    const result=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"rollback-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
+    if(result.status!==0) fail("snapshot-rollback-unaccepted: "+(result.stderr||result.error?.message));
+    rmSync(path.join(input.path,".git","pi-frozen-handoff.json"));
+    print({ok:true,binding:input,rollback:JSON.parse(result.stdout),ownerUnchanged:true},true);
+  });
+}
+
+function freezeSourceCommand(database,args) {
+  assertOnly(args,["id","path","owner","expected-head","recipient","authorization","json"]);
+  const input={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head")};
+  return withWorkspaceLock(database,input.path,()=>{
+    const record=recordBy(database,{id:input.id}), marker=path.join(input.path,".git","pi-frozen-handoff.json");
+    const previous=existsSync(marker)?JSON.parse(readFileSync(marker,"utf8")):null;
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    if (recordRetainsCustody(database,record.id)||retainedParent(database,record.path)) fail("writer-growth-admission-required");
+    if (realpathSync(input.path)!==input.path || lstatSync(path.join(input.path,".git")).isSymbolicLink()) fail("snapshot-private-git-required");
+    const clean=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
+    if (clean.status!==0 || clean.stdout) fail("snapshot-clean-source-required; no generated/build files allowed");
+    if (previous && (previous.id!==input.id||previous.head!==input.head)) fail("snapshot-marker-conflict");
+    const recipient=required(args,"recipient"), authorization=required(args,"authorization");
+    if(recipient===input.owner||!authorization.trim()) fail("snapshot-recipient-transfer-required");
+    const stat=lstatSync(input.path);
+    if(!previous) writeFileSync(marker,JSON.stringify({kind:"frozen-source-intent",id:input.id,path:input.path,head:input.head,ownerAtFreeze:input.owner})+"\n",{flag:"wx",mode:0o600});
+    const helper=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"freeze-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino,uid:stat.uid}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
+    if(helper.status!==0) fail("snapshot-freeze-unaccepted: "+(helper.stderr||helper.error?.message));
+    const after=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
+    if(gitInfo(input.path).head!==input.head||after.status!==0||after.stdout) fail("snapshot-head-raced; immutable source retained for reconciliation");
+    database.exec("BEGIN IMMEDIATE");
+    let transfer;
+    try {
+      transfer=reassignWorkspace(database,{id:input.id,path:input.path,fromOwner:input.owner,fromSourceCommit:record.sourceCommit,fromState:record.state,owner:recipient,sourceCommit:input.head,authorization,frozenSourceTransfer:true});
+      if(!transfer.ok) fail("snapshot-transfer-failed: "+transfer.error.code);
+      database.exec("COMMIT");
+    }catch(error){database.exec("ROLLBACK");throw error;}
+    print({ok:true,binding:{...input,owner:recipient},transfer:transfer.transfer,snapshot:JSON.parse(helper.stdout),nextAction:"create a separately admitted writable build workspace from this frozen exact Git source; never bootstrap this snapshot"},true);
+  });
+}
+
+function writerRunCommand(database, args) {
+  assertOnly(args, ["id", "path", "owner", "expected-head", "command-json", "timeout-ms", "json"]);
+  const input = writerRequest(Object.fromEntries([...args.named].map(([k]) => [k, one(args,k)])));
+  return withWorkspaceLock(database, input.path, () => {
+    const record = recordBy(database, {id:input.id});
+    assertWriterBinding(record,input,{head:gitInfo(input.path).head, frozen: existsSync(path.join(input.path,".git","pi-frozen-handoff.json"))});
+    if (recordRetainsCustody(database,record.id) || retainedParent(database,record.path)) fail("writer-growth-admission-required");
+    const result = runWriter(input,[...heldResourceLocks.values()]);
+    print(result,true); process.exitCode = result.ok ? 0 : result.exitCode || 1;
+  });
 }
 
 function reassignCommand(database, args) {
@@ -1918,6 +1978,14 @@ function capacityReservations(database, device, reservedPath, measure) {
     headroomBytes = Math.max(headroomBytes, plan.headroomBytes, plan.intent === "unestimated" ? plan.constructionBytes : 0);
     priced.push(plan.growthBytes + (plan.intent === "unestimated" ? 0 : plan.constructionBytes));
   }
+  // Non-Git execution reservations share this exact device ledger and fence.
+  // Charge the full operator budget until native cessation AND physical cleanup;
+  // no TTL, cached measurement or process restart silently grants capacity.
+  for (const execution of executionRows(database, device)) {
+    if (execution.state === "released") continue;
+    priced.push(execution.growthBytes);
+    headroomBytes = Math.max(headroomBytes, execution.headroomBytes);
+  }
   return { priced, headroomBytes, unpricedDormant, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
@@ -2306,8 +2374,7 @@ function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatte
     if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
     if (/^[0-9a-f]{40}$/u.test(ref) && existsSync(mirror)
       && hasObjectClosure(mirror, ref, sparsePatterns)) {
-      run("git", ["--git-dir", mirror, "update-ref", sourceRefFor(repository, ref), ref]);
-      return ref;
+      return ensureSourceCustody(mirror, repository, ref, ref, sparsePatterns);
     }
     if (sourcePreparationMode === "foreground") throw new SourcePreparationRequired();
     publishSourcePhase({ phase: "importing", commit: ref });
@@ -2360,6 +2427,31 @@ function prepareMirror(statePath, mirror, repository, upstream) {
   return statePath ? withResourceLock(statePath, `mirror-config:${mirror}`, configure) : configure();
 }
 
+// A successful fetch is object transport, not a durable source-ref commit. An
+// interrupted import may have all objects but no ref. Recover only the exact
+// independently verified closure, never a mutable donor HEAD or another ref.
+function ensureSourceCustody(mirror, repository, ref, expected, sparsePatterns = []) {
+  if (!/^[0-9a-f]{40}$/u.test(expected) || !hasObjectClosure(mirror, expected, sparsePatterns)) {
+    fail(`fetched source has incomplete object closure: ${expected}`);
+  }
+  const sourceRef = sourceRefFor(repository, ref);
+  const current = command("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+  if (current.status === 0 && current.stdout !== expected) fail(`source custody conflict at ${sourceRef}: expected ${expected}, observed ${current.stdout}`);
+  if (current.status !== 0) {
+    // No blind overwrite: another producer's publication must agree. Fsync the
+    // reference transaction (and imported objects) before publishing READY.
+    const published = command("git", ["-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync",
+      "--git-dir", mirror, "update-ref", sourceRef, expected, ""]);
+    if (published.status !== 0) {
+      const peer = command("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+      if (peer.status !== 0 || peer.stdout !== expected) fail(`source custody publication failed at ${sourceRef}: ${commandFailureDetail(published)}`);
+    }
+  }
+  const committed = run("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
+  if (committed !== expected) fail(`source custody changed at ${sourceRef}: expected ${expected}, observed ${committed}`);
+  return expected;
+}
+
 function fetchSource(mirror, repository, ref, sparsePatterns) {
   let resolved = ref;
   if (/^[0-9a-f]{4,39}$/u.test(ref)) {
@@ -2375,11 +2467,9 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   const commitPresent = /^[0-9a-f]{40,64}$/u.test(resolved) && command("git", ["--git-dir", mirror, "cat-file", "-e", `${resolved}^{commit}`]).status === 0;
   const negotiation = bases.length && !commitPresent ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
-  run("git", ["--git-dir", mirror, "fetch", ...negotiation, "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--update-shallow", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
   publishSourcePhase({ phase: "verifying", commit: resolved });
-  const commit = run("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceRef}^{commit}`]);
-  if (!hasObjectClosure(mirror, commit, sparsePatterns)) fail(`fetched source has incomplete object closure: ${commit}`);
-  return commit;
+  return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
 }
 
 // Clone uses a temporary source remote, so Git does not create origin's fetch mapping.
@@ -3309,6 +3399,33 @@ function finishOrdinaryRelease(database, requestId, results) {
   return results.map(result => ({ ...result, releaseSettlement: releaseSettlement(database, result.record.id) }));
 }
 
+// Ordinary release is an explicit end-writing request, not lease expiry or archive.
+// A retained dirty/unpublished tree is irreplaceable source, not future allocation.
+// Never infer cessation from the lease: the shared transition independently observes
+// every runtime/native/borrower reference and refuses uncertainty under exact locks.
+function settleReleasedFutureGrowth(database, item, requestId, statePath) {
+  if (item.physicalDisposition?.kind !== "retained" || item.record.leaseExpiresAt !== 0 ||
+      item.record.state !== "repair-required") return item;
+  const plan = recordedCapacity(database, item.record.id);
+  if (!plan || !["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return item;
+  try {
+    const record = recordBy(database, {id:item.record.id});
+    const {binding} = growthBinding(database, record);
+    const disposition = {kind:"retire-future-growth", retainedUse:"source", remainingGrowthBytes:0,
+      growthWriters:"none", writingLease:"retire", observedAt:Date.now(), binding,
+      reason:"Explicit ordinary release ended local writing; retained source and all generated bytes remain untouched",
+      ownerEvidence:`Original ordinary release ${requestId} by registered owner ${record.owner}; fresh locked runtime/unit/native/borrower cessation required; archive/expiry are not evidence`};
+    const retirement = retireGrowthEvidence(database, record, record.owner, JSON.stringify(disposition), statePath);
+    return {...item, record:retirement.record, futureGrowthSettlement:{kind:"retired", requestId,
+      sequence:retirement.sequence, dispositionSha256:retirement.dispositionSha256, sourceDeleted:false}};
+  } catch (error) {
+    return {...item, futureGrowthSettlement:{kind:"retained", requestId, sourceDeleted:false,
+      code:error.code ?? "growth-settlement-unknown", detail:error.message,
+      nextAction:{observe:["agent-workspace","growth-status","--id",item.record.id,"--path",item.record.path,"--json"],
+        settle:["agent-workspace","release","--id",item.record.id,"--preserve-runtime","--json"]}}};
+  }
+}
+
 function releaseCommand(database, args, statePath) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
   if (bool(args, "end-retention")) {
@@ -3348,6 +3465,7 @@ function releaseCommand(database, args, statePath) {
   } catch (error) {
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
   }
+  result = result.map(item => settleReleasedFutureGrowth(database, item, requestId, statePath));
   const settled = finishOrdinaryRelease(database, requestId, result);
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
 }
@@ -3367,7 +3485,7 @@ function pruneReleased(database, now = Date.now(), root) {
     remove.run(row.id);
     pruned += 1;
   }
-  database.exec("DELETE FROM workspace_capacity WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity.workspace_id)");
+  database.exec("DELETE FROM workspace_capacity WHERE workspace_id NOT LIKE 'execution:%' AND NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity.workspace_id)");
   database.exec("DELETE FROM workspace_capacity_measurement WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity_measurement.workspace_id)");
   return pruned;
 }
@@ -3403,6 +3521,12 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     if (retainedParent(database,record.path)) growthError("growth-admission-required", "shared Git parent requires resume-growth admission");
     if (retired !== resume) growthError("growth-admission-required", retired ? "use explicit resume-growth admission" : "growth is not retired");
     if (resume && (record.owner !== required(args, "owner") || digest(row.plan_json) !== required(args, "expected-plan-sha256"))) growthError("stale-growth-disposition", "resume owner or plan changed");
+    if (reducing && oldPlan.intent === "budgeted" && intent.intent === "source-only") {
+      throw Object.assign(new GrowthLifecycleError("capacity-intent-downgrade", "active budget reduction does not prove build/database writers ceased; preserve budgeted intent and reduce only the remaining allowance"), {
+        nextAction: {kind:"preserve-active-intent", intent:"budgeted", newWritesAuthorized:false,
+          detail:"Read a fresh growth-status binding; submit owner-bound reduction with --intent budgeted. Zero-future-growth completed work uses retire-growth."}
+      });
+    }
     const expandingBudget = ["source-only", "budgeted"].includes(oldPlan.intent) && (intent.intent === "budgeted" || (reducing && intent.intent === oldPlan.intent) || (resume && oldPlan.intent === "source-only" && intent.intent === "source-only"));
     if (oldPlan.intent !== "unestimated" && !expandingBudget) growthError("invalid-capacity-transition", resume ? "resume-growth accepts retired source-only to source-only or source-only/budgeted to budgeted admission" : "reprice-capacity accepts unestimated plans or source-only/budgeted to budgeted expansion");
     capacityRequirement(oldPlan, []);
@@ -3494,8 +3618,8 @@ function growthBinding(database, record) {
   return { binding, row, plan, measurement };
 }
 
-function growthSelected(database, args) {
-  const selected=selectedArguments('retire-growth',{id:one(args,'id'),path:one(args,'path')});
+function growthSelected(database, args, commandName = 'retire-growth') {
+  const selected=selectedArguments(commandName,{id:one(args,'id'),path:one(args,'path')});
   if(!selected.ok)throw Object.assign(new GrowthLifecycleError(selected.error.code,selected.error.detail),{nextAction:selected.error.nextAction});
   const record = recordBy(database, { id: required(args, "id") });
   if (record.path !== path.resolve(required(args, "path"))) growthError("growth-identity-changed", "id and path do not name the same workspace");
@@ -3504,7 +3628,7 @@ function growthSelected(database, args) {
 
 function growthStatusCommand(database, args, statePath) {
   assertOnly(args, ["id", "path", "json"]);
-  const selected = growthSelected(database, args);
+  const selected = growthSelected(database, args, "growth-status");
   withWorkspaceLock(database, selected.path, () => {
     const {binding, plan, measurement} = growthBinding(database, recordBy(database, {id:selected.id}));
     const sampleStatus = cachedWorkspaceAllocation(database, selected.id, selected.path, binding.device);
@@ -3765,19 +3889,27 @@ function retireGrowthCommand(database, args, statePath) {
   if (evidenceSha256 !== required(args, "disposition-sha256")) growthError("growth-evidence-changed", "disposition bytes do not match the expected SHA256");
   let disposition;
   try { disposition = JSON.parse(evidence); } catch { growthError("invalid-growth-disposition", "disposition must be JSON"); }
+  const result = retireGrowthEvidence(database, selected, required(args,"owner"), evidence, statePath);
+  print(result, bool(args,"json"));
+}
+
+// Shared locked transition: explicit release and explicit retire use identical CAS,
+// fresh process/unit/native/borrower observations and durable journal semantics.
+function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
+  const evidenceSha256 = digest(evidence), disposition = JSON.parse(evidence);
   const deadline = Date.now()+25_000;
-  duringInspection(deadline,()=>withWorkspaceLock(database, selected.path, () => {
+  return duringInspection(deadline,()=>withWorkspaceLock(database, selected.path, () => {
     const record = recordBy(database, {id:selected.id});
     if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) growthError("invalid-growth-state", `cannot retire growth from ${record.state}`);
-    if (record.owner !== required(args, "owner") || !record.owner || !record.durableSourceCommit) growthError("stale-growth-disposition", "current owning identity and immutable source required");
+    if (record.owner !== owner || !record.owner || !record.durableSourceCommit) growthError("stale-growth-disposition", "current owning identity and immutable source required");
     const initial = growthBinding(database, record);
-    withGrowthBorrowerLocks(database,record,()=>withResourceLock(statePath, `capacity:${initial.binding.device}`, () => {
+    return withGrowthBorrowerLocks(database,record,()=>withResourceLock(statePath, `capacity:${initial.binding.device}`, () => {
       const {binding, plan, row, measurement} = growthBinding(database, record);
       if (!["source-only", "budgeted"].includes(plan.intent)) growthError("invalid-growth-state", "retirement requires an explicitly priced plan");
       if (retainedGrowth(plan)) growthError("growth-already-retired", "growth is already retired; no replay");
       const cached = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!cached.ok) growthError("growth-sample-required", cached.error);
-      const safety = growthSafety(database, record);
+      const safety = terminalSafety(database, record, deadline);
       if (Date.now() >= deadline) growthError("growth-observation-timeout", "retirement observation budget exhausted");
       validateRetirement(disposition, binding, safety);
       const next = {...plan, growthLifecycle:{kind:"retired-future-growth", remainingGrowthBytes:0,
@@ -3801,8 +3933,8 @@ function retireGrowthCommand(database, args, statePath) {
           .run(Date.now(), record.id, record.leaseExpiresAt, record.updatedAt).changes;
         if (relinquished !== 1) growthError("stale-growth-disposition", "writing lease CAS failed");
         database.exec("COMMIT");
-        print({ok:true, kind:"retired-future-growth", sequence:Number(journal.lastInsertRowid),
-          record:creationRecord(database, record.id), dispositionSha256:evidenceSha256, safety}, bool(args,"json"));
+        return {ok:true, kind:"retired-future-growth", sequence:Number(journal.lastInsertRowid),
+          record:creationRecord(database, record.id), dispositionSha256:evidenceSha256, safety};
       } catch (error) { database.exec("ROLLBACK"); throw error; }
     },deadline),deadline);
   }, selected.groupId,deadline));
@@ -3874,7 +4006,9 @@ function measureCapacityCommand(database, args, statePath) {
   const deadline = Date.now() + budgetMs;
   const selected = one(args, "id") !== undefined || one(args, "path") !== undefined ? recordBy(database, selectorFrom(args, 'measure-capacity')).id : null;
   const root = one(args, "root") === undefined ? null : path.resolve(one(args, "root"));
-  return withResourceLock(statePath, "capacity-measurement", () => {
+  // Sampling serializes only the actual checkout, never the entire pool.
+  // A long tree walk must not hold a global lock across unrelated records.
+  {
     const rows = database.prepare(`SELECT w.id,w.path,w.state,w.group_id,c.device_id,c.plan_json FROM workspace w
       JOIN workspace_capacity c ON c.workspace_id=w.id LEFT JOIN workspace_capacity_measurement m ON m.workspace_id=w.id
       WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)
@@ -3895,12 +4029,12 @@ function measureCapacityCommand(database, args, statePath) {
         sample = withWorkspaceLock(database, row.path, () => store(workspaceAllocationSample(row.path, row.device_id, {
           deadline: Math.min(deadline, Date.now() + 60_000), maxEntries: 2_000_000,
           excludedPaths: paths.filter(candidate => candidate.startsWith(`${row.path}${path.sep}`)),
-        })), row.group_id);
+        })), row.group_id, deadline);
       } catch (error) { sample = store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
       results.push({ path: row.path, status: sample.ok ? "measured" : "error", ...sample });
     }
     print(results, bool(args, "json"));
-  });
+  }
 }
 
 function reconcileCommand(database, args, statePath) {
@@ -4095,6 +4229,9 @@ function help() {
   agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
   agent-workspace custody-status --id ID --path PATH --json
   agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
+  agent-workspace thaw-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA [--json]
+  agent-workspace freeze-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA --recipient OWNER --authorization EVIDENCE [--json]
+  agent-workspace writer-run --id ID --path PATH --owner OWNER --expected-head SHA --command-json '["executable","arg"]' --timeout-ms N [--json]
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
                            --owner ID --source-commit HEAD_SHA --authorization RECEIPT [--json]
   agent-workspace adopt --root PATH [--mode writer|review] [--nested-groups] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--execute]
@@ -4110,6 +4247,9 @@ function help() {
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
                             [--budget-ms 25000]
   agent-workspace reduce-retained-headroom --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
+  agent-workspace execution-reserve --root ABS_EMPTY_DIRECTORY --owner OWNER --operation-id UUID --growth-mib N --headroom-gib N --holder-pid PID --json
+  agent-workspace execution-status --id execution:UUID --json
+  agent-workspace execution-release --id execution:UUID --owner OWNER --expected-plan-sha256 SHA256 --json
   agent-workspace growth-status ${selectorSyntax("growth-status")} [--json]
   agent-workspace cache-safety --id ID --path PATH --owner OWNER (--cache RELATIVE|--request FILE --request-sha256 SHA) --json
   agent-workspace cache-plan --id ID --path PATH --owner OWNER --cache RELATIVE --classification node-dependencies|declared-build-cache --operation-id ID --evidence TEXT --json
@@ -4139,9 +4279,13 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
+  if(argv[0]==='execution-cessation') {
+    const args=parseArgs(argv.slice(1));assertOnly(args,['holder']);
+    print(executionCessation(JSON.parse(required(args,'holder'))),true);return;
+  }
   if(argv[0]==='source-job-abandon-permit') {
     if(process.getuid?.()!==0)refuse('abandon-permit-unsafe','root permit reader required');
     const args=parseArgs(argv.slice(1));assertOnly(args,['job-id']);print(readPermit(required(args,'job-id')),true);return;
@@ -4210,6 +4354,10 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const args = parseArgs(rest);
   if (args.positional.length > 0) fail(`unexpected argument: ${args.positional[0]}`);
+  if (commandName === 'maintain') {
+    const selected = selectedArguments(commandName, {id:one(args,'id'),path:one(args,'path')});
+    if (!selected.ok) throw Object.assign(new CliError(selected.error.detail), {code:selected.error.code,nextAction:selected.error.nextAction});
+  }
   if (commandName === "source-status" || commandName === "job-status") {
     assertOnly(args, ["job-id", "json"]);
     const jobId = required(args, "job-id");
@@ -4265,18 +4413,32 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
         : database.prepare("SELECT id FROM workspace WHERE root=?").all(path.resolve(scopedRoot)).map(row => row.id);
       drainGc(statePath, scopedIds);
     }
-    if (commandName === "create") createCommand(database, args, statePath);
+    if (["execution-reserve","execution-status","execution-release"].includes(commandName)) {
+      if(args.positional.length)growthError("execution-invalid-request","no positional arguments accepted");
+      print(executionCommand({database,args:args.named,command:commandName,statePath,
+        lock:(device,action)=>withResourceLock(statePath,`capacity:${device}`,action),
+        reservations:device=>capacityReservations(database,device),requirement:capacityRequirement,
+        observe:holder=>{
+          const result=command("sudo",["-n",process.execPath,new URL(import.meta.url).pathname,"execution-cessation","--holder",JSON.stringify(holder)],{timeout:7000});
+          if(result.status!==0)growthError(result.stderr?.includes("execution-holder-live")?"execution-holder-live":"execution-cessation-unknown",result.stderr?.trim()||"trusted observer failed");
+          try{return JSON.parse(result.stdout);}catch{growthError("execution-cessation-unknown","invalid observer output");}
+        }}),true);
+    }
+    else if (commandName === "create") createCommand(database, args, statePath);
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
     else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
+    else if (commandName === "thaw-source") thawSourceCommand(database,args);
+    else if (commandName === "freeze-source") freezeSourceCommand(database,args);
+    else if (commandName === "writer-run") writerRunCommand(database,args);
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
     else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {
@@ -4327,9 +4489,9 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
-          code: error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError ? error.code : error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed",
+          code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
           ...(error.nextAction === undefined ? {} : {nextAction:error.nextAction}),
         } })}\n`);

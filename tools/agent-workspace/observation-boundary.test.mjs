@@ -13,3 +13,12 @@ for(const command of ['heartbeat','release','cancel-creation','finalize-creation
  const root=mkdtempSync(path.join(tmpdir(),'selector-'));const code=process.exitCode;
  try{assert.throws(()=>main([command,'--id','identity','--path','/fixture','--json'],path.join(root,'db')),e=>e.code==='invalid-workspace-selector'&&e.message.startsWith(command+' accepts exactly one selector'));}finally{process.exitCode=code;rmSync(root,{recursive:true,force:true});}
 });
+
+test('growth-status help and parser both require bound id and path; reprice accepts exactly one',()=>{
+ assert.equal(selectorSyntax('growth-status'),'--id ID --path PATH');
+ for(const values of [{},{id:'identity'},{path:'/fixture'}])assert.equal(selectedArguments('growth-status',values).ok,false);
+ assert.equal(selectedArguments('growth-status',{id:'identity',path:'/fixture'}).ok,true);
+ assert.equal(selectorSyntax('reprice-capacity'),'(--id ID|--path PATH)');
+ assert.equal(selectedArguments('reprice-capacity',{id:'identity',path:'/fixture'}).ok,false);
+ for(const values of [{id:'identity'},{path:'/fixture'}])assert.equal(selectedArguments('reprice-capacity',values).ok,true);
+});

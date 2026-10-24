@@ -105,7 +105,7 @@ function freedReceipt(entries,stageRoot) {
 export function generatedStagingRoots(request,stateDirectory) {
   return request.paths.map(relative=>path.join(stateDirectory,'generated-retirement',hash([request.operationId,relative])));
 }
-export function referenceSummaries(values) {const keys=new Set(['kind','resourceClass','type','id','pid','startTime','startTicks','uid','state','domainId','workspaceId','threadId','conversationId','assignmentId','jobId','operationId','unit','name','containerId','root','path','roots','cwd','field','mode','fd','access','owner','groupId']);return values.map(value=>Object.fromEntries(Object.entries(value).filter(([key])=>keys.has(key))));}
+export function referenceSummaries(values) {const keys=new Set(['kind','resourceClass','type','id','pid','startTime','startTicks','uid','state','domainId','workspaceId','threadId','conversationId','assignmentId','jobId','operationId','unit','name','containerId','root','path','roots','cwd','field','mode','fd','access','owner','groupId','recordId','workspacePath','objectDirectory','commonDirectory']);return values.map(value=>Object.fromEntries(Object.entries(value).filter(([key])=>keys.has(key))));}
 function authorizeBinding(context,request) {
   const declarations=context.declarations();
   if(!Array.isArray(declarations)||request.paths.some(relative=>!declarations.some(d=>d===relative||typeof d==='string'&&d.startsWith('**/')&&relative.split('/').at(-1)===d.slice(3)))) refuse('unsafe-generated-path','selected output is no longer declared');
