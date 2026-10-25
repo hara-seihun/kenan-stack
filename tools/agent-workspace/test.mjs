@@ -22,6 +22,15 @@ let testIndex = 0;
 const test = (name, body) => nodeTest(name, { skip: testIndex++ % shardCount !== shardIndex }, body);
 const entry = new URL("./main", import.meta.url).pathname;
 
+// These historical tests compare the numerical ledger projection. The separate
+// automatic-growth suite validates the added observation diagnostics in full.
+function capacityLiabilities(...args) {
+  const {growthRepricing, ...liabilities} = workspaceTesting.capacityReservations(...args);
+  assert.ok(Array.isArray(growthRepricing));
+  return liabilities;
+}
+
+
 function preparingSource(args, output, previous) {
   if (args[0] !== "create" || !output.startsWith("{")) return null;
   const receipt = JSON.parse(output);
@@ -908,11 +917,11 @@ test("filesystem headroom is shared across completed workspaces while pending co
     const device = String(statSync(f.workspaces).dev);
     const plan = { intent: "unestimated", estimate: "unknown", constructionBytes: 30 * GiB, growthBytes: 0, headroomBytes: 0 };
     for (const record of records) db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(plan), record.id);
-    let reservations = workspaceTesting.capacityReservations(db, device);
+    let reservations = capacityLiabilities(db, device);
     assert.deepEqual(reservations, { priced: [], headroomBytes: 30 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 30 * GiB);
     db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(records[0].id);
-    reservations = workspaceTesting.capacityReservations(db, device);
+    reservations = capacityLiabilities(db, device);
     const constructionSpent = 0;
     assert.deepEqual(reservations, { priced: [30 * GiB - constructionSpent], headroomBytes: 30 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 60 * GiB - constructionSpent);
@@ -920,11 +929,11 @@ test("filesystem headroom is shared across completed workspaces while pending co
     const budgeted = { intent: "budgeted", estimate: "whole-tree-upper-bound", constructionBytes: 5 * GiB, growthBytes: 2 * GiB, headroomBytes: 40 * GiB };
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(budgeted), records[1].id);
     db.prepare("UPDATE workspace SET state='repair-required', lease_expires_at=0 WHERE id=?").run(records[1].id);
-    reservations = workspaceTesting.capacityReservations(db, device);
+    reservations = capacityLiabilities(db, device);
     assert.deepEqual(reservations, { priced: [2 * GiB], headroomBytes: 40 * GiB, unpricedDormant: 0, sourceImports: [] });
     assert.equal(workspaceTesting.capacityRequirement(plan, reservations.priced, reservations.headroomBytes), 42 * GiB);
     db.prepare("UPDATE workspace SET state='released'").run();
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     db.close();
   } finally { f.close(); }
 });
@@ -1681,48 +1690,48 @@ test("budgeted source creation shares existing objects and records immutable spa
     const device = String(statSync(f.workspaces).dev);
     const fullPlan = { intent: "unestimated", estimate: "unknown", constructionBytes: 30 * 1024 ** 3, growthBytes: 0, headroomBytes: 0 };
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(fullPlan), created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 30 * 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 30 * 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(created.capacity), created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace SET lease_expires_at=0 WHERE id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("UPDATE workspace SET state='creating', lease_expires_at=0 WHERE id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [created.capacity.growthBytes + created.capacity.constructionBytes], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [created.capacity.growthBytes + created.capacity.constructionBytes], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     db.prepare("DELETE FROM workspace_capacity WHERE workspace_id=?").run(created.id);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device, created.path), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device, created.path), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     // An old dormant reservation is priced again under the filesystem fence before resuming.
     const resumed = JSON.parse(run(args, f.env));
     assert.equal(resumed.id, created.id);
     assert.equal(resumed.capacity.sourceCommit, created.sourceCommit);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const beforeGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device);
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(70 * 1024 ** 2));
     const measured = JSON.parse(run(["measure-capacity", "--id", created.id, "--json"], f.env)).results;
     assert.equal(measured[0].status, "measured");
     const partialGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device).bytes - beforeGrowth.bytes - 64 * 1024 ** 2;
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
-    const unavailable = workspaceTesting.capacityReservations(db, device, undefined, () => ({ ok: false, error: "unreadable fixture" }));
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    const unavailable = capacityLiabilities(db, device, undefined, () => ({ ok: false, error: "unreadable fixture" }));
     assert.deepEqual(unavailable, { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [],
       measurementFailures: [{ path: created.path, error: "unreadable fixture", reservedBytes: 8 * 1024 ** 2 }] });
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(80 * 1024 ** 2));
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const cache = JSON.parse(db.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(created.id).measurement_json);
     db.prepare("UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?").run(JSON.stringify({ ...cache, startedAt: Date.now() - 16 * 60_000 }), created.id);
     assert.equal(workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, device).ok, false);
-    assert.equal(workspaceTesting.capacityReservations(db, device).priced[0], 8 * 1024 ** 2);
+    assert.equal(capacityLiabilities(db, device).priced[0], 8 * 1024 ** 2);
     db.prepare("UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?").run(JSON.stringify({ ...cache, inode: "not-the-root" }), created.id);
     assert.match(workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, device).error, /identity changed/);
     db.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(created.id);
     assert.match(workspaceTesting.cachedWorkspaceAllocation(db, created.id, created.path, device).error, /cache missing/);
     rmSync(path.join(created.path, "generated.bin"));
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     // End the real completed allocation through its ordinary lifecycle. Faking
     // a pending row can race a durable checkout's terminal receipt writer.
     run(["release", "--id", created.id], f.env);
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 0, sourceImports: [] });
     db.close();
   } finally { f.close(); }
 });
@@ -1859,13 +1868,13 @@ test("an active legacy creator refuses unknown capacity while a dormant one must
     const lock = path.join(f.root, "state", "locks", createHash("sha256").update(`checkout:${created.path}`).digest("hex"));
     child = spawn("flock", ["--exclusive", lock, process.execPath, "-e", "process.stdout.write('ready');process.stdin.resume()"], { stdio: ["pipe", "pipe", "pipe"] });
     await new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("error", reject); });
-    assert.throws(() => workspaceTesting.capacityReservations(db, device), /estimate unknown.*active legacy/);
+    assert.throws(() => capacityLiabilities(db, device), /estimate unknown.*active legacy/);
     assert.throws(() => run([...base, "--name", "other"], f.env), /estimate unknown.*active legacy/);
     const closed = new Promise(resolve => child.once("close", resolve));
     child.stdin.end();
     await closed;
     child = undefined;
-    assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
+    assert.deepEqual(capacityLiabilities(db, device), { priced: [], headroomBytes: 0, unpricedDormant: 1, sourceImports: [] });
     assert.equal(JSON.parse(run([...base, "--name", "other"], f.env)).capacity.admission.unpricedDormant, 1);
     assert.throws(() => run([...base.map(arg => arg === "0" ? "1000000" : arg), "--name", "legacy"], f.env), /GiB is required/);
     assert.equal(db.prepare("SELECT count(*) AS count FROM workspace_capacity WHERE workspace_id=?").get(created.id).count, 0);
