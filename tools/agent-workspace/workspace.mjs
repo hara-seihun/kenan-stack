@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
 import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
 import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
@@ -1516,6 +1517,14 @@ function thawSourceCommand(database,args) {
     if(result.status!==0) fail("snapshot-rollback-unaccepted: "+(result.stderr||result.error?.message));
     rmSync(path.join(input.path,".git","pi-frozen-handoff.json"));
     print({ok:true,binding:input,rollback:JSON.parse(result.stdout),ownerUnchanged:true},true);
+  });
+}
+
+function sourceHandoffCommand(database,args) {
+  assertOnly(args,["id","path","owner","expected-head","recipient","remote","branch","json"]);
+  const request={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head"),recipient:required(args,"recipient"),remote:required(args,"remote"),branch:required(args,"branch")};
+  return withWorkspaceLock(database,request.path,()=>{
+    print(sourceHandoff(recordBy(database,{id:request.id}),request,registryPaths.get(database),database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row=>row.path)),true);
   });
 }
 
@@ -4702,6 +4711,7 @@ function help() {
   agent-workspace custody-status --id ID --path PATH --json
   agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
   agent-workspace thaw-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA [--json]
+  agent-workspace source-handoff --id ID --path PATH --owner OWNER --expected-head SHA --recipient OWNER --remote origin --branch BRANCH --json
   agent-workspace freeze-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA --recipient OWNER --authorization EVIDENCE [--json]
   agent-workspace writer-run --id ID --path PATH --owner OWNER --expected-head SHA --command-json '["executable","arg"]' --timeout-ms N [--json]
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
@@ -4889,7 +4899,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["capacity-status", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4913,6 +4923,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
     else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
     else if (commandName === "thaw-source") thawSourceCommand(database,args);
+    else if (commandName === "source-handoff") sourceHandoffCommand(database,args);
     else if (commandName === "freeze-source") freezeSourceCommand(database,args);
     else if (commandName === "writer-run") writerRunCommand(database,args);
     else if (commandName === "reassign") reassignCommand(database, args);
@@ -4969,7 +4980,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
@@ -4978,6 +4989,6 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
       }
     }
     process.stderr.write(`agent-workspace: ${error instanceof Error ? error.message : String(error)}\n${error instanceof ResourceBusyError && error.detail ? `agent-workspace: lock detail ${JSON.stringify(error.detail)}\n` : ""}`);
-    process.exit(error instanceof ResourceBusyError ? 75 : (error instanceof CliError || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) ? 2 : 1);
+    process.exit(error instanceof ResourceBusyError ? 75 : (error instanceof CliError || error instanceof SourceHandoffError || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) ? 2 : 1);
   }
 }

@@ -797,3 +797,29 @@ Its runtime observation now distinguishes stable read-only process references
 from writable descriptors under the root. Writable or unknown descriptors and
 uncovered native references continue to refuse retirement. This distinction
 never changes physical deletion, generated-cache or source-custody guards.
+
+## Durable pushed source handoff
+
+Do not advertise a child-owned checkout as surviving the child's completion or
+archive. A pushed branch or a verified bundle is the source handoff contract;
+a checkout path without transferred custody is disposable. Before reporting done,
+produce a native receipt for a clean, exact pushed branch:
+
+```sh
+agent-workspace source-handoff --id ID --path PATH --owner CHILD_ID \
+  --expected-head FULL_SHA --recipient PARENT_ID --remote origin \
+  --branch agent/your-source --json
+```
+
+This read-only Git check observes the exact remote branch tip, checks the source
+again under its checkout lock, and atomically publishes a hash-bound receipt and
+Git tree manifest outside the checkout, beside the workspace registry. It does
+not push, freeze, extend a lease, transfer ownership or retain the child tree.
+The receipt names the recipient, exact commit and tree, and explicitly warns that
+the child checkout can disappear after archive. Pass the receipt path and its
+SHA-256 in the done report, not a promise that the child checkout remains live.
+The recipient creates its own admitted checkout using its authorized remote route
+and verifies the exact commit. The manifest contains Git object identities, not
+SHA-256 hashes of individual file bytes. URLs and credentials are not recorded.
+The existing `freeze-source` atomic immutable recipient transfer is unchanged;
+its accepted custody guarantee is distinct from an informally frozen Git commit.
