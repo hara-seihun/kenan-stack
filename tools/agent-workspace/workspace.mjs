@@ -47,6 +47,7 @@ import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourc
 import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { currentStackQueueReferences } from "./cache-queue.mjs";
+import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences } from "./owner-liveness.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
 import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction, validateRetainedHeadroom } from "./growth-lifecycle.mjs";
@@ -3452,6 +3453,14 @@ function releaseCommand(database, args, statePath) {
     print(results.length === 1 ? results[0] : results, bool(args,"json"));
     return;
   }
+  const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth);
+  print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
+}
+
+// The ordinary release transition shared by an owner's explicit release and by the
+// owner-liveness release of an authentically ended native owner. Only the future-growth
+// settlement (and its owner evidence) differs; every safety observation is identical.
+function ordinaryRelease(database, records, args, statePath, settle) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
   const deadline=Date.now()+35_000;
@@ -3472,9 +3481,155 @@ function releaseCommand(database, args, statePath) {
   } catch (error) {
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
   }
-  result = result.map(item => settleReleasedFutureGrowth(database, item, requestId, statePath));
-  const settled = finishOrdinaryRelease(database, requestId, result);
-  print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
+  result = result.map(item => settle(database, item, requestId, statePath));
+  return finishOrdinaryRelease(database, requestId, result);
+}
+
+// Owner-liveness release: a registered owner that is an authentically stopped or archived
+// Kenan Stack native worker can never declare its own ordinary release, so its checkouts kept
+// their reservations forever. This performs exactly that ordinary --preserve-runtime release on
+// the ended owner's behalf. The native verdict replaces only the owner's end-of-writing
+// declaration; it is never evidence that nothing runs in the checkout. The shared transition
+// still observes running tool calls, live workers naming the path, processes, units,
+// containers, threads and Git borrowers; dirty and unpublished source is retained, and only its
+// future growth is settled through the shared locked retire-growth transition.
+const ENDED_OWNER_STATES = ["active", "referenced", "blocked", "repair-required"];
+function ownerLivenessObservation(owners, deadline) {
+  if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS !== undefined) {
+    let fixture = JSON.parse(readFileSync(process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS, "utf8"));
+    if (Array.isArray(fixture.sequence)) {
+      const [next, ...rest] = fixture.sequence;
+      writeFileSync(process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS, JSON.stringify({ sequence: rest.length ? rest : [next] }));
+      fixture = next;
+    }
+    return { errors: [], agents: [], wakes: [], observations: [], ...fixture, owners: [...new Set(owners.filter(owner => OWNER_AGENT_ID.test(owner)))].sort(), observedAt: Date.now() };
+  }
+  return observeOwnerLiveness(owners, { deadline });
+}
+function endedOwnerEvidence(verdict, requestId) {
+  const rows = verdict.agents.map(agent => `${agent.channel}:${agent.state}${agent.archived ? "+archived" : ""}`).join(",");
+  return `Owner-liveness release ${requestId}: registered native owner ${verdict.owner} is ${verdict.code} (${rows}) in a complete observation of every serving Kenan Stack channel, with no pending wake owned by or held for it; this ends the owner's writing intent only. Fresh locked runtime/unit/native/borrower cessation is still required; archive/stop are not cessation evidence`;
+}
+function settleEndedOwnerFutureGrowth(verdicts) {
+  return (database, item, requestId, statePath) => {
+    if (item.physicalDisposition?.kind !== "retained") return item;
+    const retained = (code, detail) => ({ ...item, futureGrowthSettlement: { kind: "retained", requestId, sourceDeleted: false, code, detail,
+      nextAction: { observe: ["agent-workspace", "growth-status", "--id", item.record.id, "--path", item.record.path, "--json"],
+        settle: ["agent-workspace", "release-ended-owners", "--id", item.record.id, "--execute", "--json"] } } });
+    // Live native intent and uncertain observations stay charged; Git/unit references get the
+    // retire-growth transition's own fresh terminal writer observation, which refuses on any writer.
+    if (item.inspection?.currentStackQueueProtected || item.inspection?.classification === "blocked") return retained("owner-liveness-protected", item.inspection.reason);
+    const plan = recordedCapacity(database, item.record.id);
+    if (!plan || !["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return item;
+    try {
+      const record = recordBy(database, { id: item.record.id });
+      const verdict = verdicts.get(record.id);
+      if (!verdict || verdict.kind !== "ended" || verdict.owner !== record.owner) return retained("owner-liveness-changed", "owner changed during release");
+      if (record.leaseExpiresAt !== 0 || !ENDED_OWNER_STATES.includes(record.state)) return retained("owner-liveness-state", `state ${record.state}`);
+      const { binding } = growthBinding(database, record);
+      const disposition = { kind: "retire-future-growth", retainedUse: "source", remainingGrowthBytes: 0,
+        growthWriters: "none", writingLease: "retire", observedAt: Date.now(), binding,
+        reason: "Native owner ended; owner-liveness release retained source and all generated bytes untouched",
+        ownerEvidence: endedOwnerEvidence(verdict, requestId) };
+      const retirement = retireGrowthEvidence(database, record, record.owner, JSON.stringify(disposition), statePath);
+      return { ...item, record: retirement.record, futureGrowthSettlement: { kind: "retired", basis: "native-owner-ended", requestId,
+        sequence: retirement.sequence, dispositionSha256: retirement.dispositionSha256, sourceDeleted: false } };
+    } catch (error) {
+      return retained(error.code ?? "growth-settlement-unknown", error.message);
+    }
+  };
+}
+function endedOwnerSummary(record) {
+  return { id: record.id, path: record.path, owner: record.owner, state: record.state, groupId: record.groupId };
+}
+function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
+  if (group.some(record => !ENDED_OWNER_STATES.includes(record.state) || !existsSync(record.path))) return { code: "state-not-eligible" };
+  const unended = verdicts.find(verdict => verdict.kind !== "ended");
+  if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
+  const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]));
+  if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
+  if (group.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database, candidate.path)))
+    return { code: "retained-custody" };
+  if (Date.now() >= deadline) return { code: "deferred" };
+  return null;
+}
+function releaseEndedOwnerGroup(database, group, observation, options) {
+  const verdicts = group.map(record => classifyOwner(record.owner, observation));
+  const refusal = endedOwnerRefusal(database, group, verdicts, observation, options.deadline);
+  if (refusal) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", ...refusal }));
+  if (!options.execute) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "would-release-ended-owner" }));
+  return withWorkspaceLock(database, group[0].path, () => {
+    // Fresh native readback and record CAS under the checkout lock; no earlier verdict is reused.
+    const current = recordsInGroup(database, recordBy(database, { id: group[0].id }));
+    const fresh = ownerLivenessObservation(current.map(record => record.owner), options.deadline);
+    const freshVerdicts = current.map(record => classifyOwner(record.owner, fresh));
+    const changed = current.length !== group.length || current.some(record => {
+      const before = group.find(candidate => candidate.id === record.id);
+      return !before || before.owner !== record.owner || before.path !== record.path || before.sourceCommit !== record.sourceCommit;
+    });
+    const freshRefusal = changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, current, freshVerdicts, fresh, options.deadline);
+    if (freshRefusal) return current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: freshVerdicts[index], action: "none", ...freshRefusal }));
+    const byId = new Map(current.map((record, index) => [record.id, freshVerdicts[index]]));
+    const releaseArgs = { positional: [], named: new Map([["preserve-runtime", ["true"]]]) };
+    const settled = ordinaryRelease(database, current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId));
+    database.exec(`CREATE TABLE IF NOT EXISTS workspace_owner_liveness_release (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, request_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
+      owner TEXT NOT NULL, verdict_json TEXT NOT NULL, observation_json TEXT NOT NULL, result_json TEXT NOT NULL)`);
+    const insert = database.prepare("INSERT INTO workspace_owner_liveness_release(workspace_id,request_id,occurred_at,owner,verdict_json,observation_json,result_json) VALUES(?,?,?,?,?,?,?)");
+    return settled.map(item => {
+      const verdict = byId.get(item.record.id);
+      const requestId = item.releaseSettlement?.requestId ?? "unknown";
+      insert.run(item.record.id, requestId, Date.now(), verdict.owner, JSON.stringify(verdict),
+        JSON.stringify({ observations: fresh.observations, observedAt: fresh.observedAt }), JSON.stringify({ action: item.action, physicalDisposition: item.physicalDisposition, futureGrowthSettlement: item.futureGrowthSettlement ?? null, inspection: { classification: item.inspection?.classification, reason: item.inspection?.reason } }));
+      return { ...item, ownerLiveness: verdict };
+    });
+  }, group[0].groupId, options.deadline);
+}
+function releaseEndedOwnersCommand(database, args, statePath) {
+  assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "max-records", "after", "json"]);
+  const budget = numberFlag(args, "budget-ms", 30_000), maxRecords = numberFlag(args, "max-records", 16);
+  if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 40_000) fail("--budget-ms must be between 1000 and 40000");
+  if (!Number.isSafeInteger(maxRecords) || maxRecords < 1 || maxRecords > 64) fail("--max-records must be between 1 and 64");
+  const execute = bool(args, "execute"), deadline = Date.now() + budget;
+  const targeted = one(args, "id") !== undefined || one(args, "path") !== undefined;
+  if (targeted && one(args, "root") !== undefined) fail("release-ended-owners accepts --root or a single --id/--path selector");
+  let records = targeted ? [recordBy(database, selectorFrom(args, "release-ended-owners"))] : listRecords(database, one(args, "root"));
+  records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && OWNER_AGENT_ID.test(record.owner) && existsSync(record.path));
+  const scope = `owner-liveness:${one(args, "root") === undefined ? "*" : path.resolve(one(args, "root"))}`;
+  database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
+  const saved = execute && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope = ?").get(scope)?.after_id : undefined;
+  const after = one(args, "after", saved ?? "start");
+  if (after !== "start") {
+    const anchor = database.prepare("SELECT root, path FROM workspace WHERE id = ?").get(after);
+    if (anchor) {
+      const pivot = records.findIndex(record => record.root > anchor.root || (record.root === anchor.root && record.path > anchor.path));
+      if (pivot >= 0) records = [...records.slice(pivot), ...records.slice(0, pivot)];
+    }
+  }
+  const page = records.slice(0, maxRecords);
+  const members = page.flatMap(record => recordsInGroup(database, record));
+  const observation = ownerLivenessObservation(members.map(record => record.owner), deadline);
+  const results = [], visited = new Set();
+  let last;
+  for (const record of page) {
+    if (visited.has(record.id)) continue;
+    const group = recordsInGroup(database, record);
+    for (const member of group) visited.add(member.id);
+    try {
+      results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath }));
+    } catch (error) {
+      results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : "owner-liveness-release-failed", detail: error.message })));
+    }
+    last = record.id;
+    if (execute && !targeted && results.at(-1)?.code !== "deferred") database.prepare(
+      "INSERT INTO reconciliation_cursor (scope, after_id) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET after_id = excluded.after_id").run(scope, last);
+  }
+  const counts = {};
+  for (const item of results) counts[item.action === "none" ? item.code : item.action] = (counts[item.action === "none" ? item.code : item.action] ?? 0) + 1;
+  print({ ok: observation.errors.length === 0, kind: "owner-liveness-release", execute, candidates: records.length, examined: results.length, counts,
+    observation: { errors: observation.errors, observations: observation.observations, observedAt: observation.observedAt },
+    nextAfter: page.length < records.length ? last ?? null : null, results }, true);
+  if (observation.errors.length) process.exitCode = 75;
 }
 
 // A released workspace whose tree is gone is history, not state. Keep a month
@@ -4278,6 +4433,8 @@ function help() {
   agent-workspace release ${selectorSyntax("release")} --end-retention --owner OWNER --expected-plan-sha256 SHA [--json]
   agent-workspace reconcile [--root PATH] [--execute] [--reap-expired] [--preserve-runtime]
                             [--budget-ms 20000] [--max-groups 32] [--after ID|start]
+  agent-workspace release-ended-owners [--root PATH | ${selectorSyntax("release-ended-owners")}] [--execute]
+                            [--budget-ms 30000] [--max-records 16] [--after ID|start] [--json]
   agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--json]
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
@@ -4487,6 +4644,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
       }, record.groupId);
     }
     else if (commandName === "reconcile") reconcileCommand(database, args, statePath);
+    else if (commandName === "release-ended-owners") releaseEndedOwnersCommand(database, args, statePath);
     else if (commandName === "measure-capacity") measureCapacityCommand(database, args, statePath);
     else if (commandName === "growth-status") growthStatusCommand(database, args, statePath);
     else if (commandName === "cache-safety") cacheSafetyCommand(database,args,statePath);
