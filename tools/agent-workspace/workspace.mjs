@@ -3691,7 +3691,9 @@ function releaseEndedOwnersCommand(database, args, statePath) {
       "INSERT INTO reconciliation_cursor (scope, after_id) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET after_id = excluded.after_id").run(scope, last);
   }
   const counts = {};
-  for (const item of results) counts[item.action === "none" ? item.code : item.action] = (counts[item.action === "none" ? item.code : item.action] ?? 0) + 1;
+  // An executed release that retained the tree reports action "none" without a refusal code.
+  const outcome = item => item.action !== "none" ? item.action : item.code ?? `release-retained:${item.inspection?.classification ?? "unknown"}`;
+  for (const item of results) counts[outcome(item)] = (counts[outcome(item)] ?? 0) + 1;
   print({ ok: observation.errors.length === 0, kind: "owner-liveness-release", execute, candidates: records.length, examined: results.length, counts,
     observation: { errors: observation.errors, observations: observation.observations, observedAt: observation.observedAt },
     nextAfter: last !== undefined && ordered.indexOf(last) < ordered.length - 1 && (explicitWalk ? page.length < unwrapped : page.length < records.length) ? last : null, results }, true);

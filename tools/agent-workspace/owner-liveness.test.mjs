@@ -117,6 +117,7 @@ test('ended owner with unpublished commits and dirty files keeps every source by
  fs.writeFileSync(path.join(f.source,'proof'),'unique');f.git('-C',f.source,'commit','-am','unique');const head=f.git('-C',f.source,'rev-parse','HEAD');
  fs.writeFileSync(path.join(f.source,'dirty-untracked'),'uncommitted work');
  const r=f.release('--execute'),item=r.results[0];
+ assert.deepEqual(r.counts,{'release-retained:repair-required':1});
  assert.equal(item.physicalDisposition.kind,'retained',JSON.stringify(item));
  assert.equal(item.futureGrowthSettlement.kind,'retired',JSON.stringify(item));assert.equal(item.futureGrowthSettlement.basis,'native-owner-ended');
  assert.equal(f.git('-C',f.source,'rev-parse','HEAD'),head);assert.equal(fs.readFileSync(path.join(f.source,'dirty-untracked'),'utf8'),'uncommitted work');
