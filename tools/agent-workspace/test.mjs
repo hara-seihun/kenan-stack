@@ -10,6 +10,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test as nodeTest } from "node:test";
 import { main, workspaceTesting } from "./workspace.mjs";
+import { CensusFailure, systemdShowTimeoutMs } from "./safety-census.mjs";
 
 const [shardIndex = 0, shardCount = 1] = (process.env.AGENT_WORKSPACE_TEST_SHARD ?? "0/1")
   .split("/").map(Number);
@@ -2236,6 +2237,23 @@ test("systemd discovery keeps multiline command descriptions out of unit operand
     assert.deepEqual(references.map(({ id }) => id), ["worker.service", "session-12.scope"]);
     assert.equal(workspaceTesting.systemdReferences(`${workspace}-unrelated`, snapshot).references.length, 0);
   }
+});
+
+test("a systemd timeout is a typed census-incomplete result that blocks cleanup, and show time scales with a large unit list", () => {
+  for (const phase of ["list-units", "show"]) {
+    const unitIds = Array.from({ length: 4000 }, (_, index) => `transient-${index}.service`);
+    const timeouts = [];
+    const snapshot = workspaceTesting.systemdManagerSnapshot("user", (_executable, args, options) => {
+      timeouts.push(options.timeout);
+      if (args.includes(phase)) throw new CensusFailure(`workspace inspection timed out: systemctl ${phase}`);
+      return { status: 0, stderr: "", stdout: JSON.stringify(unitIds.map((unit) => ({ unit }))) };
+    });
+    assert.match(snapshot.error, /^census-incomplete: .*timed out/u);
+    assert.deepEqual(snapshot.units, []);
+    assert.equal(workspaceTesting.systemdReferences("/srv/workspaces/agent-one", snapshot).error, snapshot.error);
+    if (phase === "show") assert.equal(timeouts[1], systemdShowTimeoutMs(4000));
+  }
+  assert.ok(systemdShowTimeoutMs(4000) > systemdShowTimeoutMs(10));
 });
 
 test("systemd malformed discovery refuses safety instead of omitting units", () => {

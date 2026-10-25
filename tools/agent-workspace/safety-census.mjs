@@ -235,12 +235,28 @@ export function parseSystemdUnits(output, manager) {
   });
 }
 
+// A host with many transient units can make systemctl slow. A timeout there leaves the systemd census incomplete, which
+// is a typed "census-incomplete" result: the caller classifies the checkout as blocked and keeps custody, rather than the
+// whole release failing hard. list-units may use the whole remaining budget; show scales with the number of units.
+const SYSTEMD_LIST_TIMEOUT_MS = 120_000;
+const SYSTEMD_SHOW_BASE_MS = 20_000;
+const SYSTEMD_SHOW_PER_UNIT_MS = 50;
+export const systemdShowTimeoutMs = (unitCount) => SYSTEMD_SHOW_BASE_MS + SYSTEMD_SHOW_PER_UNIT_MS * unitCount;
+
 export function systemdManagerSnapshot(manager, execute = run) {
+  try { return systemdManagerObservation(manager, execute); }
+  catch (error) {
+    if (error instanceof CensusFailure) return { units: [], available: true, error: `census-incomplete: ${error.message}` };
+    throw error;
+  }
+}
+
+function systemdManagerObservation(manager, execute) {
   const managerArgs = manager === "user" ? ["--user"] : [];
   const listed = execute("systemctl", [
     ...managerArgs, "list-units", "--all", "--state=active,activating,reloading,deactivating",
     "--type=service", "--type=scope", "--output=json", "--no-pager",
-  ], { timeout: 20_000 });
+  ], { timeout: SYSTEMD_LIST_TIMEOUT_MS });
   if (listed.error?.code === "ENOENT" || /not been booted with systemd|failed to connect to (?:user scope )?bus|(?:DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR) not defined/iu.test(listed.stderr)) {
     return { units: [], available: false };
   }
@@ -265,7 +281,7 @@ export function systemdManagerSnapshot(manager, execute = run) {
     ...managerArgs, "show", "--property=Id", "--property=ActiveState", "--property=WorkingDirectory",
     "--property=ExecStart", "--property=MainPID", "--property=SubState", "--property=ControlPID",
     "--property=ControlGroup", "--property=ExecStop", "--property=ExecStopPost", "--property=TriggeredBy", "--", ...unitIds,
-  ], { timeout: 20_000 });
+  ], { timeout: systemdShowTimeoutMs(unitIds.length) });
   if (shown.status !== 0) return { units: [], available: true, error: shown.stderr || shown.stdout || "systemctl show failed" };
   return { units: parseSystemdUnits(shown.stdout, manager), available: true };
 }
