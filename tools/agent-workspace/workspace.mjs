@@ -3448,6 +3448,9 @@ function settleReleasedFutureGrowth(database, item, requestId, statePath) {
   }
 }
 
+// A release that reports a blocked outcome did not release: callers must see a nonzero status.
+const BLOCKED_RELEASE_EXIT = 2;
+
 function releaseCommand(database, args, statePath) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
   if (bool(args, "end-retention")) {
@@ -3465,10 +3468,12 @@ function releaseCommand(database, args, statePath) {
   if (records.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database,candidate.path))) {
     const results = records.map(retainedCustodyResult);
     print(results.length === 1 ? results[0] : results, bool(args,"json"));
+    process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
   }
   const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth);
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
+  if (settled.some(item => item.inspection?.classification === "blocked")) process.exitCode = BLOCKED_RELEASE_EXIT;
 }
 
 // The ordinary release transition shared by an owner's explicit release and by the
