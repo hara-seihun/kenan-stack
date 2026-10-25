@@ -124,7 +124,7 @@ test('ended owner with unpublished commits and dirty files keeps every source by
  assert.equal(f.plan().growthLifecycle.remainingGrowthBytes,0);assert.equal(f.plan().headroomBytes,before.headroomBytes);
  const journal=f.db.prepare('SELECT disposition_json FROM workspace_growth_retirement WHERE workspace_id=?').get(f.record.id);
  assert.match(JSON.parse(journal.disposition_json).ownerEvidence,/Owner-liveness release .* archive\/stop are not cessation evidence/);
- const again=f.release('--execute');assert.equal(again.results[0].code,'retained-custody');assert.equal(f.git('-C',f.source,'rev-parse','HEAD'),head);
+ const again=f.release('--execute');assert.equal(again.results[0].error.code,'retention-release-protected');assert.equal(f.git('-C',f.source,'rev-parse','HEAD'),head);
 }));
 
 for(const [name,owner,observation,code] of [
@@ -187,4 +187,25 @@ test('an explicit --after walk visits every candidate once and ends',()=>fixture
  const seen=[];let after='start';
  for(let i=0;i<5;i++){const r=f.run(['release-ended-owners','--root',f.root,'--max-records','1','--after',after,'--json']);seen.push(...r.results.map(x=>x.record.id));if(!r.nextAfter)break;after=r.nextAfter;}
  assert.equal(seen.length,2);assert.equal(new Set(seen).size,2);
+}));
+
+for(const owner of [ARCHIVED, 'retired-legacy-owner']) test('missing retained path releases without growth admission for '+owner,()=>fixture(owner,f=>{
+ f.observe(owner===ARCHIVED?ended(owner):{agents:[],wakes:[]});f.priced();
+ f.db.exec('CREATE TABLE workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');
+ f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());
+ fs.rmSync(f.source,{recursive:true});
+ const r=f.release('--execute');assert.equal(r.results[0].action,'released',JSON.stringify(r));
+ assert.equal(f.row().state,'released');assert.equal(f.row().lease_expires_at,0);
+ assert.ok(f.db.prepare('SELECT * FROM workspace_retention_release WHERE workspace_id=?').get(f.record.id));
+}));
+test('ended retained published source can end retention without resume-growth',()=>fixture(ARCHIVED,f=>{
+ f.observe(ended(ARCHIVED));f.priced();
+ f.db.exec('CREATE TABLE workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');
+ f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());
+ const r=f.release('--execute');assert.equal(r.results[0].action,'released',JSON.stringify(r));assert.equal(fs.existsSync(f.source),false);
+}));
+for(const mode of ['live','observation-error','wake'])test('missing path preserves '+mode,()=>fixture(LIVE,f=>{
+ f.priced();fs.rmSync(f.source,{recursive:true});
+ f.observe(mode==='live'?{agents:[{id:LIVE,state:'running',archived:false}],wakes:[]}:mode==='observation-error'?{errors:['no grant']}:ended(LIVE,{wakes:[{id:'protect',agentId:'manager:converge',held:true,text:f.source}]}));
+ const r=f.release('--execute');assert.equal(r.results[0].action,'none',JSON.stringify(r));assert.equal(f.row().state,'active');
 }));

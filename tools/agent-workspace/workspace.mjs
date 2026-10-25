@@ -3271,7 +3271,7 @@ function retainedCustodyResult(record) {
   return {record, action:"none", inspection:{classification:"blocked", reason:"explicit retained source/runtime custody; resume-growth admission required before cleanup or writing", processes:[], containers:[], systemdUnits:[]}};
 }
 
-function terminalRetentionRelease(database, selected, args, statePath) {
+function terminalRetentionRelease(database, selected, args, statePath, automatic = false) {
   const owner = required(args, "owner");
   const expectedPlan = required(args, "expected-plan-sha256");
   const deadline = Date.now() + 25_000;
@@ -3281,10 +3281,10 @@ function terminalRetentionRelease(database, selected, args, statePath) {
     if (!row || digest(row.plan_json) !== expectedPlan || record.owner !== owner) {
       growthError("stale-retention-release", "owner or capacity plan changed; read the current binding");
     }
-    if (!retainedGrowth(JSON.parse(row.plan_json))) throw Object.assign(new GrowthLifecycleError("future-growth-not-retired", "future growth is not retired"),{nextAction:futureGrowthAction(record)});
-    if (generatedOnlySourceCustody(database, record.id)) growthError("retention-release-source-custody", "separate generated/source materialization retention remains");
+    if (!automatic && !retainedGrowth(JSON.parse(row.plan_json))) throw Object.assign(new GrowthLifecycleError("future-growth-not-retired", "future growth is not retired"),{nextAction:futureGrowthAction(record)});
+    if (existsSync(record.path) && generatedOnlySourceCustody(database, record.id)) growthError("retention-release-source-custody", "separate generated/source materialization retention remains");
     if (record.groupId !== null) growthError("retention-release-group", "group retention requires an explicit disposition for every member");
-    if (record.leaseExpiresAt !== 0) growthError("retention-release-active", "a writing lease remains");
+    if (!automatic && record.leaseExpiresAt !== 0) growthError("retention-release-active", "a writing lease remains");
     if (record.state === "released" && !existsSync(record.path)) {
       return {ok:true, record, action:"already-released", inspection:{classification:"missing", reason:"terminal retained release already completed", processes:[], containers:[], systemdUnits:[]}};
     }
@@ -3295,13 +3295,16 @@ function terminalRetentionRelease(database, selected, args, statePath) {
     const protect = inspection => ({ok:false, record:recordBy(database,{id:record.id}), action:"none", inspection,
       error:{code:"retention-release-protected", message:inspection.reason}});
     const observe = () => {
-      if (existsSync(record.path)) {
+      {
         const safety = growthSafety(database, record);
         if (safety.errors.length || safety.references.length) return {classification:"blocked",
           reason:safety.errors.length ? `cannot prove terminal retention safety: ${safety.errors.join("; ")}` : "runtime/thread/process/borrower writing references remain",
           processes:safety.references, containers:[], systemdUnits:[]};
       }
-      return inspectRecord(record, {ignoreLease:true, safety:safetySnapshot(database), deadline,terminalSourceTransfer:true});
+      const snapshot = safetySnapshot(database);
+      const protection = stackQueueInspection(stackQueueSafety([record.path], snapshot, "physical-checkout", deadline));
+      if (protection) return protection;
+      return inspectRecord(record, {ignoreLease:true, safety:snapshot, deadline,terminalSourceTransfer:true});
     };
     return withGrowthBorrowerLocks(database, record, () => {
       let inspection = observe();
@@ -3317,7 +3320,7 @@ function terminalRetentionRelease(database, selected, args, statePath) {
       try {
         const current = recordBy(database, {id:record.id});
         const currentPlan = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
-        if (current.owner !== owner || current.leaseExpiresAt !== 0 || current.updatedAt !== record.updatedAt || currentPlan?.plan_json !== row.plan_json) {
+        if (current.owner !== owner || current.leaseExpiresAt !== record.leaseExpiresAt || current.updatedAt !== record.updatedAt || currentPlan?.plan_json !== row.plan_json) {
           growthError("stale-retention-release", "record or plan changed before terminal release");
         }
         database.exec(`CREATE TABLE IF NOT EXISTS workspace_retention_release (
@@ -3325,6 +3328,7 @@ function terminalRetentionRelease(database, selected, args, statePath) {
           record_json TEXT NOT NULL, plan_json TEXT NOT NULL, inspection_json TEXT NOT NULL)`);
         database.prepare("INSERT INTO workspace_retention_release(workspace_id,occurred_at,record_json,plan_json,inspection_json) VALUES(?,?,?,?,?)")
           .run(record.id, Date.now(), JSON.stringify(record), row.plan_json, JSON.stringify(inspection));
+        database.prepare("UPDATE workspace SET lease_expires_at=0 WHERE id=?").run(record.id);
         updateState(database, current, "reclaiming", "owner ended retained custody; terminal release qualified");
         database.exec("COMMIT");
       } catch (error) { database.exec("ROLLBACK"); throw error; }
@@ -3573,12 +3577,13 @@ function endedOwnerSummary(record) {
   return { id: record.id, path: record.path, owner: record.owner, state: record.state, groupId: record.groupId };
 }
 function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
-  if (group.some(record => !ENDED_OWNER_STATES.includes(record.state) || !existsSync(record.path))) return { code: "state-not-eligible" };
-  const unended = verdicts.find(verdict => verdict.kind !== "ended");
+  if (group.some(record => !ENDED_OWNER_STATES.includes(record.state))) return { code: "state-not-eligible" };
+  if (observation.errors.length) return { code: "owner-unknown" };
+  const unended = verdicts.find((verdict, index) => verdict.kind !== "ended" && (existsSync(group[index].path) || verdict.kind === "live"));
   if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
-  if (group.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database, candidate.path)))
+  if (group.some(candidate => existsSync(candidate.path) && (generatedOnlySourceCustody(database, candidate.id) || retainedParent(database, candidate.path))))
     return { code: "retained-custody" };
   if (Date.now() >= deadline) return { code: "deferred" };
   return null;
@@ -3605,6 +3610,17 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
     const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline);
     if (freshRefusal) return { refused: locked.current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: locked.verdicts[index], action: "none", ...freshRefusal })) };
     const byId = new Map(locked.current.map((record, index) => [record.id, locked.verdicts[index]]));
+    // Ending a reservation does not require admitting new growth. The same terminal
+    // release checks source reachability and strict runtime cessation before deletion.
+    // Missing paths have no bytes to delete, even when their historical owner is unknown.
+    if (locked.current.length === 1 && (!existsSync(locked.current[0].path) || recordRetainsCustody(database, locked.current[0].id))) {
+      const record = locked.current[0];
+      const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+      if (row) {
+        const args = {positional: [], named: new Map([["owner", [record.owner]], ["expected-plan-sha256", [digest(row.plan_json)]]])};
+        return {byId, fresh: locked.fresh, settled: [terminalRetentionRelease(database, record, args, options.statePath, true)]};
+      }
+    }
     const releaseArgs = { positional: [], named: new Map([["preserve-runtime", ["true"]]]) };
     return { byId, fresh: locked.fresh, settled: ordinaryRelease(database, locked.current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId), options.deadline) };
   }, group[0].groupId, options.deadline);
@@ -3654,7 +3670,7 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   const targeted = one(args, "id") !== undefined || one(args, "path") !== undefined;
   if (targeted && one(args, "root") !== undefined) fail("release-ended-owners accepts --root or a single --id/--path selector");
   let records = targeted ? [recordBy(database, selectorFrom(args, "release-ended-owners"))] : listRecords(database, one(args, "root"));
-  records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && OWNER_AGENT_ID.test(record.owner) && existsSync(record.path));
+  records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && (OWNER_AGENT_ID.test(record.owner) || !existsSync(record.path)));
   const scope = `owner-liveness:${one(args, "root") === undefined ? "*" : path.resolve(one(args, "root"))}`;
   database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
   const saved = execute && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope = ?").get(scope)?.after_id : undefined;
@@ -3877,7 +3893,7 @@ function growthSafety(database, record) {
     ...dependencies.linkedWorktrees.filter(value => value.recordId !== record.id && within(record.path, value.commonDirectory))];
   const borrowers = new Map(retainedBorrowers.map(value => [value.workspacePath, recordBy(database,{id:value.recordId})]));
   // Include Git's complete linked-worktree list, not just registered borrowers.
-  const common = path.resolve(record.path, git(record.path,["rev-parse","--git-common-dir"]));
+  const common = existsSync(record.path) ? path.resolve(record.path, git(record.path,["rev-parse","--git-common-dir"])) : null;
   if (common === path.join(record.path,".git")) for (const line of git(record.path,["worktree","list","--porcelain"]).split("\n")) {
     if (!line.startsWith("worktree ")) continue;
     const borrowerPath = line.slice(9);
