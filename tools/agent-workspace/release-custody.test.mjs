@@ -56,3 +56,19 @@ test('timed-out union walk retains source, cache, foreign refs and release custo
  assert.equal(fs.existsSync(path.join(f.source,'node_modules','receipt')),true);
  assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'new unique work');
 }));
+
+test('ordinary release preserves an undispatched qualification and paired train before any cache disposal',()=>fixture(f=>{
+ const data=path.join(f.root,'release-data'),id='74551659-ca7f-47cc-92ff-c3e4b786e9e9',owner='226bb31d-e421-4f2b-99bb-ced3e5606ad9',base=f.git('-C',f.source,'rev-parse','HEAD');
+ for(const d of ['qualification-authority-requests','prepared-qualifications','merge-queue','producer-admission','release-launcher'])fs.mkdirSync(path.join(data,d),{recursive:true});
+ const put=(p,x)=>fs.writeFileSync(path.join(data,p),JSON.stringify(x));
+ const request={version:1,root:f.source,rootSource:base,name:'current-paired-train',pipeline:{operation:id,owner,base,leaves:[base]}};
+ put('qualification-authority-requests/'+id+'.json',request);put('prepared-qualifications/'+id+'.json.workspace.json',{id:f.record.id,path:f.source});put('prepared-qualifications/'+id+'.json.assembly.json',{request,candidate:base});
+ put('merge-queue/state.json',{batches:[{name:request.name,leaves:[base],owners:[owner]}]});
+ const before=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=data;
+ try {
+  let result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.cacheDisposition.kind,'not-attempted');assert.equal(result.inspection.currentStackQueueProtected,true);assert.ok(result.inspection.currentStackReferences.some(r=>r.kind==='qualification_request'));assert.ok(fs.existsSync(path.join(f.source,'node_modules','receipt')));
+  put('producer-admission/'+id+'.completed.json',{state:'completed',identity:request.pipeline});
+  result=f.release();assert.equal(result.physicalDisposition.kind,'retained','the train still owns the prepared root after request settlement');assert.ok(result.inspection.currentStackReferences.some(r=>r.kind==='queue_train'));
+  put('merge-queue/state.json',{batches:[]});result=f.release();assert.equal(result.physicalDisposition.kind,'removed','exact settlement and absence of a current train permit ordinary release');
+ }finally {if(before===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=before;}
+}));

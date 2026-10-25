@@ -48,6 +48,7 @@ import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourc
 import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { currentStackQueueReferences } from "./cache-queue.mjs";
+import { qualificationReferences } from "./qualification-references.mjs";
 import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
@@ -1025,8 +1026,14 @@ function removeEmptyWorkspaceContainer(record) {
 }
 
 function stackQueueSafety(roots,safety,resourceKind,deadline) {
-  if(process.env.NODE_TEST_CONTEXT!==undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY==="empty") {const observed=safety?.currentStackQueue??{errors:[],references:[],observedAt:Date.now()};return {...observed,references:observed.references.filter(ref=>resourceKind==="source"||ref.resourceClass!=="source-intent")};}
-  return currentStackQueueReferences(roots,{resourceKind,deadline});
+  if(process.env.NODE_TEST_CONTEXT!==undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY==="empty") {
+    const observed=safety?.currentStackQueue??{errors:[],references:[],observedAt:Date.now()};
+    const qualifications=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT ? qualificationReferences(roots,{dataRoot:process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT}) : {errors:[],references:[]};
+    return {...observed,errors:[...observed.errors,...qualifications.errors],references:[...observed.references.filter(ref=>resourceKind==="source"||ref.resourceClass!=="source-intent"),...qualifications.references]};
+  }
+  const native = currentStackQueueReferences(roots,{resourceKind,deadline});
+  const qualifications = qualificationReferences(roots);
+  return {...native, errors:[...native.errors,...qualifications.errors], references:[...native.references,...qualifications.references], qualificationObservation:qualifications.observations};
 }
 function stackQueueInspection(queued) {
   if(queued.errors.length) return {classification:"blocked",reason:`current Stack queue observation unavailable: ${queued.errors.join("; ")}`,processes:[],containers:[],systemdUnits:[],currentStackQueueProtected:true};

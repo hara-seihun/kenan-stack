@@ -77,6 +77,10 @@ function overlaps(left, right) {
  */
 export function qualificationReferences(roots = null, options = {}) {
   const directories = { ...releaseDirectories(options.dataRoot), ...Object.fromEntries(Object.entries(options).filter(([key]) => key.endsWith("Dir") || key === "queueStateFile")) };
+  // This is an application-specific census. Hosts without the Converge release
+  // component have no such custody; an existing but damaged component fails closed.
+  if (Object.keys(options).length === 0 && !fs.existsSync(DEFAULT_RELEASE_DATA))
+    return {errors:[],references:[],released:[],observations:[{source:"qualification-records",state:"not-installed"}],complete:true,observedAt:Date.now()};
   const limits = { ...LIMITS, ...(options.limits ?? {}) };
   const budget = new Budget(limits);
   const errors = [], references = [], released = [], ignored = [];
