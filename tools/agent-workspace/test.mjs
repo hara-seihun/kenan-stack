@@ -3989,14 +3989,17 @@ test("capacity projection preserves admitted local-mirror writer on register and
   } finally { f.close(); }
 });
 
-test("capacity projection explicitly reports unset for new and refreshed registration", () => {
+test("writer registration projects an admitted capacity plan and refresh preserves it", () => {
   const f = fixture();
   try {
     const first = JSON.parse(run(["register", "--path", f.source, "--owner", "author", "--json"], f.env));
-    assert.equal(first.capacity, null);
+    assert.equal(first.capacity.intent, "unestimated");
+    assert.equal(first.capacity.constructionBytes, 30 * 1024 ** 3);
+    assert.ok(first.capacity.completedAllocationBytes > 0);
     const refreshed = JSON.parse(run(["register", "--path", f.source, "--json"], f.env));
-    assert.equal(refreshed.capacity, null);
-    assert.equal(JSON.parse(run(["status", "--path", f.source, "--json"], f.env)).records[0].capacity, null);
+    assert.deepEqual(refreshed.capacity, first.capacity);
+    assert.equal(refreshed.leaseExpiresAt, first.leaseExpiresAt);
+    assert.deepEqual(JSON.parse(run(["status", "--path", f.source, "--json"], f.env)).records[0].capacity, first.capacity);
   } finally { f.close(); }
 });
 
