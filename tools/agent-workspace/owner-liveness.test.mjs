@@ -151,3 +151,30 @@ test('non-native owners are never candidates',()=>fixture('task-name-owner',f=>{
  f.observe({agents:[],wakes:[]});const r=f.release('--execute');
  assert.equal(r.candidates,0);assert.equal(r.results.length,0);assert.ok(fs.existsSync(f.source));
 }));
+
+test('a stale capacity sample is refreshed by a bounded targeted measurement and then retires future growth',()=>fixture(STOPPED,f=>{
+ f.observe(ended(STOPPED));const before=f.priced();
+ const old=Date.now()-3600_000,st=fs.statSync(f.source);
+ f.db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:old,completedAt:old+10}),f.record.id);
+ fs.writeFileSync(path.join(f.source,'proof'),'unique');f.git('-C',f.source,'commit','-am','unique');const head=f.git('-C',f.source,'rev-parse','HEAD');
+ const started=Date.now(),r=f.release('--execute','--budget-ms','20000'),item=r.results[0];
+ assert.ok(Date.now()-started<20000+30000,'global execution stays bounded');
+ assert.equal(item.capacitySample.kind,'measured',JSON.stringify(item));
+ assert.equal(item.futureGrowthSettlement.kind,'retired',JSON.stringify(item));
+ const sample=JSON.parse(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.record.id).measurement_json);
+ assert.ok(sample.ok&&sample.startedAt>=started,'retirement used a sample taken by this run, not the stale one');
+ assert.equal(f.plan().growthLifecycle.remainingGrowthBytes,0);assert.equal(f.plan().headroomBytes,before.headroomBytes);
+ assert.equal(f.git('-C',f.source,'rev-parse','HEAD'),head);
+}));
+
+test('a measurement that cannot complete keeps the full future-growth allowance',()=>fixture(STOPPED,f=>{
+ f.observe(ended(STOPPED));const before=f.priced();
+ f.db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify({ok:false,error:'unknown physical allocation'}),f.record.id);
+ fs.writeFileSync(path.join(f.source,'proof'),'unique');f.git('-C',f.source,'commit','-am','unique');
+ const sealed=path.join(f.source,'sealed');fs.mkdirSync(sealed);fs.writeFileSync(path.join(sealed,'x'),'y');fs.chmodSync(sealed,0);
+ try{
+  const r=f.release('--execute'),item=r.results[0];
+  if(process.getuid()!==0){assert.equal(item.capacitySample.kind,'failed',JSON.stringify(item));assert.equal(item.futureGrowthSettlement.kind,'retained');assert.deepEqual(f.plan(),before);}
+  assert.ok(fs.existsSync(path.join(f.source,'proof')));
+ }finally{fs.chmodSync(sealed,0o700);}
+}));

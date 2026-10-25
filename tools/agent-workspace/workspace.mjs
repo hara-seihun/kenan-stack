@@ -3460,10 +3460,10 @@ function releaseCommand(database, args, statePath) {
 // The ordinary release transition shared by an owner's explicit release and by the
 // owner-liveness release of an authentically ended native owner. Only the future-growth
 // settlement (and its owner evidence) differs; every safety observation is identical.
-function ordinaryRelease(database, records, args, statePath, settle) {
+function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
-  const deadline=Date.now()+35_000;
+  const deadline=Math.min(Date.now()+35_000, outerDeadline);
   // Snapshot failure is a completed *non-destructive* refusal, not an orphaned
   // release. Never substitute partial/empty reference observations.
   let result;
@@ -3539,6 +3539,36 @@ function settleEndedOwnerFutureGrowth(verdicts) {
     }
   };
 }
+// Retirement needs a current allocated-block sample. A recurring release must not wait for the
+// fleet sampler to happen to visit this checkout, so a stale priced, unretired sample is refreshed
+// here, before any lifecycle lock, through the host's supported UID-preserving read-capability
+// route (falling back to an unprivileged walk). Only the measurement cache changes; retirement
+// still validates freshness, root identity and its own terminal writer observation.
+function refreshEndedOwnerSample(database, record, deadline, statePath) {
+  const row = database.prepare(`SELECT w.id,w.path,w.state,w.group_id,c.device_id,c.plan_json FROM workspace w
+    JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=?`).get(record.id);
+  if (!row) return { kind: "unpriced" };
+  const plan = JSON.parse(row.plan_json);
+  if (!["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return { kind: "not-needed" };
+  if (cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) return { kind: "fresh" };
+  const budget = Math.min(60_000, deadline - Date.now() - 10_000);
+  if (budget < 1000) return { kind: "deferred", detail: "release budget too small for a measurement" };
+  const isolated = process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
+  let route = "unprivileged";
+  if (!isolated && process.getuid?.() !== 0) {
+    const uid = process.getuid(), gid = process.getgid();
+    const measured = boundedCommand("sudo", ["-n", "/usr/bin/setpriv", `--reuid=${uid}`, `--regid=${gid}`, "--init-groups",
+      "--bounding-set=-all,+dac_read_search", "--inh-caps=+dac_read_search", "--ambient-caps=+dac_read_search",
+      "/usr/bin/env", `HOME=${homedir()}`, `PI_WORKSPACE_STATE=${statePath}`, "PATH=/usr/local/bin:/usr/bin:/bin",
+      process.execPath, new URL(import.meta.url).pathname, "measure-capacity", "--id", record.id, "--budget-ms", String(budget), "--json"],
+      { encoding: "utf8", timeout: budget + 5_000, maxBuffer: 1 << 20, reapGroup: true });
+    if (measured.status === 0 && !measured.error && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) return { kind: "measured", route: "read-capability" };
+    route = "unprivileged-after-read-capability-failure";
+  }
+  const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(value => value.path);
+  const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline - 5_000, Date.now() + budget));
+  return sample.ok && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok ? { kind: "measured", route } : { kind: "failed", route, detail: sample.error ?? "sample not current" };
+}
 function endedOwnerSummary(record) {
   return { id: record.id, path: record.path, owner: record.owner, state: record.state, groupId: record.groupId };
 }
@@ -3553,37 +3583,67 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
   if (Date.now() >= deadline) return { code: "deferred" };
   return null;
 }
+function lockedEndedOwnerVerdicts(database, group, deadline) {
+  // Fresh native readback and record CAS under the checkout lock; no earlier verdict is reused.
+  const current = recordsInGroup(database, recordBy(database, { id: group[0].id }));
+  const fresh = ownerLivenessObservation(current.map(record => record.owner), deadline);
+  const verdicts = current.map(record => classifyOwner(record.owner, fresh));
+  const changed = current.length !== group.length || current.some(record => {
+    const before = group.find(candidate => candidate.id === record.id);
+    return !before || before.owner !== record.owner || before.path !== record.path || before.sourceCommit !== record.sourceCommit;
+  });
+  return { current, fresh, verdicts, changed };
+}
 function releaseEndedOwnerGroup(database, group, observation, options) {
   const verdicts = group.map(record => classifyOwner(record.owner, observation));
   const refusal = endedOwnerRefusal(database, group, verdicts, observation, options.deadline);
   if (refusal) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", ...refusal }));
   if (!options.execute) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "would-release-ended-owner" }));
-  return withWorkspaceLock(database, group[0].path, () => {
-    // Fresh native readback and record CAS under the checkout lock; no earlier verdict is reused.
-    const current = recordsInGroup(database, recordBy(database, { id: group[0].id }));
-    const fresh = ownerLivenessObservation(current.map(record => record.owner), options.deadline);
-    const freshVerdicts = current.map(record => classifyOwner(record.owner, fresh));
-    const changed = current.length !== group.length || current.some(record => {
-      const before = group.find(candidate => candidate.id === record.id);
-      return !before || before.owner !== record.owner || before.path !== record.path || before.sourceCommit !== record.sourceCommit;
-    });
-    const freshRefusal = changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, current, freshVerdicts, fresh, options.deadline);
-    if (freshRefusal) return current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: freshVerdicts[index], action: "none", ...freshRefusal }));
-    const byId = new Map(current.map((record, index) => [record.id, freshVerdicts[index]]));
+  if (options.deadline - Date.now() < 10_000) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", code: "deferred" }));
+  const released = withWorkspaceLock(database, group[0].path, () => {
+    const locked = lockedEndedOwnerVerdicts(database, group, options.deadline);
+    const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline);
+    if (freshRefusal) return { refused: locked.current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: locked.verdicts[index], action: "none", ...freshRefusal })) };
+    const byId = new Map(locked.current.map((record, index) => [record.id, locked.verdicts[index]]));
     const releaseArgs = { positional: [], named: new Map([["preserve-runtime", ["true"]]]) };
-    const settled = ordinaryRelease(database, current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId));
-    database.exec(`CREATE TABLE IF NOT EXISTS workspace_owner_liveness_release (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, request_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
-      owner TEXT NOT NULL, verdict_json TEXT NOT NULL, observation_json TEXT NOT NULL, result_json TEXT NOT NULL)`);
-    const insert = database.prepare("INSERT INTO workspace_owner_liveness_release(workspace_id,request_id,occurred_at,owner,verdict_json,observation_json,result_json) VALUES(?,?,?,?,?,?,?)");
-    return settled.map(item => {
-      const verdict = byId.get(item.record.id);
-      const requestId = item.releaseSettlement?.requestId ?? "unknown";
-      insert.run(item.record.id, requestId, Date.now(), verdict.owner, JSON.stringify(verdict),
-        JSON.stringify({ observations: fresh.observations, observedAt: fresh.observedAt }), JSON.stringify({ action: item.action, physicalDisposition: item.physicalDisposition, futureGrowthSettlement: item.futureGrowthSettlement ?? null, inspection: { classification: item.inspection?.classification, reason: item.inspection?.reason } }));
-      return { ...item, ownerLiveness: verdict };
-    });
+    return { byId, fresh: locked.fresh, settled: ordinaryRelease(database, locked.current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId), options.deadline) };
   }, group[0].groupId, options.deadline);
+  if (released.refused) return released.refused;
+  // A retained tree whose sample was stale is measured outside every lifecycle lock, then the
+  // same settlement runs again under the checkout lock with a fresh native verdict.
+  const samples = new Map();
+  const settled = released.settled.map(item => {
+    if (item.futureGrowthSettlement?.kind !== "retained" || item.futureGrowthSettlement.code !== "growth-sample-required") return item;
+    const sample = refreshEndedOwnerSample(database, item.record, options.deadline, options.statePath);
+    samples.set(item.record.id, sample);
+    if (sample.kind !== "measured") return item;
+    try {
+      return withWorkspaceLock(database, item.record.path, () => {
+        const locked = lockedEndedOwnerVerdicts(database, group, options.deadline);
+        const index = locked.current.findIndex(record => record.id === item.record.id);
+        const again = locked.changed || index < 0 ? { code: "owner-liveness-changed" }
+          : locked.verdicts[index].kind !== "ended" ? { code: locked.verdicts[index].kind === "live" ? "owner-live" : "owner-unknown" }
+          : pendingWakeReferences(item.record.path, locked.fresh, locked.verdicts[index]).length ? { code: "pending-wake-reference" } : null;
+        if (again) return { ...item, futureGrowthSettlement: { ...item.futureGrowthSettlement, code: again.code, detail: "owner liveness changed before settlement after measurement" } };
+        released.byId.set(item.record.id, locked.verdicts[index]);
+        return settleEndedOwnerFutureGrowth(released.byId)(database, { ...item, record: recordBy(database, { id: item.record.id }) }, item.releaseSettlement?.requestId ?? "unknown", options.statePath);
+      }, item.record.groupId, options.deadline);
+    } catch (error) {
+      return { ...item, futureGrowthSettlement: { ...item.futureGrowthSettlement, code: error.code ?? "growth-settlement-unknown", detail: error.message } };
+    }
+  });
+  database.exec(`CREATE TABLE IF NOT EXISTS workspace_owner_liveness_release (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, request_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
+    owner TEXT NOT NULL, verdict_json TEXT NOT NULL, observation_json TEXT NOT NULL, result_json TEXT NOT NULL)`);
+  const insert = database.prepare("INSERT INTO workspace_owner_liveness_release(workspace_id,request_id,occurred_at,owner,verdict_json,observation_json,result_json) VALUES(?,?,?,?,?,?,?)");
+  return settled.map(item => {
+    const verdict = released.byId.get(item.record.id), requestId = item.releaseSettlement?.requestId ?? "unknown";
+    insert.run(item.record.id, requestId, Date.now(), verdict.owner, JSON.stringify(verdict),
+      JSON.stringify({ observations: released.fresh.observations, observedAt: released.fresh.observedAt }),
+      JSON.stringify({ action: item.action, physicalDisposition: item.physicalDisposition, futureGrowthSettlement: item.futureGrowthSettlement ?? null, capacitySample: samples.get(item.record.id) ?? null,
+        inspection: { classification: item.inspection?.classification, reason: item.inspection?.reason } }));
+    return { ...item, ownerLiveness: verdict, capacitySample: samples.get(item.record.id) ?? null };
+  });
 }
 function releaseEndedOwnersCommand(database, args, statePath) {
   assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "max-records", "after", "json"]);
@@ -4189,6 +4249,22 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
   }, selected.groupId,deadline));
 }
 
+// One checkout's allocated-block sample under its own checkout lock; only the measurement
+// cache changes. A failed walk is stored as a failed sample, never as a smaller allocation.
+function measureWorkspaceRow(database, row, paths, deadline) {
+  const store = sample => {
+    database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
+      SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
+    return sample;
+  };
+  try {
+    return withWorkspaceLock(database, row.path, () => store(workspaceAllocationSample(row.path, row.device_id, {
+      deadline: Math.min(deadline, Date.now() + 60_000), maxEntries: 2_000_000,
+      excludedPaths: paths.filter(candidate => candidate.startsWith(`${row.path}${path.sep}`)),
+    })), row.group_id, deadline);
+  } catch (error) { return store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
+}
+
 function measureCapacityCommand(database, args, statePath) {
   assertOnly(args, ["root", "path", "id", "budget-ms", "json"]);
   const budgetMs = numberFlag(args, "budget-ms", 40_000);
@@ -4209,18 +4285,7 @@ function measureCapacityCommand(database, args, statePath) {
       const plan = JSON.parse(row.plan_json);
       if (plan.intent !== "unestimated" && plan.growthBytes === 0 && row.state !== "creating") continue;
       if (Date.now() >= deadline) { results.push({ path: row.path, status: "deferred" }); continue; }
-      const store = sample => {
-        database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
-          SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
-        return sample;
-      };
-      let sample;
-      try {
-        sample = withWorkspaceLock(database, row.path, () => store(workspaceAllocationSample(row.path, row.device_id, {
-          deadline: Math.min(deadline, Date.now() + 60_000), maxEntries: 2_000_000,
-          excludedPaths: paths.filter(candidate => candidate.startsWith(`${row.path}${path.sep}`)),
-        })), row.group_id, deadline);
-      } catch (error) { sample = store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
+      const sample = measureWorkspaceRow(database, row, paths, deadline);
       results.push({ path: row.path, status: sample.ok ? "measured" : "error", ...sample });
     }
     print(results, bool(args, "json"));
