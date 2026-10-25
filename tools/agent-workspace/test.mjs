@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {MaintenanceJournal,digest} from './maintenance-journal.mjs';
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";

@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import {execFileSync,spawn} from 'node:child_process';import {createHash}from'node:crypto';import {deployGate,inventory}from'./deploy-custody-gate.mjs';
 const sha=b=>createHash('sha256').update(b).digest('hex');
 const tool=path.dirname(new URL(import.meta.url).pathname);const git=(r,...a)=>execFileSync('git',['-C',r,...a],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();

@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 // target: release/reconcile deletion guard. level: unit. intent: incident regression (2026-10-19 converge Slack sender). size: small.
 import {test} from 'node:test';
 import assert from 'node:assert/strict';

@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,readdirSync,existsSync,chmodSync,rmSync,statSync} from 'node:fs';

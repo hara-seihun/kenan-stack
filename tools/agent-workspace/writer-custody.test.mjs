@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import path from 'node:path';import os from 'node:os';import {spawn,spawnSync} from 'node:child_process';import {once} from 'node:events';
 const cli=new URL('./workspace.mjs',import.meta.url).pathname;
 const git=(p,...a)=>{let r=spawnSync('git',['-C',p,...a],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);return r.stdout.trim();};

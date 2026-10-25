@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import{test}from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import os from'node:os';import path from'node:path';import{execFileSync,spawnSync}from'node:child_process';import{DatabaseSync}from'node:sqlite';import{fileURLToPath}from'node:url';import{digest}from'./growth-lifecycle.mjs';
 const moduleFile=process.env.WORKSPACE_RESUME_MODULE||fileURLToPath(new URL('./workspace.mjs',import.meta.url));const{main}=await import(moduleFile);
 function fixture(action,oldIntent='source-only'){

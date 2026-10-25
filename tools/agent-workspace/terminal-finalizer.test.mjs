@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {finalizeTerminal,completedOneshot} from './terminal-finalizer.mjs';

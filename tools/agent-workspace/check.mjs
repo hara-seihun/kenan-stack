@@ -1,6 +1,4 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { statfsSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { runJobs } from "../../scripts/run-jobs.mjs";
 
 const shardCount = 128;
@@ -18,12 +16,5 @@ export const workspaceChecks = [["agent workspace frozen source", "sudo", ["-n",
 ])];
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  // Fixtures admit real capacity with the 8 GiB operating floor in os.tmpdir(); a small tmpfs /tmp
-  // refuses those admissions and looks like a code failure.
-  const scratch = tmpdir(), fs = statfsSync(scratch), free = fs.bavail * fs.bsize, needed = 16 * 1024 ** 3;
-  if (free < needed) {
-    process.stderr.write(`agent workspace checks need ${needed} free bytes in TMPDIR (${scratch} has ${free}); set TMPDIR to a directory on a larger disk, e.g. TMPDIR=/var/tmp\n`);
-    process.exit(2);
-  }
   await runJobs(workspaceChecks, { concurrency: 1 });
 }

@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 // target: release/reconcile safety census. level: unit + cross-process. intent: incident regression
 // (2026-10-21 converge: 54.6 s serial census vs 35 s release deadline; release 81df3049 settled
 // blocked on "database is locked" from an idle WAL thread database). size: small.

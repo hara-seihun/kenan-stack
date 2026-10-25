@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {spawn,spawnSync}from'node:child_process';
 test('exclusive publication drains old admission; new launcher resolves successor only after release',async()=>{
  const r=fs.mkdtempSync(path.join(os.tmpdir(),'workspace-drain-'));const lock=path.join(r,'lock'),ready=path.join(r,'ready'),selected=path.join(r,'selected');

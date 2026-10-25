@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {execFileSync,spawnSync} from 'node:child_process';import {DatabaseSync} from 'node:sqlite';import {digest} from './growth-lifecycle.mjs';
 const cli=new URL('./workspace.mjs',import.meta.url).pathname;
 test('native CLI real Git SQLite terminal headroom and retained registration preserve dirty/ignored bytes and reject stale remote, owner, source and writer',()=>{
