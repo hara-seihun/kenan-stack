@@ -1009,8 +1009,8 @@ function stopSystemdReferences(references) {
 }
 
 function removeWorkspace(record, statePath) {
-  assertUnfrozenCustody(record.path);
   if (record.checkoutType === "worktree") {
+    assertUnfrozenCustody(record.path);
     const rawCommon = git(record.path, ["rev-parse", "--git-common-dir"]);
     const common = path.resolve(record.path, rawCommon);
     const branchResult = command("git", ["-C", record.path, "symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -1162,6 +1162,7 @@ function reconcileRecord(database, record, options) {
     updateState(database, current, latest.classification, latest.reason);
     return { record: current, inspection: latest, removedCaches, action: "none" };
   }
+  assertUnfrozenCustody(current.path);
   updateState(database, current, "reclaiming", latest.reason);
   removeWorkspace(current, options.statePath);
   removeEmptyWorkspaceContainer(current);
@@ -1261,6 +1262,7 @@ function groupReconciliation(database, records, options) {
     return records.map((record, index) => ({ record, inspection: inspections[index], action: "would-release-group" }));
   }
 
+  for (const record of records) if (existsSync(record.path)) assertUnfrozenCustody(record.path);
   database.exec("BEGIN IMMEDIATE");
   try {
     const current = records.map((record) => recordBy(database, { id: record.id }));
@@ -3315,6 +3317,8 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
     return withGrowthBorrowerLocks(database, record, () => {
       let inspection = observe();
       if (["referenced", "blocked", "active"].includes(inspection.classification) || inspection.sourceRetention) return protect(inspection);
+      const frozen = frozenCustody(record.path, {recursive:true});
+      if (frozen) return protect({classification:"blocked",...frozen,processes:[],containers:[],systemdUnits:[]});
       let removedCaches = [];
       if (inspection.classification === "repair-required") {
         removedCaches = stripCaches(record, statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id));
@@ -3503,7 +3507,7 @@ function ordinaryRelease(database, records, args, statePath, settle, outerDeadli
 // still observes running tool calls, live workers naming the path, processes, units,
 // containers, threads and Git borrowers; dirty and unpublished source is retained, and only its
 // future growth is settled through the shared locked retire-growth transition.
-const ENDED_OWNER_STATES = ["active", "referenced", "blocked", "repair-required"];
+const ENDED_OWNER_STATES = ["active", "referenced", "blocked", "repair-required", "reclaiming"];
 function ownerLivenessObservation(owners, deadline) {
   if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS !== undefined) {
     let fixture = JSON.parse(readFileSync(process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS, "utf8"));

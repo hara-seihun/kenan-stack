@@ -3852,6 +3852,12 @@ const r=cp.spawnSync(${JSON.stringify(realGit)},args,{stdio:'inherit'});process.
     const jobsBefore = readdirSync(jobs);
     const originalJobs=jobsBefore.filter(id=>JSON.parse(readFileSync(path.join(jobs,id,"result.json"),"utf8")).state==="failed"); assert.equal(originalJobs.length,1);
     const originalDir=path.join(jobs,originalJobs[0]);
+    // result.json is committed before terminal progress.json. Capture the immutable
+    // baseline only after the original worker finishes that terminal publication.
+    const terminalDeadline=Date.now()+5000;
+    while (readFileSync(path.join(originalDir,"progress.json"),"utf8")!==readFileSync(path.join(originalDir,"result.json"),"utf8") && Date.now()<terminalDeadline)
+      await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(readFileSync(path.join(originalDir,"progress.json"),"utf8"),readFileSync(path.join(originalDir,"result.json"),"utf8"),"original terminal progress must be published before capturing its preservation baseline");
     const preserved=Object.fromEntries(["request.json","progress.json","result.json"].map(name=>[name,readFileSync(path.join(originalDir,name),"utf8")]));
     assert.equal(JSON.parse(preserved["result.json"]).error.code,"workspace-capacity-refused");
     assert.equal(existsSync(path.join(f.workspaces,"capacity-recovered")),false);

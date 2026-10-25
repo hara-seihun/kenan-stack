@@ -231,3 +231,8 @@ test('retained frozen handoff returns typed refusal without terminal effects',()
  f.priced();f.observe(ended(ARCHIVED));f.db.exec('CREATE TABLE workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());fs.writeFileSync(path.join(f.source,'.git','pi-frozen-handoff.json'),'{}');
  const result=f.release('--execute');assert.equal(result.results[0].error.code,'FROZEN_CUSTODY');assert.ok(fs.existsSync(f.source));assert.equal(f.row().state,'active');
 }));
+
+test('previously interrupted terminal reclamation is observed and safely resumed',()=>fixture(ARCHIVED,f=>{
+ f.priced();f.observe(ended(ARCHIVED));f.db.prepare("UPDATE workspace SET state='reclaiming',lease_expires_at=0 WHERE id=?").run(f.record.id);
+ const result=f.release('--execute');assert.equal(result.results[0].action,'released');assert.equal(f.row().state,'released');assert.equal(fs.existsSync(f.source),false);
+}));
