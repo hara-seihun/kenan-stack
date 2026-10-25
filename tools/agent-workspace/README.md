@@ -2,6 +2,14 @@
 
 `agent-workspace` owns temporary Git clones and worktrees used by agents. It gives every checkout a lease, records its owner and durable source commit, blocks new allocation when disk or inode reserves are low, and removes a checkout only after proving that it has no unique local work. Processes, active systemd units, Docker containers, and durable work in this Unix person's thread databases count as live owners.
 
+## Refusal-driven sampling and terminal source growth
+
+New source and registration admissions and explicit growth heartbeats refresh the stale or missing samples that contribute to a capacity refusal, largest remaining liability first. Sampling runs outside the device admission fence with a 30-second total budget. Each decision rereads physical capacity and all reservations under the fence. Admission stops sampling as soon as it fits. A failed or incomplete observation never grants credit or changes a source lease, plan, checkout or cache. Foreground source preparation delegates slow work to its original durable request rather than occupying its short foreground budget.
+
+Explicit `measure-capacity` selectors use their full requested deadline rather than a two-second fleet slice. Fleet observations remain incremental, and incomplete walks preserve prior successful measurements.
+
+Ordinary release and the ended-owner release sweep already retire future growth even when source must be retained. Pushed source alone is not evidence that a live writer has ended. Native root preparation can additionally project zero future growth after every exact declared stage has authentically settled, source identity still matches, and a fresh consumer census is empty. Pending, uncertain, frozen or active custody retains its liability. Explicit subsequent growth restoration overrides older terminal evidence. Projection changes no source, generated files, lease, original growth promise or headroom. Its bounded consumer census is outside the device admission fence.
+
 ## Complete repricing observation
 
 Active reduction runs inside one explicit bounded operation: `--budget-ms 25000`, an integer from1 to40000. Workspace/group/capacity fence acquisition and Git observations share its absolute deadline. The final complete allocated-block walk under those fences gets the remaining budget minus2000ms for validation/commit and the same2000000-entry ceiling as explicit capacity measurement. Exhaustion returns an error before plan mutation; it never credits a partial walk. The original cached sample remains immutable, and accounting uses the maximum of cached and complete fresh allocation. All source/owner/lease/borrower/sample/plan/capacity and8GiB guards remain.

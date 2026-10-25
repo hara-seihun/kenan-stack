@@ -2035,7 +2035,8 @@ function terminalQualificationPaths(rows, database) {
   const statePath=registryPaths.get(database);
   const holdsDevice=[...heldResourceLocks.keys()].some(key=>key.startsWith(`${statePath}\0capacity:`));
   if(holdsDevice){
-    if(nativeTerminalProjection?.database===database)for(const [root,at] of nativeTerminalProjection.paths)settled.set(root,at);
+    if(nativeTerminalProjection?.database===database)for(const [root,at] of nativeTerminalProjection.paths)
+      if(!census.references.some(ref=>ref.paths.some(q=>q===root||q.startsWith(root+path.sep)||root.startsWith(q+path.sep))))settled.set(root,at);
     return settled;
   }
   // Native root-precheck plans are a separate consumer format. Preserve all
@@ -2125,35 +2126,35 @@ function capacityReservations(database, device, reservedPath, measure) {
 // Only a pre-effect admission refusal may retry. Acquire the device fence for
 // each decision/commit, but release it before acquiring another checkout's fence.
 function withCapacityAdmission(database, statePath, device, action) {
-  return admitWithRefresh({
-    decide: () => {
-      // Never perform recursive source or process observations under the device
-      // fence. Native restoration still overrides this per-decision observation.
-      const rows=database.prepare(`SELECT c.plan_json,w.id,w.state,w.path,w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
-        WHERE c.device_id=? AND w.state!='released'`).all(device);
-      const paths=terminalQualificationPaths(rows,database);
-      nativeTerminalProjection={database,paths};
-      try{return withResourceLock(statePath, `capacity:${device}`, action);}
-      finally{nativeTerminalProjection=null;}
-    },
+  try{return admitWithRefresh({
+    decide: () => {try{return withResourceLock(statePath, `capacity:${device}`, action);}finally{nativeTerminalProjection=null;}},
     candidates: error => {
-      // Foreground source preparation owns only 1.5 seconds. Its original
-      // durable worker performs slow sampling under the same request identity.
       const failures=error.capacity?.breakdown?.measurementFailures??[];
       const charged=new Map((error.capacity?.breakdown?.automaticGrowthRepricing??[]).map(item=>[item.path,item.effectiveRemainingBytes]));
       const candidates=failures.filter(item=>['allocated-block-cache-stale','allocated-block-cache-missing','allocated-block-measurement-failed'].includes(item.code)
         && (charged.get(item.path)??item.reservedBytes)>0)
         .sort((a,b)=>(charged.get(b.path)??b.reservedBytes)-(charged.get(a.path)??a.reservedBytes));
-      if(candidates.length && sourcePreparationMode==='foreground')throw new SourcePreparationRequired();
-      return candidates;
+      if(!candidates.length)return [];
+      // Foreground preparation owns 1.5 seconds; its original durable worker
+      // performs slow observations under the same request identity.
+      if(sourcePreparationMode==='foreground')throw new SourcePreparationRequired();
+      return [{path:'native-terminal-projection',terminal:true},...candidates];
     },
     refresh: (candidate,deadline) => {
+      if(candidate.terminal){
+        const rows=database.prepare(`SELECT c.plan_json,w.id,w.state,w.path,w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
+          WHERE c.device_id=? AND w.state!='released'`).all(device);
+        // Only the immediately following decisions may reuse this observation.
+        // Every explicit growth restoration continues to override terminal credit.
+        nativeTerminalProjection={database,paths:terminalQualificationPaths(rows,database)};
+        return {kind:'terminal-projection',settled:nativeTerminalProjection.paths.size};
+      }
       const row=database.prepare("SELECT * FROM workspace WHERE path=? AND state!='creating' AND state!='released'").get(candidate.path);
       if(!row)return {kind:'not-eligible'};
       const record=recordBy(database,{id:row.id});
       return refreshEndedOwnerSample(database,record,deadline,statePath);
     },
-  });
+  });}finally{nativeTerminalProjection=null;}
 }
 
 // Diagnostic projection of the same reservations used by the refusal.
