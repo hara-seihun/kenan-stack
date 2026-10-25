@@ -8,7 +8,7 @@ function fixture(action,oldIntent='source-only'){
  try{
   git('init','-b','main');git('config','user.name','Fixture');git('config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(source,'proof'),'preserved source');git('add','.');git('commit','-m','source');const head=git('rev-parse','HEAD');
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',head,'--json']);db=new DatabaseSync(state);
-  db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(record.id,String(fs.statSync(source).dev),JSON.stringify({intent:oldIntent,estimate:'whole-tree-upper-bound',constructionBytes:4096,completedAllocationBytes:4096,growthBytes:512*1024**2,headroomBytes:8*1024**3}));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(record.id,String(fs.statSync(source).dev),JSON.stringify({intent:oldIntent,estimate:'whole-tree-upper-bound',constructionBytes:4096,completedAllocationBytes:4096,growthBytes:512*1024**2,headroomBytes:8*1024**3}));
   run(['measure-capacity','--id',record.id,'--json']);const get=()=>run(['growth-status','--id',record.id,'--path',source,'--json']);
   const disposition={kind:'retire-future-growth',retainedUse:'source',remainingGrowthBytes:0,growthWriters:'none',writingLease:'retire',reason:'fixture work ended',ownerEvidence:'disposable fixture owner',observedAt:Date.now(),binding:get().binding};const bytes=JSON.stringify(disposition),file=path.join(root,'disposition.json');fs.writeFileSync(file,bytes);
   run(['retire-growth','--id',record.id,'--path',source,'--owner','fixture','--disposition',file,'--disposition-sha256',digest(bytes),'--json']);

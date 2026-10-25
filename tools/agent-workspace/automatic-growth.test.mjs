@@ -8,8 +8,10 @@ function fixture(fn){const root=fs.mkdtempSync(path.join(os.tmpdir(),'auto-growt
  try{fs.mkdirSync(dir);execFileSync('git',['init','-q',dir]);execFileSync('git',['-C',dir,'-c','user.name=F','-c','user.email=f@example.invalid','commit','-q','--allow-empty','-m','init']);
  const row=run(['register','--path',dir,'--root',root,'--owner','fixture','--json']);db=new DatabaseSync(state);const st=fs.statSync(dir),device=String(st.dev),now=Date.now(),created=now-3*H;
  db.prepare('UPDATE workspace SET created_at=? WHERE id=?').run(created,row.id);
+ // Registration now produces a baseline; this fixture deliberately tests absent evidence.
+ db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(row.id);
  const baseline=1024*1024,plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:baseline,completedAllocationBytes:baseline,growthBytes:6*G,headroomBytes:8*G};
- db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(row.id,device,JSON.stringify(plan));
+ db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(row.id,device,JSON.stringify(plan));
  const sample=(bytes,at=Date.now())=>({ok:true,bytes,allocatedBytes:bytes,device,inode:String(st.ino),startedAt:at,completedAt:at});
  const cache=s=>db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(row.id,JSON.stringify(s));
  const projection=()=>workspaceTesting.capacityReservations(db,device);

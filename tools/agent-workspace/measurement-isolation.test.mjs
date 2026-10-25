@@ -21,7 +21,7 @@ for(const same of [false,true])test(same?'same-checkout contention is bounded by
  const source=path.join(root,'source');fs.mkdirSync(source);execFileSync('git',['init',source],{stdio:'ignore'});execFileSync('git',['-C',source,'-c','user.name=Fixture','-c','user.email=fixture@invalid','commit','--allow-empty','-m','fixture'],{stdio:'ignore'});
  const state=path.join(root,'registry.sqlite3'),env={...process.env,PI_WORKSPACE_STATE:state};
  const register=spawnSync(tool,['register','--path',source,'--owner','fixture','--json'],{encoding:'utf8',env,timeout:3000});assert.equal(register.status,0,register.stderr);const r=JSON.parse(register.stdout);
- const db=new DatabaseSync(state);db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(r.id,String(fs.statSync(source).dev),JSON.stringify({intent:'budgeted',growthBytes:1024,headroomBytes:8*1024**3}));db.close();
+ const db=new DatabaseSync(state);db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(r.id,String(fs.statSync(source).dev),JSON.stringify({intent:'budgeted',growthBytes:1024,headroomBytes:8*1024**3}));db.close();
  const release=await heldLock(root,same?'checkout:'+source:'capacity-measurement');t.after(release);
  const start=Date.now();const sample=spawnSync(tool,['measure-capacity','--id',r.id,'--budget-ms','1500','--json'],{env,timeout:3000,encoding:'utf8'});assert.equal(sample.status,0,sample.stderr);assert.ok(Date.now()-start<2600);
  const output=JSON.parse(sample.stdout).results;assert.equal(output[0].status,same?'error':'measured');

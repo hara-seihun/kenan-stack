@@ -52,14 +52,14 @@ for (const lease of ['valid','expired']) test(`retained growth CLI ${lease} leas
  writeFileSync(path.join(source,'proof.txt'),'irreplaceable unpublished proof');git('-C',source,'add','.');git('-C',source,'commit','-m','unpublished proof');
  const head=git('-C',source,'rev-parse','HEAD');git('-C',source,'worktree','add','--detach',borrower,head);
  const run=args=>{let text='';const priorExit=process.exitCode;const original=process.stdout.write;process.stdout.write=chunk=>{text+=chunk;return true;};try {main(args,state);} finally {process.stdout.write=original;process.exitCode=priorExit;} return JSON.parse(text);};
- const register=p=>run(['register','--path',p,'--root',root,'--owner','current-owner','--source-commit',head,'--json']);
+ const register=p=>run(['register','--path',p,'--root',root,'--owner','current-owner','--source-commit',head,'--intent','source-only','--headroom-gib','8','--growth-mib','0','--json']);
  const record=register(source);const child=register(borrower);
  const db=new DatabaseSync(state);db.prepare("UPDATE workspace SET state='referenced' WHERE id=?").run(record.id);
  const stats=statSync(source),device=String(stats.dev);
  const plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:26159738880,headroomBytes:8589934592,completedAllocationBytes:4096};
- const planText=JSON.stringify(plan);db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,device,planText);
+ const planText=JSON.stringify(plan);db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,device,planText);
  const sample={ok:true,bytes:4096,allocatedBytes:4096,device,inode:String(stats.ino),startedAt:Date.now(),completedAt:Date.now()};
- const sampleText=JSON.stringify(sample);db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,sampleText);
+ const sampleText=JSON.stringify(sample);db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,sampleText);
  if(lease==='expired') db.prepare('UPDATE workspace SET lease_expires_at=1 WHERE id=?').run(record.id);
  const originalRecord=db.prepare('SELECT * FROM workspace WHERE id=?').get(record.id);
  const get=()=>run(['growth-status','--id',record.id,'--path',source,'--json']);

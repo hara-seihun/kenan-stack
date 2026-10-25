@@ -23,7 +23,7 @@ function fixture(action) {
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',head,'--json']);
   db=new DatabaseSync(state);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(record.id);
   const plan=JSON.stringify({intent:'budgeted',constructionBytes:0,growthBytes:123456789,headroomBytes:8589934592,growthLifecycle:{kind:'retired-future-growth',remainingGrowthBytes:0,retainedUse:'source',dispositionSha256:'a'.repeat(64),retiredAt:Date.now()}});
-  db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(statSync(source).dev),plan);
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(statSync(source).dev),plan);
   const release=(owner='fixture',sha=digest(plan))=>run(['release','--id',record.id,'--end-retention','--owner',owner,'--expected-plan-sha256',sha,'--json']);
   action({root,source,db,run,git,head,record,plan,release});
  } finally {db?.close();if(old===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=old;rmSync(root,{recursive:true,force:true});}
@@ -50,7 +50,7 @@ for(const kind of ['dirty','unpublished','borrower','unregistered-borrower'])tes
  if(kind==='unpublished'){writeFileSync(path.join(source,'proof'),'new source');git('-C',source,'commit','-am','unpublished');}
  if(kind.includes('borrower')){
   const borrower=path.join(root,'borrower');git('-C',source,'worktree','add','--detach',borrower,head);
-  if(kind==='borrower'){const saved=db.prepare('SELECT * FROM workspace_capacity WHERE workspace_id=?').get(record.id);db.prepare('DELETE FROM workspace_capacity WHERE workspace_id=?').run(record.id);const child=run(['register','--path',borrower,'--root',root,'--owner','fixture','--source-commit',head,'--json']);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(child.id);db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,saved.device_id,saved.plan_json);}
+  if(kind==='borrower'){const saved=db.prepare('SELECT * FROM workspace_capacity WHERE workspace_id=?').get(record.id);db.prepare('DELETE FROM workspace_capacity WHERE workspace_id=?').run(record.id);const child=run(['register','--path',borrower,'--root',root,'--owner','fixture','--source-commit',head,'--json']);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(child.id);db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,saved.device_id,saved.plan_json);}
  }
  if(kind==='unregistered-borrower')assert.throws(()=>release(),{code:'growth-writer-unknown'});
  else {const result=release();assert.equal(result.ok,false);assert.equal(result.action,'none');assert.equal(result.error.code,'retention-release-protected');}

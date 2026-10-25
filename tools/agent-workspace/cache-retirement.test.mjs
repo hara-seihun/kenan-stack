@@ -22,7 +22,7 @@ function fixture(action){
   const run=args=>{const original=process.stdout.write,code=process.exitCode;let text='';process.stdout.write=x=>{text+=x;return true;};try{main(args,state);}finally{process.stdout.write=original;process.exitCode=code;}return JSON.parse(text);};
   const head=git('rev-parse','HEAD'),record=run(['register','--path',root,'--root',base,'--owner','fixture','--source-commit',head,'--json']);
   db=new DatabaseSync(state);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(record.id);
-  db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(record.id,String(fs.statSync(root).dev),JSON.stringify({historical:'capacity retained'}));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(record.id,String(fs.statSync(root).dev),JSON.stringify({historical:'capacity retained'}));
   fs.writeFileSync(path.join(root,'source.ts'),'dirty irreplaceable');fs.mkdirSync(path.join(root,'ignored-evidence'));fs.writeFileSync(path.join(root,'ignored-evidence','receipt'),'private receipt');
   const cache=path.join(root,'node_modules');fs.mkdirSync(cache);fs.writeFileSync(path.join(cache,'dependency'),'rebuildable');
   const binding=workspaceTesting.cacheBinding(db,record.id),r={kind:'retire-workspace-cache',operationId:'fixture-cache-36a4',binding,cachePath:'node_modules',classification:'node-dependencies',ownerEvidence:'original actor ended; no more dependency use'};

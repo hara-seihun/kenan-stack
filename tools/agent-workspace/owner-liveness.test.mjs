@@ -91,8 +91,8 @@ function fixture(owner,action){
   let out='';const write=process.stdout.write;process.stdout.write=x=>{out+=x;return true;};try{main(['register','--path',source,'--root',root,'--owner',owner,'--source-commit',initial,'--lease-seconds','86400','--json'],state);}finally{process.stdout.write=write;}
   const record=JSON.parse(out);db=new DatabaseSync(state);
   const priced=()=>{const st=fs.statSync(source),now=Date.now(),plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096};
-   db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify(plan));
-   db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));return plan;};
+   db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify(plan));
+   db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));return plan;};
   const plan=()=>JSON.parse(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(record.id).plan_json);
   const row=()=>({...db.prepare('SELECT state,lease_expires_at FROM workspace WHERE id=?').get(record.id)});
   const release=(...extra)=>run(['release-ended-owners','--id',record.id,...extra,'--json']);

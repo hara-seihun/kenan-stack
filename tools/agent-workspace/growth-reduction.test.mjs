@@ -32,9 +32,9 @@ for (const [priorIntent, nextIntent] of [['source-only','budgeted'],['source-onl
  db=new DatabaseSync(state); const stats=statSync(source),device=String(stats.dev);
  // Original3357 numeric accounting shape; fixture sample is not a live measurement.
  const plan={intent:priorIntent,constructionBytes:328032984,sourceImportBytes:265006712,completedAllocationBytes:10416128,growthBytes:512*M,headroomBytes:8*1024**3,sourceCommit:head,estimate:'git-sparse-upper-bound'};
- db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(rec.id,device,JSON.stringify(plan));
+ db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(rec.id,device,JSON.stringify(plan));
  const sample={ok:true,bytes:61612032,allocatedBytes:61612032,device,inode:String(stats.ino),startedAt:Date.now(),completedAt:Date.now()};
- db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(rec.id,JSON.stringify(sample));
+ db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(rec.id,JSON.stringify(sample));
  const get=()=>run(['growth-status','--id',rec.id,'--path',source,'--json']);
  const args=['reprice-capacity','--id',rec.id,'--path',source,'--intent',nextIntent,'--headroom-gib','8','--growth-mib','64','--json'];
  assert.throws(()=>run(args.filter((_,i)=>i!==3 && i!==4)),/cannot reduce headroom or total growth|to budgeted expansion/); // retained refusal, before explicit reduction
@@ -57,21 +57,25 @@ for (const [priorIntent, nextIntent] of [['source-only','budgeted'],['source-onl
  assert.throws(()=>run([...args,'--owner','foreign','--reduction',file,'--reduction-sha256',digest(bytes)]),{code:'stale-growth-reduction'});untouched();
  // Another independent row's bill cannot be discounted to admit this reduction.
  const other=path.join(root,'other');mkdirSync(other);git('clone','--no-hardlinks',source,other);const r2=run(['register','--path',other,'--root',root,'--owner','foreign','--source-commit',head,'--json']);
- const otherPlan={...plan,growthBytes:1000000*M};db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(r2.id,device,JSON.stringify(otherPlan));
+ // Admit all fixtures before deliberately oversubscribing the private ledger.
+ const fresh=path.join(root,'fresh');git('clone','--no-hardlinks',source,fresh);
+ const r3=run(['register','--path',fresh,'--root',root,'--owner','new-owner','--source-commit',head,'--json']);
+ const otherPlan={...plan,growthBytes:1000000*M};db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(r2.id,device,JSON.stringify(otherPlan));
  // Expanded writes still require full admission even while a reduction can repair oversubscription.
  const expansion=args.filter((_,i)=>i!==3 && i!==4);expansion[expansion.indexOf('64')]='1024';expansion[expansion.indexOf(nextIntent)]='budgeted';
  assert.throws(()=>run(expansion),{code:'workspace-capacity-refused'});untouched();
  // Raising operating headroom enough to worsen the host deficit is not a monotone repair.
  const worse=[...args];worse[worse.indexOf('8')]='9';writeFileSync(file,bytes);
+ // Remove the fresh fixture's default 30 GiB floor while checking that a
+ // 9 GiB replacement actually worsens the original 8 GiB requirement.
+ db.prepare('DELETE FROM workspace_capacity WHERE workspace_id=?').run(r3.id);
  assert.throws(()=>run([...worse,'--owner','owner','--reduction',file,'--reduction-sha256',digest(bytes)]),error=>['unsafe-growth-reduction','workspace-capacity-refused'].includes(error.code));untouched();
  const nondecrease={...d,remainingGrowthBytes:512*M};const sameArgs=[...args];sameArgs[sameArgs.indexOf('64')]='512';const same=JSON.stringify(nondecrease);writeFileSync(file,same);
  assert.throws(()=>run([...sameArgs,'--owner','owner','--reduction',file,'--reduction-sha256',digest(same)]),{code:'unsafe-growth-reduction'});untouched();
  // A newly unestimated allocation cannot use the monotone replacement lane.
- const fresh=path.join(root,'fresh');git('clone','--no-hardlinks',source,fresh);
- const r3=run(['register','--path',fresh,'--root',root,'--owner','new-owner','--source-commit',head,'--json']);
  const freshPlan={intent:'unestimated',estimate:'unknown',constructionBytes:0,growthBytes:0,headroomBytes:8*1024**3};
- db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(r3.id,device,JSON.stringify(freshPlan));
- const fstats=statSync(fresh);db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(r3.id,JSON.stringify({...sample,inode:String(fstats.ino)}));
+ db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(r3.id,device,JSON.stringify(freshPlan));
+ const fstats=statSync(fresh);db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(r3.id,JSON.stringify({...sample,inode:String(fstats.ino)}));
  assert.throws(()=>run(['reprice-capacity','--id',r3.id,'--intent','budgeted','--growth-mib','64','--headroom-gib','8','--json']),{code:'workspace-capacity-refused'});
  assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(r3.id).plan_json,JSON.stringify(freshPlan));untouched();
  const otherBefore=db.prepare('SELECT * FROM workspace WHERE id=?').get(r2.id);

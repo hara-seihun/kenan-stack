@@ -531,10 +531,46 @@ function maintainReferenceClone(workspace, execute, statePath) {
 
 function register(database, input) {
   return withWorkspaceLock(database, input.path, () => {
-    if(!input.retained)return registerWorkspace(database,input);
-    database.exec("BEGIN IMMEDIATE");
-    try{const result=registerWorkspace(database,input);database.exec("COMMIT");return result;}
-    catch(e){database.exec("ROLLBACK");throw e;}
+    const existing = database.prepare("SELECT * FROM workspace WHERE path=?").get(input.path);
+    if (!input.retained && existing !== undefined && recordRetainsCustody(database,existing.id)) growthError("growth-admission-required","retained custody cannot register/adopt until fresh resume-growth admission");
+    const accounted = existing?.state !== "released" && existing !== undefined && recordedCapacity(database, existing.id) !== null;
+    if (input.adoptAccounted && !accounted) growthError("adoption-capacity-missing", "--adopt-accounted requires an existing unreleased capacity reservation");
+    const pricingRequested = ["intent","headroom-gib","growth-mib","min-free-gib"].some(flag => one(input.capacityArgs,flag) !== undefined);
+    if (pricingRequested && (input.retained || input.mode !== "writer" || accounted)) growthError("registration-pricing-conflict", "preservation/review registration grants no growth; use reprice-capacity for an existing reservation");
+    if (input.retained || input.mode !== "writer" || accounted) {
+      database.exec("BEGIN IMMEDIATE");
+      try { const result=registerWorkspace(database,input); database.exec("COMMIT"); return result; }
+      catch(e) { database.exec("ROLLBACK"); throw e; }
+    }
+    // External source already occupies physical disk. Price its FUTURE writes,
+    // not another construction/import, through create's device admission fence.
+    // Admission precedes registrationInspection, which may mutate Git custody.
+    const root = path.resolve(input.root ?? path.dirname(input.path));
+    const info = gitInfo(input.path);
+    const intent = capacityIntent(input.capacityArgs);
+    const plan = intent === null
+      ? { intent:"unestimated", estimate:"unknown", constructionBytes:Math.ceil(numberFlag(input.capacityArgs,"min-free-gib",DEFAULT_MIN_FREE_GIB)*1024**3), growthBytes:0, headroomBytes:0 }
+      : { ...intent, estimate:"whole-tree-upper-bound", constructionBytes:0, sourceImportBytes:0, sourceCommit:info.head };
+    const device = String(statSync(input.path).dev);
+    if (String(statSync(root).dev) !== device) fail("registration root and checkout must share a filesystem");
+    return withResourceLock(registryPaths.get(database), `capacity:${device}`, () => {
+      plan.admission = assertCapacity(root,input.capacityArgs,database,input.path,plan);
+      const measurement = workspaceAllocationSample(input.path,device,{deadline:Date.now()+10_000,maxEntries:1_000_000});
+      if (!measurement.ok) growthError("registration-allocation-unavailable",measurement.error);
+      // An absent baseline could make later samples spend future growth on
+      // already-existing files. Unknown allocation therefore admits no writer.
+      plan.completedAllocationBytes = measurement.allocatedBytes;
+      const inspected = registrationInspection(input.path,registryPaths.get(database));
+      if (inspected.head !== info.head) growthError("registration-source-changed","checkout changed during registration admission");
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const record = registerWorkspace(database,input,inspected);
+        database.prepare("INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)").run(record.id,device,JSON.stringify(plan));
+        database.prepare("INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json) VALUES(?,?)").run(record.id,JSON.stringify(measurement));
+        database.exec("COMMIT");
+        return record;
+      } catch(e) { database.exec("ROLLBACK"); throw e; }
+    });
   }, input.groupId);
 }
 
@@ -1381,7 +1417,7 @@ function print(value, json) {
 }
 
 function registerCommand(database, args) {
-  assertOnly(args, ["path", "root", "kind", "mode", "owner", "group", "source-commit", "lease-seconds", "cache", "cache-owned", "replace-cache", "retained", "json"]);
+  assertOnly(args, ["path", "root", "kind", "mode", "owner", "group", "source-commit", "lease-seconds", "cache", "cache-owned", "replace-cache", "retained", "adopt-accounted", "intent", "headroom-gib", "growth-mib", "min-free-gib", "max-count", "min-free-inodes-percent", "json"]);
   if (bool(args,"retained") && one(args,"lease-seconds") !== undefined) growthError("invalid-request","retained registration never takes a writing lease");
   const mode = one(args, "mode", "writer");
   if (!["writer", "review"].includes(mode)) fail("--mode must be writer or review");
@@ -1389,6 +1425,8 @@ function registerCommand(database, args) {
   const record = register(database, {
     path: selectedPath,
     retained: bool(args,"retained"),
+    adoptAccounted: bool(args,"adopt-accounted"),
+    capacityArgs: args,
     root: one(args, "root"),
     kind: one(args, "kind", "agent"),
     mode,
@@ -4659,7 +4697,7 @@ function help() {
   agent-workspace job-status --job-id SHA256 [--json]
   agent-workspace source-status --job-id SHA256 [--json]
   agent-workspace source-job-abandon --job-id SHA256 --owner OWNER --permit-sha256 SHA256 --json
-  agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--retained | --lease-seconds N]
+  agent-workspace register --path PATH [--owner ID] [--source-commit SHA] [--group ID] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--retained | --lease-seconds N] [--adopt-accounted | --intent source-only|budgeted --headroom-gib N --growth-mib N | --min-free-gib N]
   agent-workspace terminal-safety --id ID --path PATH --owner OWNER --json
   agent-workspace custody-status --id ID --path PATH --json
   agent-workspace end-writing --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json

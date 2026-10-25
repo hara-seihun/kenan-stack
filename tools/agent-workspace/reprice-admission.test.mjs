@@ -23,14 +23,14 @@ test('re-pricing an existing reservation charges only its increment, even on an 
   const own=checkout('current-kenan-custody','c2fb443a');
   db=new DatabaseSync(state);const stats=statSync(own.dir),device=String(stats.dev);
   const plan={intent:'source-only',estimate:'whole-tree-upper-bound',constructionBytes:52054788,sourceImportBytes:19353944,completedAllocationBytes:3923968,growthBytes:512*M,headroomBytes:8*G,sourceCommit:own.head};
-  db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(own.rec.id,device,JSON.stringify(plan));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(own.rec.id,device,JSON.stringify(plan));
   const sample={ok:true,bytes:6459392,allocatedBytes:6459392,device,inode:String(stats.ino),startedAt:Date.now(),completedAt:Date.now()};
-  db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(own.rec.id,JSON.stringify(sample));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(own.rec.id,JSON.stringify(sample));
   const free=()=>{const s=statfsSync(root);return s.bavail*s.bsize;};
   const unestimated=checkout('develop-taxonomy-src','other');
-  db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(unestimated.rec.id,device,JSON.stringify({intent:'unestimated',estimate:'unknown',constructionBytes:30*G,growthBytes:0,headroomBytes:0}));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(unestimated.rec.id,device,JSON.stringify({intent:'unestimated',estimate:'unknown',constructionBytes:30*G,growthBytes:0,headroomBytes:0}));
   const big=checkout('host-expiry','other');
-  db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(big.rec.id,device,JSON.stringify({...plan,sourceCommit:big.head,growthBytes:free()}));
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(big.rec.id,device,JSON.stringify({...plan,sourceCommit:big.head,growthBytes:free()}));
   const reprice=(growth,headroom='8')=>run(['reprice-capacity','--id',own.rec.id,'--intent','budgeted','--headroom-gib',headroom,'--growth-mib',growth,'--json']);
   const stored=()=>db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(own.rec.id).plan_json;
 

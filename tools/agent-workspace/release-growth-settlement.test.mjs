@@ -16,8 +16,8 @@ function fixture(action){
 function priced(f) {
  const st=fs.statSync(f.source),now=Date.now();
  const plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096};
- f.db.prepare('INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(f.record.id,String(st.dev),JSON.stringify(plan));
- f.db.prepare('INSERT INTO workspace_capacity_measurement VALUES(?,?)').run(f.record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));
+ f.db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(f.record.id,String(st.dev),JSON.stringify(plan));
+ f.db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(f.record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));
  return plan;
 }
 function checkBytes(f,head) {
