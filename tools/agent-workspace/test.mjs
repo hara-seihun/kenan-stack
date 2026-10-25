@@ -114,6 +114,16 @@ async function runAsync(args, env, cwd) {
   }
 }
 
+function runExit2(args, env, cwd) {
+  try {
+    execFileSync(entry, args, { cwd, env: { ...process.env, ...env }, encoding: "utf8", timeout: 90_000 });
+  } catch (error) {
+    assert.equal(error.status, 2, `expected exit 2 (custody kept), got ${error.status}: ${error.stderr}`);
+    return error.stdout.trim();
+  }
+  assert.fail("expected exit 2 (custody kept), command succeeded");
+}
+
 function git(cwd, ...args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
@@ -1124,13 +1134,17 @@ test("capacity caches survive retained source inspection and invalidate only bef
     const cached = () => db.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(created.id);
     const before = cached();
     assert.ok(before);
-    run(["release", "--id", created.id, "--json"], f.env);
+    const firstRelease = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    assert.equal(firstRelease.action, "none");
+    assert.equal(firstRelease.inspection.classification, "repair-required");
+    assert.equal(existsSync(created.path), true);
     assert.deepEqual(cached(), before);
     mkdirSync(path.join(created.path, "node_modules"));
     writeFileSync(path.join(created.path, "node_modules", "generated"), "generated\n");
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
     const generatedMeasurement=cached();
-    run(["release", "--id", created.id, "--json"], f.env);
+    assert.equal(JSON.parse(runExit2(["release", "--id", created.id, "--json"], f.env)).action, "none");
+    assert.equal(existsSync(created.path), true);
     assert.deepEqual(cached(), generatedMeasurement);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "dirty retained source\n");
     git(created.path,"checkout","--","file.txt");
@@ -2382,7 +2396,7 @@ test("a released checkout stays until its owner's input, execution, wait and can
     }
     setMetadata.run("{}");
     writeFileSync(path.join(f.root, "invalid-threads.sqlite3"), "not sqlite");
-    const unknown=JSON.parse(run(["release", "--id", created.id, "--json"], {
+    const unknown=JSON.parse(runExit2(["release", "--id", created.id, "--json"], {
       ...env, PI_THREAD_DATABASE: path.join(f.root, "invalid-threads.sqlite3"),
     }));
     assert.equal(unknown.action,"none");assert.equal(unknown.inspection.classification,"blocked");
