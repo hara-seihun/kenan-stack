@@ -4537,7 +4537,7 @@ function measureCapacityCommand(database, args, statePath) {
       }
       const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline,Date.now()+2000), statePath, selected===null);
       counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
-      results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...sample });
+      results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
       if(sample.partial)next.push({row,budget,cached});
     }
     pending=next;
