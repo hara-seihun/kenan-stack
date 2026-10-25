@@ -37,6 +37,7 @@ export function validateRetirement(disposition, binding, safety, now = Date.now(
       now - disposition.observedAt > 15 * 60_000) {
     growthError('stale-growth-disposition', 'owner disposition must be current, not future-dated');
   }
+  if (safety?.growthWriters !== undefined) return validateObservedGrowthWriters(safety);
   if (!Array.isArray(safety.references) || !Array.isArray(safety.errors)) {
     growthError('growth-writer-unknown', 'growth writer observation is unset');
   }
@@ -74,4 +75,32 @@ export function validateRetainedHeadroom(value, binding, plan, safety, now=Date.
   validateRetirement({...value,kind:'retire-future-growth',remainingGrowthBytes:0,writingLease:'retire'},binding,safety,now);
   if (!Array.isArray(safety.retainedBorrowers) || (safety.retainedBorrowers.length && (!Array.isArray(safety.borrowerCustody) || safety.borrowerCustody.length !== safety.retainedBorrowers.length)))
     growthError('retained-headroom-borrower','all registered and unregistered borrowers must be absent');
+}
+
+// Explicit reader/writer proof from growth-writer-observation.mjs. Only a complete, error-free observation whose
+// every reference is read-only may replace the conservative reference list. Any writable descriptor is active;
+// unknown access, unresolved units, incompleteness or errors stay unknown. References that the observation did
+// not account for (units, runtime or thread references) are still treated as active, as before.
+function validateObservedGrowthWriters(safety) {
+  const observed = safety.growthWriters;
+  if (observed === null || typeof observed !== 'object' || !Array.isArray(observed.references) || !Array.isArray(observed.errors)) {
+    growthError('growth-writer-unknown', 'growth writer observation is malformed');
+  }
+  const exited = r => r.exited === true;
+  const writers = observed.references.filter(r => r?.access === 'write' && !exited(r));
+  if (writers.length) growthError('growth-writer-active', 'writable descriptors remain on the checkout: '+JSON.stringify(writers.map(r=>({pid:r.pid,root:r.root,kind:r.kind,fd:r.fd,path:r.path}))).slice(0,4096));
+  if (observed.complete !== true || observed.errors.length) {
+    growthError('growth-writer-unknown', 'growth writer observation incomplete: '+(observed.errors.join('; ')||'complete flag not set').slice(0,2048));
+  }
+  const unknown = observed.references.filter(r => !exited(r) && r?.access !== 'read-only');
+  if (unknown.length) growthError('growth-writer-unknown', 'descriptor access could not be classified: '+JSON.stringify(unknown.map(r=>({pid:r?.pid,kind:r?.kind,fd:r?.fd}))).slice(0,2048));
+  const units = new Map((Array.isArray(observed.units) ? observed.units : []).map(u => [u?.id, u]));
+  const observedPids = new Set(Array.isArray(observed.observedPids) ? observed.observedPids : []);
+  const unaccounted = (Array.isArray(safety.references) ? safety.references : []).filter(r => {
+    if (r?.id !== undefined && r.pid === undefined) return units.get(r.id)?.state !== 'resolved';
+    if (r?.pid !== undefined) return !observedPids.has(r.pid);
+    return true;
+  });
+  if (unaccounted.length) growthError('growth-writer-active', 'runtime/thread/process references not covered by the observation remain: '+JSON.stringify(unaccounted.map(r=>({kind:r.kind,id:r.id,pid:r.pid,channel:r.channel,root:r.root,workspacePath:r.workspacePath}))).slice(0,4096));
+  if (Array.isArray(safety.errors) && safety.errors.length) growthError('growth-writer-unknown', safety.errors.join('; '));
 }
