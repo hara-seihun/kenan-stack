@@ -12,6 +12,19 @@ def thaw(root):
 class Freeze(unittest.TestCase):
  def fixture(self,root):
   p=Path(root)/'snapshot';p.mkdir();(p/'.git').mkdir();(p/'body').write_text('source');s=p.stat();return p,[s.st_dev,s.st_ino],s.st_uid
+ def test_cleanup_observer_refuses_immutable_root_or_nested_source_without_marker(self):
+  import json
+  helper=Path(__file__).with_name('frozen-custody.mjs').resolve().as_uri()
+  for nested in [False,True]:
+   with self.subTest(nested=nested),tempfile.TemporaryDirectory() as root:
+    p,ident,uid=self.fixture(root);target=p/'body' if nested else p
+    fd=os.open(target,os.O_RDONLY);before=m.flags(fd);m.setflags(fd,before|m.IMMUTABLE);os.close(fd)
+    try:
+     script="import {frozenCustody,assertUnfrozenCustody} from "+json.dumps(helper)+";const p="+json.dumps(str(p))+";try{assertUnfrozenCustody(p);throw new Error('cleanup unexpectedly allowed')}catch(e){if(e.code!=='FROZEN_CUSTODY')throw e;console.log(e.code)}"
+     observed=subprocess.run(['node','--input-type=module','-e',script],capture_output=True,text=True,timeout=10)
+     self.assertEqual(observed.returncode,0,observed.stderr);self.assertEqual(observed.stdout.strip(),'FROZEN_CUSTODY')
+     fd=os.open(target,os.O_RDONLY);self.assertEqual(m.flags(fd),before|m.IMMUTABLE);os.close(fd);self.assertEqual((p/'body').read_text(),'source')
+    finally:thaw(str(p))
  def test_raw_write_and_delete_refused_other_writer_preserved(self):
   with tempfile.TemporaryDirectory() as root:
    p,ident,uid=self.fixture(root); other=Path(root)/'other';other.write_text('other')

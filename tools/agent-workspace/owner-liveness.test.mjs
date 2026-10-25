@@ -221,3 +221,13 @@ test('missing path with an unfinished thread retains its reservation',()=>fixtur
  const r=f.release('--execute');assert.equal(r.results[0].action,'none');assert.match(r.results[0].inspection.reason,/writing references remain/);assert.equal(f.row().state,'active');
  }finally{db.close();if(old===undefined)delete process.env.PI_THREAD_DATABASE;else process.env.PI_THREAD_DATABASE=old;}
 }));
+
+test('ended owner frozen handoff refuses before stripping caches, chown or checkout removal',()=>fixture(ARCHIVED,f=>{
+ f.priced();f.observe(ended(ARCHIVED));fs.mkdirSync(path.join(f.source,'node_modules'));fs.writeFileSync(path.join(f.source,'node_modules','keep'),'original');fs.writeFileSync(path.join(f.source,'.git','pi-frozen-handoff.json'),'{}');
+ const result=f.release('--execute');assert.equal(result.results[0].inspection.code,'FROZEN_CUSTODY',JSON.stringify(result));assert.equal(fs.readFileSync(path.join(f.source,'node_modules','keep'),'utf8'),'original');assert.ok(fs.existsSync(path.join(f.source,'.git','pi-frozen-handoff.json')));assert.notEqual(f.row().state,'released');
+}));
+
+test('retained frozen handoff returns typed refusal without terminal effects',()=>fixture(ARCHIVED,f=>{
+ f.priced();f.observe(ended(ARCHIVED));f.db.exec('CREATE TABLE workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());fs.writeFileSync(path.join(f.source,'.git','pi-frozen-handoff.json'),'{}');
+ const result=f.release('--execute');assert.equal(result.results[0].error.code,'FROZEN_CUSTODY');assert.ok(fs.existsSync(f.source));assert.equal(f.row().state,'active');
+}));

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
 import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
 import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
@@ -864,6 +865,7 @@ function drainGc(statePath, scopedIds) {
 }
 
 function repairCacheOwnership(target) {
+  assertUnfrozenCustody(target);
   const uid = process.getuid?.();
   const gid = process.getgid?.();
   if (uid === undefined || gid === undefined) fail(`cannot repair cache ownership without a numeric user and group: ${target}`);
@@ -871,6 +873,7 @@ function repairCacheOwnership(target) {
 }
 
 function moveToGc(target, destination) {
+  assertUnfrozenCustody(target);
   try {
     renameSync(target, destination);
     spawnRemoval(destination);
@@ -1006,6 +1009,7 @@ function stopSystemdReferences(references) {
 }
 
 function removeWorkspace(record, statePath) {
+  assertUnfrozenCustody(record.path);
   if (record.checkoutType === "worktree") {
     const rawCommon = git(record.path, ["rev-parse", "--git-common-dir"]);
     const common = path.resolve(record.path, rawCommon);
@@ -1041,6 +1045,8 @@ function inspectRecord(record, options = {}) {
   }
   const now = options.now ?? Date.now();
   if (!existsSync(record.path)) return { classification: "missing", reason: "checkout path is absent", processes: [], containers: [], systemdUnits: [] };
+  const frozen = frozenCustody(record.path);
+  if (frozen) return {classification:"blocked",...frozen,processes:[],containers:[],systemdUnits:[]};
   if (record.leaseExpiresAt > now && !options.ignoreLease) {
     return { classification: "active", reason: `lease valid until ${new Date(record.leaseExpiresAt).toISOString()}`, processes: [], containers: [], systemdUnits: [] };
   }
@@ -1289,7 +1295,7 @@ function blockedReconciliation(database, records, error, execute) {
       ? updateState(database, record, "blocked", detail) : record;
     return {
       record: current,
-      inspection: { classification: "blocked", reason: detail, processes: [], containers: [], systemdUnits: [] },
+      inspection: { classification: "blocked", reason: detail, ...(error.code?.startsWith("FROZEN_CUSTODY") ? {code:error.code}:{}), processes: [], containers: [], systemdUnits: [] },
       cacheDisposition:{kind:"unknown",reason:"interrupted reconciliation; no cache-effect inference"},
       action: "none",
     };
@@ -3293,7 +3299,7 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
     }
     if (retainedParent(database, record.path)) growthError("retention-release-parent", "shared Git parent still retains custody");
     const protect = inspection => ({ok:false, record:recordBy(database,{id:record.id}), action:"none", inspection,
-      error:{code:"retention-release-protected", message:inspection.reason}});
+      error:{code:inspection.code ?? "retention-release-protected", message:inspection.reason}});
     const observe = () => {
       {
         const safety = growthSafety(database, record);
@@ -3702,7 +3708,7 @@ function releaseEndedOwnersCommand(database, args, statePath) {
     try {
       results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath }));
     } catch (error) {
-      results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : "owner-liveness-release-failed", detail: error.message })));
+      results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : error.code ?? "owner-liveness-release-failed", detail: error.message })));
     }
     last = record.id;
     if (execute && !targeted && results.at(-1)?.code !== "deferred") database.prepare(
@@ -4775,7 +4781,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["measure-capacity", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
