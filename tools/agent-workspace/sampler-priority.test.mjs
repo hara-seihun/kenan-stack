@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
+import {syncBuiltinESMExports} from 'node:module';
 import {main,workspaceTesting} from './workspace.mjs';
 
 const G=1024**3;
@@ -72,4 +73,71 @@ test('oldest attempts rotate first so repeated failure cannot starve another sta
  }
  const pass=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--json']);
  assert.deepEqual(pass.results.map(r=>path.basename(r.path)),['current','small','large']);
+}));
+
+// Advance a clock at real filesystem observation boundaries instead of sleeping or
+// constructing a huge tree. Both the full walk and the fleet slices read these files.
+function withSlowWalk(f, action, stepMs = 500) {
+ const directory=path.join(f.rows.large.path,'slow-walk');fs.mkdirSync(directory);
+ for(let i=0;i<8;i++)fs.writeFileSync(path.join(directory,String(i)),'data');
+ const now=Date.now,lstat=fs.lstatSync;let elapsed=0;
+ Date.now=()=>now()+elapsed;
+ fs.lstatSync=(file,...args)=>{
+  const result=lstat(file,...args);
+  if(path.dirname(String(file))===directory)elapsed+=stepMs;
+  return result;
+ };
+ syncBuiltinESMExports();
+ try{return action();}finally{Date.now=now;fs.lstatSync=lstat;syncBuiltinESMExports();}
+}
+
+for(const selector of ['id','path'])test(`targeted --${selector} uses the requested budget beyond two seconds`,()=>fixture(f=>{
+ withSlowWalk(f,()=>{
+  const pass=f.run(['measure-capacity',`--${selector}`,f.rows.large[selector],'--budget-ms','18000','--json']);
+  assert.equal(pass.results.length,1);assert.equal(pass.results[0].status,'measured');
+  assert.ok(pass.elapsedMs>=4000);assert.ok(pass.elapsedMs<18000);
+  assert.equal(pass.results[0].ok,true);
+ });
+}));
+
+test('targeted exhaustion respects its shorter budget and preserves the successful sample',()=>fixture(f=>{
+ f.run(['measure-capacity','--id',f.rows.large.id,'--json']);
+ const sample=()=>f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json;
+ const previous=sample();
+ withSlowWalk(f,()=>{
+  const pass=f.run(['measure-capacity','--id',f.rows.large.id,'--budget-ms','1200','--json']);
+  assert.equal(pass.results[0].status,'error');assert.match(pass.results[0].error,/measurement budget exhausted/);
+  assert.ok(pass.elapsedMs>=1200);assert.ok(pass.elapsedMs<2500);
+  assert.equal(sample(),previous);
+ });
+}));
+
+test('fleet sampling keeps bounded slices and preserves prior credit until the walk finishes',()=>fixture(f=>{
+ f.run(['measure-capacity','--id',f.rows.large.id,'--json']);
+ const sample=()=>f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json;
+ const previous=sample();
+ // Give this row priority without changing the real successful sample.
+ f.db.exec('DELETE FROM workspace_capacity WHERE workspace_id NOT IN (SELECT workspace_id FROM workspace_capacity_measurement)');
+ withSlowWalk(f,()=>{
+  const pass=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--budget-ms','1200','--json']);
+  assert.ok(pass.results.some(result=>result.status==='partial'));
+  assert.equal(pass.progress.measured,0);assert.equal(sample(),previous);
+  assert.ok(f.db.prepare('SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?').get(f.rows.large.id));
+  assert.ok(pass.elapsedMs<2500);
+  const completed=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--budget-ms','18000','--json']);
+  assert.equal(completed.progress.measured,1);
+  assert.equal(completed.results.at(-1).status,'measured');
+  assert.equal(f.db.prepare('SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?').get(f.rows.large.id),undefined);
+  assert.notEqual(sample(),previous);
+ });
+}));
+
+// The CLI accepts up to five minutes; there must not be a second hidden
+// one-minute ceiling inside the non-incremental walk.
+test('targeted sampling honors requested budgets longer than one minute',()=>fixture(f=>{
+ withSlowWalk(f,()=>{
+  const pass=f.run(['measure-capacity','--id',f.rows.large.id,'--budget-ms','180000','--json']);
+  assert.equal(pass.results[0].status,'measured');
+  assert.ok(pass.elapsedMs>=80000);assert.ok(pass.elapsedMs<180000);
+ },10000);
 }));

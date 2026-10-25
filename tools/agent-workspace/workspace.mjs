@@ -4512,7 +4512,7 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
   try {
     return withWorkspaceLock(database, row.path, () => {
       const excludedPaths=paths.filter(candidate=>candidate.startsWith(`${row.path}${path.sep}`));
-      if(!incremental)return store(workspaceAllocationSample(row.path,row.device_id,{deadline:Math.min(deadline,Date.now()+60_000),maxEntries:2_000_000,excludedPaths}));
+      if(!incremental)return store(workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths}));
       database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
       const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
@@ -4581,7 +4581,10 @@ function measureCapacityCommand(database, args, statePath) {
         results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
         continue;
       }
-      const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline,Date.now()+2000), statePath, selected===null);
+      // A targeted walk owns the requested bounded budget. Fleet sampling keeps
+      // its short per-row lock window and resumable traversal slices.
+      const sampleDeadline = selected === null ? Math.min(deadline, Date.now() + 2000) : deadline;
+      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null);
       counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
       results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
       if(sample.partial)next.push({row,budget,cached});
