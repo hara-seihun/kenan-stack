@@ -1077,7 +1077,7 @@ function stackQueueSafety(roots,safety,resourceKind,deadline) {
 }
 function stackQueueInspection(queued) {
   if(queued.errors.length) return {classification:"blocked",reason:`current Stack queue observation unavailable: ${queued.errors.join("; ")}`,processes:[],containers:[],systemdUnits:[],currentStackQueueProtected:true};
-  if(queued.references.length) return {classification:"referenced",reason:"current/queued/uncertain Stack workspace custody remains",currentStackReferences:queued.references,processes:[],containers:[],systemdUnits:[],currentStackQueueProtected:true};
+  if(queued.references.length) return {classification:"referenced",reason:"current/queued/uncertain Stack workspace custody remains",currentStackReferences:queued.references,currentStackQueueObservations:queued.observations??[],processes:[],containers:[],systemdUnits:[],currentStackQueueProtected:true};
   return null;
 }
 function inspectRecord(record, options = {}) {
@@ -3360,8 +3360,11 @@ function markSourceRetained(database,id) {
   database.exec("CREATE TABLE IF NOT EXISTS workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)");
   database.prepare("INSERT OR REPLACE INTO workspace_source_retention VALUES(?,?)").run(id,Date.now());
 }
+function explicitSourceRetention(database, id) {
+  return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_source_retention'").get() && database.prepare("SELECT 1 FROM workspace_source_retention WHERE workspace_id=?").get(id));
+}
 function recordRetainsCustody(database, id) {
-  if(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_source_retention'").get() && database.prepare("SELECT 1 FROM workspace_source_retention WHERE workspace_id=?").get(id)) return true;
+  if (explicitSourceRetention(database, id)) return true;
   if (generatedRetirementPending(database, id)) return true;
   const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(id);
   return row !== undefined && retainedGrowth(JSON.parse(row.plan_json));
@@ -3574,6 +3577,25 @@ function releaseCommand(database, args, statePath) {
   }
   const record = recordBy(database, selectorFrom(args, 'release'));
   const records = recordsInGroup(database, record);
+  const previous = releaseSettlement(database, record.id);
+  const planRow = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+  // An ordinary release may retire growth while a temporary consumer retains the tree.
+  // Retrying that same end-writing intent needs terminal safety, not new growth admission.
+  if (records.length === 1 && ["repair-required", "released"].includes(record.state) && record.leaseExpiresAt === 0 &&
+      previous.kind === "completed" && previous.owner === record.owner &&
+      previous.result?.futureGrowthSettlement?.kind === "retired" &&
+      previous.result.futureGrowthSettlement.requestId === previous.requestId &&
+      previous.result.record?.path === record.path &&
+      previous.result.record?.sourceCommit === record.sourceCommit &&
+      planRow && retainedGrowth(JSON.parse(planRow.plan_json)) &&
+      !explicitSourceRetention(database, record.id) && !generatedRetirementPending(database, record.id) &&
+      !generatedOnlySourceCustody(database, record.id)) {
+    const terminalArgs = {positional:[], named:new Map([["owner",[record.owner]], ["expected-plan-sha256",[digest(planRow.plan_json)]]])};
+    const result = terminalRetentionRelease(database, record, terminalArgs, statePath);
+    print({...result, ordinaryReleaseContinuation:{requestId:previous.requestId, basis:"original ordinary release retired future growth"}}, bool(args,"json"));
+    if (!result.ok) process.exitCode = BLOCKED_RELEASE_EXIT;
+    return;
+  }
   if (records.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database,candidate.path))) {
     const results = records.map(retainedCustodyResult);
     print(results.length === 1 ? results[0] : results, bool(args,"json"));

@@ -65,3 +65,46 @@ for(const mode of ['running','unknown'])test(mode+' thread custody refuses growt
   assert.equal(JSON.parse(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(f.record.id).plan_json).growthLifecycle,undefined);checkBytes(f,head);
  } finally {if(prior===undefined)delete process.env.PI_THREAD_DATABASE;else process.env.PI_THREAD_DATABASE=prior;db.close();}
 }));
+
+test('ordinary release by ID completes its retired-growth cleanup after source becomes durable',()=>fixture(f=>{
+ f.commit();priced(f);const first=f.release();
+ assert.equal(first.futureGrowthSettlement.kind,'retired');
+ f.git('-C',f.source,'push','origin','HEAD:refs/heads/main');
+ const result=f.release();assert.equal(result.ok,true,JSON.stringify(result));
+ assert.equal(result.action,'released');assert.equal(fs.existsSync(f.source),false);
+ assert.equal(result.ordinaryReleaseContinuation.requestId,first.releaseSettlement.requestId);
+ assert.equal(f.release().action,'already-released');
+ assert.equal(f.db.prepare('SELECT count(*) AS n FROM workspace_retention_release WHERE workspace_id=?').get(f.record.id).n,1);
+ assert.equal(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(f.record.id).plan_json.includes('retired-future-growth'),true);
+}));
+test('ordinary retired-growth retry still protects dirty source',()=>fixture(f=>{
+ f.commit();priced(f);const first=f.release();assert.equal(first.futureGrowthSettlement.kind,'retired');
+ f.git('-C',f.source,'push','origin','HEAD:refs/heads/main');fs.writeFileSync(path.join(f.source,'proof'),'dirty');
+ const result=f.release();assert.equal(result.ok,false);assert.equal(result.action,'none');
+ assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'dirty');
+ assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');
+}));
+
+test('ordinary release preserves a foreign queued consumer and then completes by ID after its exact settlement',()=>fixture(f=>{
+ priced(f);
+ const data=path.join(f.root,'release-data'),id='74551659-ca7f-47cc-92ff-c3e4b786e9e9',owner='226bb31d-e421-4f2b-99bb-ced3e5606ad9',base=f.git('-C',f.source,'rev-parse','HEAD');
+ for(const d of ['qualification-authority-requests','prepared-qualifications','merge-queue','producer-admission','release-launcher'])fs.mkdirSync(path.join(data,d),{recursive:true});
+ const put=(p,x)=>fs.writeFileSync(path.join(data,p),JSON.stringify(x));
+ const request={version:1,root:f.source,rootSource:base,name:'foreign-consumer',pipeline:{operation:id,owner,base,leaves:[base]}};
+ put('qualification-authority-requests/'+id+'.json',request);put('prepared-qualifications/'+id+'.json.workspace.json',{id:f.record.id,path:f.source});put('prepared-qualifications/'+id+'.json.assembly.json',{request,candidate:base});put('merge-queue/state.json',{batches:[]});
+ const previous=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=data;
+ try{
+  const first=f.release();assert.equal(first.inspection.classification,'referenced');assert.equal(first.futureGrowthSettlement.kind,'retired',JSON.stringify(first));
+  const protectedAgain=f.release();assert.equal(protectedAgain.ok,false);assert.equal(fs.existsSync(f.source),true);assert.ok(protectedAgain.inspection.currentStackReferences.some(r=>r.kind==='qualification_request'));
+  put('producer-admission/'+id+'.completed.json',{state:'completed',identity:request.pipeline});
+  const done=f.release();assert.equal(done.action,'released',JSON.stringify(done));assert.equal(done.ordinaryReleaseContinuation.requestId,first.releaseSettlement.requestId);assert.equal(fs.existsSync(f.source),false);
+ }finally{if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=previous;}
+}));
+
+test('ordinary retired-growth continuation does not override a separately retained source',()=>fixture(f=>{
+ f.commit();priced(f);assert.equal(f.release().futureGrowthSettlement.kind,'retired');
+ f.git('-C',f.source,'push','origin','HEAD:refs/heads/main');
+ f.db.exec('CREATE TABLE IF NOT EXISTS workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');
+ f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());
+ const result=f.release();assert.equal(result.action,'none');assert.equal(result.ordinaryReleaseContinuation,undefined);assert.equal(fs.existsSync(f.source),true);
+}));
