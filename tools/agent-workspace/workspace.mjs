@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {admitWithRefresh} from './admission-refresh.mjs';
+import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
@@ -2020,7 +2021,8 @@ function measuredBudgetBytes(plan, state) {
   return plan.growthBytes + (state === "creating" ? plan.constructionBytes : 0);
 }
 
-function terminalQualificationPaths(rows) {
+let nativeTerminalProjection=null;
+function terminalQualificationPaths(rows, database) {
   const census = qualificationReferences(rows.map(row=>row.path), process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT ? {dataRoot:process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT} : {});
   if (!census.complete) return new Map();
   const settled=new Map();
@@ -2029,6 +2031,35 @@ function terminalQualificationPaths(rows) {
     if(!row||row.state==='creating'||census.references.some(ref=>ref.paths.some(q=>q===row.path||q.startsWith(row.path+path.sep)||row.path.startsWith(q+path.sep))))continue;
     try{const at=statSync(item.evidence).mtimeMs;if(row.created_at===undefined||row.created_at<=at)settled.set(row.path,at);}catch{}
   }
+  if (database===undefined) return settled;
+  const statePath=registryPaths.get(database);
+  const holdsDevice=[...heldResourceLocks.keys()].some(key=>key.startsWith(`${statePath}\0capacity:`));
+  if(holdsDevice){
+    if(nativeTerminalProjection?.database===database)for(const [root,at] of nativeTerminalProjection.paths)settled.set(root,at);
+    return settled;
+  }
+  // Native root-precheck plans are a separate consumer format. Preserve all
+  // execution files and plans; only project zero future writes after exact native
+  // settlement and a fresh complete writer/consumer observation. Frozen roots are
+  // deliberately ineligible, even when every payload has ended.
+  const censusDeadline=Date.now()+3000;
+  const roots = nativeTerminalRootPaths(rows.filter(row => {
+    try { return !retainedGrowth(JSON.parse(row.plan_json)); } catch { return false; }
+  }), {
+    head: root => git(root,["rev-parse","HEAD"]),
+    safe: row => rootTerminalSafety(row,{
+      frozen: root => {
+        if(Date.now()>=censusDeadline)throw Error('terminal census budget exhausted');
+        return frozenCustody(root,{recursive:true,budget:{baseSeconds:1,perEntrySeconds:0,capSeconds:1}});
+      },
+      observe: row => {
+        const deadline=censusDeadline;
+        const record=recordBy(database,{id:row.id});
+        return duringInspection(deadline,()=>terminalSafety(database,record,deadline));
+      },
+    }),
+  });
+  for (const [root,at] of roots) if (!census.references.some(ref=>ref.paths.some(q=>q===root||q.startsWith(root+path.sep)||root.startsWith(q+path.sep)))) settled.set(root,at);
   return settled;
 }
 
@@ -2049,20 +2080,21 @@ function capacityReservations(database, device, reservedPath, measure) {
   const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
     WHERE c.device_id=? AND w.path!=? AND w.state!='released' ORDER BY w.created_at DESC, w.id`)
     .all(device, reservedPath ?? "");
-  const settled = terminalQualificationPaths(rows);
+  const settled = terminalQualificationPaths(rows, database);
   const priced = rows.map(row => {
       const plan = JSON.parse(row.plan_json);
       if (!["source-only", "budgeted", "unestimated"].includes(plan.intent) ||
         !(plan.intent === "unestimated" ? ["unknown"] : ["whole-tree-upper-bound", "git-sparse-upper-bound"]).includes(plan.estimate)) fail("invalid capacity ledger intent or estimate");
       capacityRequirement(plan, []);
-      const budget = measuredBudgetBytes(plan, row.state);
+      let restored=false;
+      try{restored=(JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json??'{}').restoreAt??0)>settled.get(row.path);}catch{restored=true;}
+      const terminal = row.state!=='creating' && settled.has(row.path) && !restored;
+      const budget = terminal ? 0 : measuredBudgetBytes(plan, row.state);
       const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
       const liability = ledgerLiability(plan, row.state, measurement);
-      let restored=false;
-    try{restored=(JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json??'{}').restoreAt??0)>settled.get(row.path);}catch{restored=true;}
-    const policy = row.state!=='creating' && settled.has(row.path) && !restored ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation ?? measurement);
+      const policy = terminal ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation ?? measurement);
       if (policy!==null) {
         liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : policy.effectiveRemainingBytes??plan.growthBytes;
         growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy});
@@ -2094,7 +2126,16 @@ function capacityReservations(database, device, reservedPath, measure) {
 // each decision/commit, but release it before acquiring another checkout's fence.
 function withCapacityAdmission(database, statePath, device, action) {
   return admitWithRefresh({
-    decide: () => withResourceLock(statePath, `capacity:${device}`, action),
+    decide: () => {
+      // Never perform recursive source or process observations under the device
+      // fence. Native restoration still overrides this per-decision observation.
+      const rows=database.prepare(`SELECT c.plan_json,w.id,w.state,w.path,w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
+        WHERE c.device_id=? AND w.state!='released'`).all(device);
+      const paths=terminalQualificationPaths(rows,database);
+      nativeTerminalProjection={database,paths};
+      try{return withResourceLock(statePath, `capacity:${device}`, action);}
+      finally{nativeTerminalProjection=null;}
+    },
     candidates: error => {
       // Foreground source preparation owns only 1.5 seconds. Its original
       // durable worker performs slow sampling under the same request identity.

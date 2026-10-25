@@ -847,3 +847,25 @@ completed qualification or terminal refusal removes remaining preparation growth
 only when the complete qualification census shows no current request or train
 reference. Its source retention, original plan, lease and operating headroom do
 not change. The supported release command remains the route for physical cleanup.
+
+### Automatic native root-precheck growth settlement
+
+Capacity projection also recognizes the native root-precheck plans in
+`~/data/converge-root-precheck`. It credits only the exact registered root and
+candidate workspace identities after **every declared compile, tests and smoke
+command** has a settled root-owned heavy-authority record. The read-only privileged
+observer returns only command/source/operation identity and terminal state, never
+grant tokens. Missing stages, changed source or commands, another plan sharing the
+root, and any pending or uncertain authority preserve the reservation. An explicit
+growth restoration newer than settlement restores the original charge.
+
+Before credit, the current source HEAD must match, and a fresh complete native
+process, queued-tool, runtime and borrower census must show no consumer. Frozen
+roots and unknown observations are ineligible. The bounded immutable-attribute
+observation can conservatively retain very large trees rather than delay admission.
+No plan, source file, lease, root-owned authority record or reservation plan is
+modified; zero future growth is projected anew on each capacity read. Source
+custody and the original operating headroom remain. This is not source deletion,
+release, reclaimed disk, successful qualification, activation or deployment. Settled
+owner-directed source workspaces still use ordinary `release`/`release-ended-owners`;
+a push or an expired lease alone never establishes ended writing.
