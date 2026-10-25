@@ -754,3 +754,9 @@ The ended-owner sweep includes retained custody. For a singleton retained checko
 An ordinary `release` whose result is `blocked` (a frozen or unknown-frozen tree, an unobservable queue, retained custody) prints that result and exits 2, so a caller cannot read exit 0 as released.
 
 Frozen source is never implicitly thawed by reclamation. A `pi-frozen-handoff.json` marker or filesystem immutable flag produces a typed `FROZEN_CUSTODY` refusal before ownership repair or removal. The destructive boundary also scans descendants without following symlinks; the observation's time allowance grows with the tree (20 seconds plus 0.5 ms per entry seen, at most 15 minutes, with no entry-count limit), so a large tree is not refused for its size. An unavailable or over-budget observation produces `FROZEN_CUSTODY_UNKNOWN` and preserves the tree. Only the explicit, owner-bound snapshot thaw lifecycle can undo the original freeze. This applies even to positively ended native owners.
+
+### Authenticated native owner bindings
+
+`--owner` remains a human-readable label, not proof of a running worker. Creation and new registration record an authenticated native caller from its root-created tool-call scope when available. Reassignment updates that binding or clears it when no native caller is authenticated. UUID owner labels keep their existing meaning.
+
+`agent-workspace bind-native-owners --root PATH --json` proposes migration of older task-labelled records. Add `--execute` to record bindings proven by exact checkout-job creation receipts and the matching tool call in that native agent's conversation on exactly one serving channel. Malformed, missing, changed or ambiguous evidence stays unbound. This changes no checkout, writing lease or retention condition. `release-ended-owners` uses these bindings for positive native liveness evidence, including pending wakes, and repeats all existing source, immutable, runtime and borrower checks before any deletion.
