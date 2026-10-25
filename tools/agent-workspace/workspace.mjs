@@ -4,7 +4,7 @@ import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mj
 import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {withStdoutFile, foldRecords} from './stdout-records.mjs';
-import {hasUncoveredCommits} from './release-reachability.mjs';
+import {hasUncoveredCommits, observedRemoteHeads} from './release-reachability.mjs';
 import {classifyLocalMerges,disposedMergesCoverRelease,recordMergeDisposal} from './local-merge-disposal.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
@@ -801,7 +801,6 @@ function gitDisposition(record, nestedWorkspaces = []) {
     .split("\n").filter(Boolean).map(line => line.split(" "));
   const knownHeads = new Map(record.checkoutType === "clone"
     ? inventory.filter(([ref]) => ref.startsWith("refs/heads/")) : []);
-  const refs = [...knownHeads.keys()];
   const candidates = [...knownHeads.values(), head];
   const durable = inventory.filter(([ref]) => ref.startsWith("refs/remotes/")).map(([,sha]) => sha);
   if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
@@ -813,20 +812,13 @@ function gitDisposition(record, nestedWorkspaces = []) {
     try { return disposedMergesCoverRelease((args, options) => git(record.path, args, options), path.resolve(record.path, git(record.path, ["rev-parse", "--git-common-dir"])), candidates, durable); }
     catch { return false; }
   };
-  if (initiallyUncovered && refs.length) {
-    const remotes = git(record.path, ["remote"]).split("\n").filter(Boolean);
-    for (const remote of remotes) {
-      const observed = command("git", ["-C", record.path, "ls-remote", "--heads", remote, ...refs], {timeout:4000});
-      if (observed.status !== 0) return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable for ${remote}; checkout and generated caches retained`, head};
-      for (const line of observed.stdout.split("\n").filter(Boolean)) {
-        const [sha,ref] = line.split(/\s+/u);
-        if (!/^[a-f0-9]{40,64}$/u.test(sha) || !knownHeads.has(ref)) return {safe:false, sourceRetention:true, reason:"remote custody observation malformed; checkout and generated caches retained", head};
-        if (knownHeads.get(ref) === sha) durable.push(sha);
-      }
-    }
+  // Local remote-tracking refs can be stale: a commit pushed under any other branch name is
+  // durable too. Every head each remote advertises now is read before calling a commit unique.
+  if (initiallyUncovered) {
+    const observed = observedRemoteHeads(command, record.path);
+    if (!observed.ok && observed.code !== "remote-custody-absent") return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable: ${observed.detail}; checkout and generated caches retained`, head};
+    if (observed.ok) durable.push(...observed.durable);
     if (uncovered() && !recordedMergesCover()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
-  } else if (initiallyUncovered && !recordedMergesCover()) {
-    return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
   if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
   if (head === record.durableSourceCommit) return { safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head };
@@ -1939,20 +1931,30 @@ function workspaceAllocationSample(workspacePath, device, options) {
 
 function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device, now = Date.now()) {
   const row = database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(workspaceId);
-  if (row === undefined) return { ok: false, error: "allocated-block cache missing" };
+  if (row === undefined) return { ok: false, code: "allocated-block-cache-missing", error: "allocated-block cache missing" };
   const sample = JSON.parse(row.measurement_json);
-  if (!sample.ok) return { ok: false, error: `allocated-block measurement failed: ${sample.error}` };
+  if (!sample.ok) return { ok: false, code: "allocated-block-measurement-failed", error: `allocated-block measurement failed: ${sample.error}` };
   for (const value of [sample.startedAt, sample.completedAt, sample.bytes, sample.allocatedBytes]) {
     if (!Number.isSafeInteger(value) || value < 0) fail("invalid capacity allocation cache");
   }
-  if (sample.completedAt < sample.startedAt || sample.completedAt > now || now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) return { ok: false, error: "allocated-block cache stale or future-dated" };
+  if (sample.completedAt < sample.startedAt || sample.completedAt > now) return { ok: false, code: "allocated-block-cache-future-dated", error: `allocated-block cache future-dated (completed ${sample.completedAt}, observed ${now})` };
+  if (now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) return { ok: false, code: "allocated-block-cache-stale", ageMs: now - sample.startedAt,
+    error: `allocated-block cache stale (age ${Math.round((now - sample.startedAt) / 1000)} s; limit ${CAPACITY_MEASUREMENT_MAX_AGE_MS / 1000} s)` };
   try {
     const stats = lstatSync(workspacePath);
-    if (!stats.isDirectory() || String(stats.dev) !== device || sample.device !== device || String(stats.ino) !== sample.inode) return { ok: false, error: "allocated-block cache root identity changed" };
-  } catch (error) { return { ok: false, error: `allocated-block cache root unavailable: ${error.code ?? error.message}` }; }
+    if (!stats.isDirectory() || String(stats.dev) !== device || sample.device !== device || String(stats.ino) !== sample.inode) return { ok: false, code: "allocated-block-cache-root-changed", error: "allocated-block cache root identity changed" };
+  } catch (error) { return { ok: false, code: "allocated-block-cache-root-unavailable", error: `allocated-block cache root unavailable: ${error.code ?? error.message}` }; }
   const marginBytes = Math.max(CAPACITY_MEASUREMENT_MARGIN_BYTES, Math.ceil(sample.bytes / 100));
   return { ok: true, bytes: Math.max(0, sample.bytes - marginBytes), allocatedBytes: sample.allocatedBytes,
     startedAt: sample.startedAt, completedAt: sample.completedAt, marginBytes };
+}
+
+// The bytes a plan charges in full unless a current allocated-block sample credits its
+// growth. Zero means the ledger never reads a measurement for it: retired future growth,
+// or a plan with no growth and no pending construction. The sampler uses the same rule.
+function measuredBudgetBytes(plan, state) {
+  if (retainedGrowth(plan)) return 0;
+  return plan.growthBytes + (state === "creating" ? plan.constructionBytes : 0);
 }
 
 function capacityReservations(database, device, reservedPath, measure) {
@@ -1977,10 +1979,10 @@ function capacityReservations(database, device, reservedPath, measure) {
       if (!["source-only", "budgeted", "unestimated"].includes(plan.intent) ||
         !(plan.intent === "unestimated" ? ["unknown"] : ["whole-tree-upper-bound", "git-sparse-upper-bound"]).includes(plan.estimate)) fail("invalid capacity ledger intent or estimate");
       capacityRequirement(plan, []);
-      const budget = plan.growthBytes + (row.state === "creating" ? plan.constructionBytes : 0);
-      const unmeasured = retainedGrowth(plan) || budget === 0;
+      const budget = measuredBudgetBytes(plan, row.state);
+      const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
-      if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, error: measurement.error, reservedBytes: budget });
+      if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
       const liability = ledgerLiability(plan, row.state, measurement);
       headroomBytes = Math.max(headroomBytes, liability.headroomBytes);
       return liability.reservedBytes;
@@ -3951,30 +3953,9 @@ function terminalSafety(database,record,deadline) {
   return {...safety,errors:[...safety.errors,...native.errors],references:[...safety.references,...native.references],nativeObservations:native.observations};
 }
 function verifiedRemoteCustody(record) {
-  const remotes=git(record.path,["remote"]).split("\n").filter(Boolean);
-  if(!remotes.length)growthError("retained-source-unpublished","no remote custody");
-  const durable=[],observations=[];
-  for(const remote of remotes) {
-    const r=command("git",["-C",record.path,"ls-remote","--heads",remote],{timeout:4000});
-    if(r.status!==0)growthError("retained-source-unknown","fresh remote observation failed: "+remote);
-    const remoteShas=[];
-    for(const line of r.stdout.split("\n").filter(Boolean)) {
-      const [sha,ref]=line.split(/\s+/u);
-      if(!/^[a-f0-9]{40,64}$/.test(sha)||!ref?.startsWith("refs/heads/"))growthError("retained-source-unknown","malformed remote refs");
-      remoteShas.push(sha);
-    }
-    if(remoteShas.length) {
-      const checked=command("git",["-C",record.path,"cat-file","--batch-check=%(objectname) %(objecttype)"],{input:remoteShas.join("\n")+"\n",timeout:4000});
-      if(checked.status!==0)growthError("retained-source-unknown","remote object inventory failed");
-      const rows=checked.stdout.split("\n");
-      if(rows.length!==remoteShas.length)growthError("retained-source-unknown","incomplete remote object inventory");
-      for(let i=0;i<rows.length;i++) {
-        if(rows[i]===remoteShas[i]+" commit")durable.push(remoteShas[i]);
-        else if(rows[i]!==remoteShas[i]+" missing")growthError("retained-source-unknown","invalid remote object response");
-      }
-    }
-    observations.push({remote,refsSha256:digest(r.stdout),observedAt:Date.now()});
-  }
+  const observed=observedRemoteHeads(command,record.path);
+  if(!observed.ok)growthError(observed.code==="remote-custody-absent"?"retained-source-unpublished":"retained-source-unknown",observed.detail);
+  const {durable,observations}=observed;
   const candidates=[git(record.path,["rev-parse","HEAD"]),...git(record.path,["for-each-ref","--format=%(objectname)","refs/heads"]).split("\n").filter(Boolean)];
   if(!durable.length||hasUncoveredCommits((a,o)=>git(record.path,a,o),candidates,durable))growthError("retained-source-unpublished","local HEAD/branches not covered by current remote heads");
   return observations;
@@ -4161,6 +4142,9 @@ function disposeLocalMergesCommand(database, args) {
     const candidates = [...inventory.filter(([ref]) => ref.startsWith("refs/heads/")).map(([, sha]) => sha), head];
     const durable = inventory.filter(([ref]) => ref.startsWith("refs/remotes/")).map(([, sha]) => sha);
     if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
+    const observed = observedRemoteHeads(command, record.path);
+    if (!observed.ok && observed.code !== "remote-custody-absent") growthError("merge-disposal-refused", `${observed.detail}; unique source is never disposed`);
+    if (observed.ok) durable.push(...observed.durable);
     const gitRun = (a, o) => git(record.path, a, o);
     const verdict = classifyLocalMerges(gitRun, candidates, durable);
     if (!verdict.ok) growthError("merge-disposal-refused", `${verdict.reason}; unique source is never disposed`);
@@ -4306,31 +4290,62 @@ function measureWorkspaceRow(database, row, paths, deadline) {
   } catch (error) { return store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
 }
 
+// One pass refreshes the samples the ledger actually reads, most valuable first: rows charged
+// in full because their sample is missing, failed or stale (largest charge first), then
+// current samples closest to expiry. Rows the ledger never measures are skipped, not walked.
+// A targeted --id/--path request always measures the selected row.
 function measureCapacityCommand(database, args, statePath) {
   assertOnly(args, ["root", "path", "id", "budget-ms", "json"]);
   const budgetMs = numberFlag(args, "budget-ms", 40_000);
   if (!Number.isSafeInteger(budgetMs) || budgetMs < 1 || budgetMs > 300_000) fail("--budget-ms must be between 1 and 300000");
-  const deadline = Date.now() + budgetMs;
+  const started = Date.now(), deadline = started + budgetMs;
   const selected = one(args, "id") !== undefined || one(args, "path") !== undefined ? recordBy(database, selectorFrom(args, 'measure-capacity')).id : null;
   const root = one(args, "root") === undefined ? null : path.resolve(one(args, "root"));
   // Sampling serializes only the actual checkout, never the entire pool.
   // A long tree walk must not hold a global lock across unrelated records.
-  {
-    const rows = database.prepare(`SELECT w.id,w.path,w.state,w.group_id,c.device_id,c.plan_json FROM workspace w
-      JOIN workspace_capacity c ON c.workspace_id=w.id LEFT JOIN workspace_capacity_measurement m ON m.workspace_id=w.id
-      WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)
-      ORDER BY coalesce(json_extract(m.measurement_json,'$.completedAt'),0),w.id`).all(selected, selected, root, root);
-    const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
-    const results = [];
-    for (const row of rows) {
-      const plan = JSON.parse(row.plan_json);
-      if (plan.intent !== "unestimated" && plan.growthBytes === 0 && row.state !== "creating") continue;
-      if (Date.now() >= deadline) { results.push({ path: row.path, status: "deferred" }); continue; }
-      const sample = measureWorkspaceRow(database, row, paths, deadline);
-      results.push({ path: row.path, status: sample.ok ? "measured" : "error", ...sample });
-    }
-    print(results, bool(args, "json"));
+  const rows = database.prepare(`SELECT w.id,w.path,w.state,w.group_id,c.device_id,c.plan_json FROM workspace w
+    JOIN workspace_capacity c ON c.workspace_id=w.id
+    WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)`).all(selected, selected, root, root);
+  const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
+  const skipped = { "retired-future-growth": 0, "zero-liability": 0 };
+  const queue = [];
+  for (const row of rows) {
+    const plan = JSON.parse(row.plan_json);
+    const budget = measuredBudgetBytes(plan, row.state);
+    if (selected === null && budget === 0) { skipped[retainedGrowth(plan) ? "retired-future-growth" : "zero-liability"] += 1; continue; }
+    const cached = cachedWorkspaceAllocation(database, row.id, row.path, row.device_id, started);
+    queue.push({ row, budget, cached });
   }
+  queue.sort((a, b) => (a.cached.ok - b.cached.ok)
+    || (a.cached.ok ? a.cached.startedAt - b.cached.startedAt : b.budget - a.budget)
+    || (a.row.id < b.row.id ? -1 : a.row.id > b.row.id ? 1 : 0));
+  const chargedBefore = queue.filter(item => !item.cached.ok).reduce((sum, item) => sum + item.budget, 0);
+  const results = [];
+  const counts = { measured: 0, error: 0, deferred: 0 };
+  for (const { row, budget, cached } of queue) {
+    if (Date.now() >= deadline) {
+      counts.deferred += 1;
+      results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
+      continue;
+    }
+    const sample = measureWorkspaceRow(database, row, paths, deadline);
+    counts[sample.ok ? "measured" : "error"] += 1;
+    results.push({ path: row.path, status: sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...sample });
+  }
+  const now = Date.now();
+  let chargedAfter = 0, oldestCurrentStartedAt = null;
+  const after = {};
+  for (const { row, budget } of queue) {
+    const cached = cachedWorkspaceAllocation(database, row.id, row.path, row.device_id, now);
+    if (!cached.ok) { chargedAfter += budget; after[cached.code] = (after[cached.code] ?? 0) + 1; }
+    else if (oldestCurrentStartedAt === null || cached.startedAt < oldestCurrentStartedAt) oldestCurrentStartedAt = cached.startedAt;
+  }
+  print({ kind: "capacity-measurement", budgetMs, elapsedMs: now - started,
+    progress: { pricedRows: rows.length, eligible: queue.length, skipped, ...counts,
+      fullyChargedBytesBefore: chargedBefore, fullyChargedBytesAfter: chargedAfter, uncreditedAfter: after,
+      oldestCurrentSampleAgeMs: oldestCurrentStartedAt === null ? null : now - oldestCurrentStartedAt,
+      sampleLimitMs: CAPACITY_MEASUREMENT_MAX_AGE_MS },
+    results }, bool(args, "json"));
 }
 
 function reconcileCommand(database, args, statePath) {

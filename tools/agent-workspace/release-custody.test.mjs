@@ -19,6 +19,14 @@ test('published exact branch with stale tracking refs is verified read-only befo
  const head=f.commit();f.git('-C',f.source,'push',f.remote,'HEAD:refs/heads/main');assert.notEqual(f.git('-C',f.source,'rev-parse','refs/remotes/origin/main'),head);
  const result=f.release();assert.equal(result.record.state,'released',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');assert.equal(result.cacheDisposition.kind,'detached-for-retirement');assert.deepEqual(result.cacheDisposition.paths,['node_modules']);assert.equal(result.cacheDisposition.physicalReclaim,'not-measured');
 }));
+test('a commit pushed under a different remote branch name is durable even with stale local refs',()=>fixture(f=>{
+ const head=f.commit();f.git('-C',f.source,'push',f.remote,'HEAD:refs/heads/kenan/leaf-'+head.slice(0,8));assert.equal(f.git('-C',f.source,'for-each-ref','--format=%(refname)','refs/remotes').includes('leaf'),false);
+ const result=f.release();assert.equal(result.record.state,'released',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');
+}));
+test('a remote tip absent locally covers nothing: unique local work stays retained',()=>fixture(f=>{
+ const other=path.join(f.root,'other');f.git('clone',f.remote,other);f.git('-C',other,'config','user.name','O');f.git('-C',other,'config','user.email','o@example.invalid');fs.writeFileSync(path.join(other,'x'),'x');f.git('-C',other,'add','x');f.git('-C',other,'commit','-m','remote only');f.git('-C',other,'push','origin','HEAD:refs/heads/elsewhere');
+ f.commit();const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.match(result.inspection.reason,/absent from remote refs/);
+}));
 test('a different unpublished local branch still protects all cache/source even when current HEAD is published',()=>fixture(f=>{
  const unique=f.commit();f.git('-C',f.source,'branch','private-work',unique);f.git('-C',f.source,'checkout','main');f.git('-C',f.source,'reset','--hard','refs/remotes/origin/main');const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.cacheDisposition.kind,'none-selected');assert.equal(f.git('-C',f.source,'rev-parse','private-work'),unique);assert.equal(fs.existsSync(path.join(f.source,'node_modules','receipt')),true);
 }));

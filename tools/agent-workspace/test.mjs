@@ -1698,7 +1698,7 @@ test("budgeted source creation shares existing objects and records immutable spa
     assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
     const beforeGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device);
     writeFileSync(path.join(created.path, "generated.bin"), Buffer.alloc(70 * 1024 ** 2));
-    const measured = JSON.parse(run(["measure-capacity", "--id", created.id, "--json"], f.env));
+    const measured = JSON.parse(run(["measure-capacity", "--id", created.id, "--json"], f.env)).results;
     assert.equal(measured[0].status, "measured");
     const partialGrowth = workspaceTesting.allocatedWorkspaceBytes(created.path, device).bytes - beforeGrowth.bytes - 64 * 1024 ** 2;
     assert.deepEqual(workspaceTesting.capacityReservations(db, device), { priced: [8 * 1024 ** 2 - partialGrowth], headroomBytes: 1024 ** 3, unpricedDormant: 0, sourceImports: [] });
