@@ -235,13 +235,18 @@ export function parseSystemdUnits(output, manager) {
   });
 }
 
-// A host with many transient units can make systemctl slow. A timeout there leaves the systemd census incomplete, which
-// is a typed "census-incomplete" result: the caller classifies the checkout as blocked and keeps custody, rather than the
-// whole release failing hard. list-units may use the whole remaining budget; show scales with the number of units.
+// The systemd census reads properties only for services. A scope has no ExecStart or WorkingDirectory (its processes
+// were started outside systemd and are covered by the process census), so showing scopes, often the bulk of transient
+// units, costs a manager round trip per unit and can never produce a reference. Services are shown in bounded batches.
+// A slow or stalled manager leaves the census incomplete: a typed "census-incomplete" result that the caller classifies
+// as blocked and keeps custody, rather than the whole release failing hard.
 const SYSTEMD_LIST_TIMEOUT_MS = 120_000;
 const SYSTEMD_SHOW_BASE_MS = 20_000;
 const SYSTEMD_SHOW_PER_UNIT_MS = 50;
+export const SYSTEMD_SHOW_BATCH = 512;
 export const systemdShowTimeoutMs = (unitCount) => SYSTEMD_SHOW_BASE_MS + SYSTEMD_SHOW_PER_UNIT_MS * unitCount;
+const SHOWN_PROPERTIES = ["Id", "ActiveState", "WorkingDirectory", "ExecStart", "MainPID", "SubState", "ControlPID",
+  "ControlGroup", "ExecStop", "ExecStopPost", "TriggeredBy"].map((property) => `--property=${property}`);
 
 export function systemdManagerSnapshot(manager, execute = run) {
   try { return systemdManagerObservation(manager, execute); }
@@ -276,14 +281,16 @@ function systemdManagerObservation(manager, execute) {
   if (new Set(unitIds).size !== unitIds.length) {
     return { units: [], available: true, error: "systemctl list-units returned duplicate unit records" };
   }
-  if (unitIds.length === 0) return { units: [], available: true };
-  const shown = execute("systemctl", [
-    ...managerArgs, "show", "--property=Id", "--property=ActiveState", "--property=WorkingDirectory",
-    "--property=ExecStart", "--property=MainPID", "--property=SubState", "--property=ControlPID",
-    "--property=ControlGroup", "--property=ExecStop", "--property=ExecStopPost", "--property=TriggeredBy", "--", ...unitIds,
-  ], { timeout: systemdShowTimeoutMs(unitIds.length) });
-  if (shown.status !== 0) return { units: [], available: true, error: shown.stderr || shown.stdout || "systemctl show failed" };
-  return { units: parseSystemdUnits(shown.stdout, manager), available: true };
+  const services = unitIds.filter((unit) => unit.endsWith(".service"));
+  const units = [];
+  for (let start = 0; start < services.length; start += SYSTEMD_SHOW_BATCH) {
+    const batch = services.slice(start, start + SYSTEMD_SHOW_BATCH);
+    const shown = execute("systemctl", [...managerArgs, "show", ...SHOWN_PROPERTIES, "--", ...batch],
+      { timeout: systemdShowTimeoutMs(batch.length) });
+    if (shown.status !== 0) return { units: [], available: true, error: shown.stderr || shown.stdout || "systemctl show failed" };
+    units.push(...parseSystemdUnits(shown.stdout, manager));
+  }
+  return { units, available: true };
 }
 
 export function unionSystemd(user, system) {

@@ -2223,10 +2223,10 @@ test("systemd discovery keeps multiline command descriptions out of unit operand
         status: 0, stderr: "",
         stdout: JSON.stringify(unitIds.map((unit) => ({ unit, description }))),
       };
-      assert.deepEqual(args.slice(args.indexOf("--") + 1), unitIds);
+      assert.deepEqual(args.slice(args.indexOf("--") + 1), unitIds.filter((unit) => unit.endsWith(".service")));
       return {
         status: 0, stderr: "",
-        stdout: `ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -c root='${workspace}/data'\\nprint(root) ; }\nWorkingDirectory=/srv\nId=worker.service\nActiveState=active\n\nId=session-12.scope\nActiveState=active\nWorkingDirectory=${workspace}\nExecStart=\n`,
+        stdout: `ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -c root='${workspace}/data'\\nprint(root) ; }\nWorkingDirectory=/srv\nId=worker.service\nActiveState=active\n`,
       };
     });
     assert.equal(calls.length, 2);
@@ -2234,26 +2234,39 @@ test("systemd discovery keeps multiline command descriptions out of unit operand
     assert.equal(calls[0].includes("--user"), manager === "user");
     assert.equal(snapshot.error, undefined);
     const references = workspaceTesting.systemdReferences(workspace, snapshot).references;
-    assert.deepEqual(references.map(({ id }) => id), ["worker.service", "session-12.scope"]);
+    assert.deepEqual(references.map(({ id }) => id), ["worker.service"]);
     assert.equal(workspaceTesting.systemdReferences(`${workspace}-unrelated`, snapshot).references.length, 0);
   }
 });
 
-test("a systemd timeout is a typed census-incomplete result that blocks cleanup, and show time scales with a large unit list", () => {
+test("a large transient unit list is censused in bounded service batches, and a timeout is a typed census-incomplete result", () => {
+  const workspace = "/srv/workspaces/agent-one";
+  const scopes = Array.from({ length: 3000 }, (_, index) => `run-p${index}-i${index}.scope`);
+  const services = Array.from({ length: 1000 }, (_, index) => `transient-${index}.service`);
+  const listing = JSON.stringify([...scopes, ...services].map((unit) => ({ unit })));
+  const shownBatches = [];
+  const started = performance.now();
+  const snapshot = workspaceTesting.systemdManagerSnapshot("user", (_executable, args, options) => {
+    if (args.includes("list-units")) return { status: 0, stderr: "", stdout: listing };
+    const batch = args.slice(args.indexOf("--") + 1);
+    shownBatches.push({ batch, timeout: options.timeout });
+    return { status: 0, stderr: "", stdout: batch.map((unit) =>
+      `Id=${unit}\nActiveState=active\nSubState=running\nMainPID=7\nWorkingDirectory=${unit === "transient-999.service" ? workspace : "/srv"}\nExecStart=\n`).join("\n") };
+  });
+  assert.ok(performance.now() - started < 1_000);
+  assert.equal(snapshot.error, undefined);
+  assert.deepEqual(shownBatches.flatMap(({ batch }) => batch), services);
+  assert.ok(shownBatches.every(({ batch, timeout }) => batch.length <= 512 && timeout === systemdShowTimeoutMs(batch.length)));
+  assert.deepEqual(workspaceTesting.systemdReferences(workspace, snapshot).references.map(({ id }) => id), ["transient-999.service"]);
   for (const phase of ["list-units", "show"]) {
-    const unitIds = Array.from({ length: 4000 }, (_, index) => `transient-${index}.service`);
-    const timeouts = [];
-    const snapshot = workspaceTesting.systemdManagerSnapshot("user", (_executable, args, options) => {
-      timeouts.push(options.timeout);
+    const failed = workspaceTesting.systemdManagerSnapshot("user", (_executable, args) => {
       if (args.includes(phase)) throw new CensusFailure(`workspace inspection timed out: systemctl ${phase}`);
-      return { status: 0, stderr: "", stdout: JSON.stringify(unitIds.map((unit) => ({ unit }))) };
+      return { status: 0, stderr: "", stdout: listing };
     });
-    assert.match(snapshot.error, /^census-incomplete: .*timed out/u);
-    assert.deepEqual(snapshot.units, []);
-    assert.equal(workspaceTesting.systemdReferences("/srv/workspaces/agent-one", snapshot).error, snapshot.error);
-    if (phase === "show") assert.equal(timeouts[1], systemdShowTimeoutMs(4000));
+    assert.match(failed.error, /^census-incomplete: .*timed out/u);
+    assert.deepEqual(failed.units, []);
+    assert.equal(workspaceTesting.systemdReferences(workspace, failed).error, failed.error);
   }
-  assert.ok(systemdShowTimeoutMs(4000) > systemdShowTimeoutMs(10));
 });
 
 test("systemd malformed discovery refuses safety instead of omitting units", () => {
