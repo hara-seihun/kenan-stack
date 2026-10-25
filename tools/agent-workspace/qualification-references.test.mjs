@@ -138,7 +138,8 @@ test("missing queue state or request directory is an error that protects all pat
   assert.equal(protects(result, "/x/y"), true);
   fs.rmSync(f.directories.requestsDir, { recursive: true });
   result = census(f);
-  assert.match(result.errors.join("\n"), /directory missing/u);
+  assert.equal(result.complete, true);
+  assert.equal(result.observations[0].state, "not-installed");
 });
 
 test("malformed or contradictory records fail closed and keep the paths that can still be named", () => {
@@ -200,4 +201,11 @@ test("the census is bounded and only reads", () => {
 
 test("a current request also protects its carried root workspace before dispatch",()=>{
  const f=fixture();try{f.addRequest(A);const carried=`${CLONES}/carry-root-${A}`;f.write(path.join(f.directories.preparedDir,`${A}.json.root-workspace.json`),{id:B,path:carried,root:BASE});const result=census(f);assert.deepEqual(result.errors,[]);assert.equal(protects(result,carried),true);assert.equal(protects(result,carried+'/infrastructure'),true);}finally{fs.rmSync(f.data,{recursive:true,force:true});}
+});
+
+test("a host with only release locks and historical residue has no installed qualification component",()=>{
+ const data=fs.mkdtempSync(path.join(os.tmpdir(),'qualification-uninstalled-'));try{
+ fs.mkdirSync(path.join(data,'locks'));fs.mkdirSync(path.join(data,'old-scout'));const result=qualificationReferences(null,{dataRoot:data});assert.deepEqual(result.errors,[]);assert.equal(result.complete,true);assert.equal(result.references.length,0);assert.equal(result.observations[0].state,'not-installed');
+ fs.mkdirSync(path.join(data,'qualification-authority-requests'));assert.equal(qualificationReferences(null,{dataRoot:data}).complete,false,'one existing authority source plus a missing peer is damaged, not uninstalled');
+ }finally{fs.rmSync(data,{recursive:true,force:true});}
 });
