@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {admitWithRefresh} from './admission-refresh.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
@@ -555,7 +556,7 @@ function register(database, input) {
       : { ...intent, estimate:"whole-tree-upper-bound", constructionBytes:0, sourceImportBytes:0, sourceCommit:info.head };
     const device = String(statSync(input.path).dev);
     if (String(statSync(root).dev) !== device) fail("registration root and checkout must share a filesystem");
-    return withResourceLock(registryPaths.get(database), `capacity:${device}`, () => {
+    return withCapacityAdmission(database, registryPaths.get(database), device, () => {
       plan.admission = assertCapacity(root,input.capacityArgs,database,input.path,plan);
       const measurement = workspaceAllocationSample(input.path,device,{deadline:Date.now()+10_000,maxEntries:1_000_000});
       if (!measurement.ok) growthError("registration-allocation-unavailable",measurement.error);
@@ -2089,9 +2090,32 @@ function capacityReservations(database, device, reservedPath, measure) {
   return { priced, headroomBytes, unpricedDormant, growthRepricing, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
-// Diagnostic projection only: the admission decision still uses capacityRequirement.
-// Preserve absent source estimates explicitly, and never infer import bytes from
-// requested future growth. These are the SAME reservations used by the refusal.
+// Only a pre-effect admission refusal may retry. Acquire the device fence for
+// each decision/commit, but release it before acquiring another checkout's fence.
+function withCapacityAdmission(database, statePath, device, action) {
+  return admitWithRefresh({
+    decide: () => withResourceLock(statePath, `capacity:${device}`, action),
+    candidates: error => {
+      // Foreground source preparation owns only 1.5 seconds. Its original
+      // durable worker performs slow sampling under the same request identity.
+      const failures=error.capacity?.breakdown?.measurementFailures??[];
+      const charged=new Map((error.capacity?.breakdown?.automaticGrowthRepricing??[]).map(item=>[item.path,item.effectiveRemainingBytes]));
+      const candidates=failures.filter(item=>['allocated-block-cache-stale','allocated-block-cache-missing','allocated-block-measurement-failed'].includes(item.code)
+        && (charged.get(item.path)??item.reservedBytes)>0)
+        .sort((a,b)=>(charged.get(b.path)??b.reservedBytes)-(charged.get(a.path)??a.reservedBytes));
+      if(candidates.length && sourcePreparationMode==='foreground')throw new SourcePreparationRequired();
+      return candidates;
+    },
+    refresh: (candidate,deadline) => {
+      const row=database.prepare("SELECT * FROM workspace WHERE path=? AND state!='creating' AND state!='released'").get(candidate.path);
+      if(!row)return {kind:'not-eligible'};
+      const record=recordBy(database,{id:row.id});
+      return refreshEndedOwnerSample(database,record,deadline,statePath);
+    },
+  });
+}
+
+// Diagnostic projection of the same reservations used by the refusal.
 function capacityRefusalDetails(plan, reservations) {
   const requiredBytes = capacityRequirement(plan, reservations.priced, reservations.headroomBytes);
   const unestimated = plan.intent === "unestimated";
@@ -2653,7 +2677,7 @@ function prepareSourceValue(database, args, request) {
   writePreparationReceipt(forecastPath, forecast);
   const device = String(statSync(root).dev);
   let resolvedCommit;
-  withResourceLock(statePath, `capacity:${device}`, () => {
+  withCapacityAdmission(database, statePath, device, () => {
     const priorImport = database.prepare("SELECT receipt FROM workspace_source_capacity WHERE destination=?").get(destination);
     if (priorImport && priorImport.receipt !== request.receipt) throw new ResourceBusyError("source import retains capacity under a different original request; reconcile that operation first");
     try { plan.admission = assertCapacity(root, args, database, destination, plan); }
@@ -2932,7 +2956,7 @@ function createWorkspace(database, args, statePath) {
     const { sourceCommit, plan } = preparation.value;
     const device = String(statSync(root).dev);
     const caller = nativeCaller();
-    withResourceLock(statePath, `capacity:${device}`, () => {
+    withCapacityAdmission(database, statePath, device, () => {
       plan.admission = assertCapacity(root, args, database, destination, plan);
       database.exec("BEGIN IMMEDIATE");
       try {
@@ -2971,7 +2995,7 @@ function createWorkspace(database, args, statePath) {
       ? { intent: "unestimated", estimate: "unknown", constructionBytes: Math.ceil(numberFlag(args, "min-free-gib", DEFAULT_MIN_FREE_GIB) * 1024 ** 3), growthBytes: 0, headroomBytes: 0 }
       : sourceCapacityPlan(repository, sourceCommit, intent, statfsSync(root).bsize, mirror, sparsePatterns);
     const device = String(statSync(root).dev);
-    withResourceLock(statePath, `capacity:${device}`, () => {
+    withCapacityAdmission(database, statePath, device, () => {
       plan.admission = assertCapacity(root, args, database, destination, plan);
       database.prepare("INSERT INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)")
         .run(row.id, device, JSON.stringify(plan));
@@ -3302,7 +3326,7 @@ function heartbeatCommand(database, args, statePath) {
     const row=database.prepare("SELECT device_id,plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
     if(!row)fail("heartbeat growth restoration requires an existing priced workspace");
     const old=JSON.parse(row.plan_json);
-    withWorkspaceLock(database,record.path,()=>withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
+    withWorkspaceLock(database,record.path,()=>withCapacityAdmission(database,statePath,row.device_id,()=>{
       const sample=cachedWorkspaceAllocation(database,record.id,record.path,row.device_id);
       const current=database.prepare("SELECT created_at FROM workspace WHERE id=?").get(record.id);
       const policy=projectGrowthPolicy(database,{...current,id:record.id,state:record.state},old,sample.ok?{...sample,bytes:sample.rawBytes}:sample);
@@ -4827,7 +4851,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
