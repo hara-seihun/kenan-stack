@@ -209,3 +209,15 @@ for(const mode of ['live','observation-error','wake'])test('missing path preserv
  f.observe(mode==='live'?{agents:[{id:LIVE,state:'running',archived:false}],wakes:[]}:mode==='observation-error'?{errors:['no grant']}:ended(LIVE,{wakes:[{id:'protect',agentId:'manager:converge',held:true,text:f.source}]}));
  const r=f.release('--execute');assert.equal(r.results[0].action,'none',JSON.stringify(r));assert.equal(f.row().state,'active');
 }));
+
+for(const field of ['agentId','heldFor'])test('missing path with unknown owner retains its direct '+field+' wake',()=>fixture(ABSENT,f=>{
+ f.priced();fs.rmSync(f.source,{recursive:true});f.observe({agents:[],wakes:[{id:'direct',agentId:'manager:converge',text:'resume work', [field]:ABSENT}]});
+ const r=f.release('--execute');assert.equal(r.results[0].code,'pending-owner-wake');assert.equal(f.row().state,'active');
+}));
+test('missing path with an unfinished thread retains its reservation',()=>fixture(ARCHIVED,f=>{
+ f.priced();fs.rmSync(f.source,{recursive:true});f.observe(ended(ARCHIVED));
+ const old=process.env.PI_THREAD_DATABASE,thread=path.join(f.root,'threads.db'),db=new DatabaseSync(thread);
+ try {db.exec('CREATE TABLE thread(id TEXT PRIMARY KEY,cwd TEXT,state TEXT,metadata TEXT); CREATE TABLE thread_work(thread_id TEXT,status TEXT); CREATE TABLE thread_execution(thread_id TEXT,ended_at INTEGER)');db.prepare('INSERT INTO thread VALUES(?,?,?,?)').run('running',f.source,'running','{}');process.env.PI_THREAD_DATABASE=thread;
+ const r=f.release('--execute');assert.equal(r.results[0].action,'none');assert.match(r.results[0].inspection.reason,/writing references remain/);assert.equal(f.row().state,'active');
+ }finally{db.close();if(old===undefined)delete process.env.PI_THREAD_DATABASE;else process.env.PI_THREAD_DATABASE=old;}
+}));

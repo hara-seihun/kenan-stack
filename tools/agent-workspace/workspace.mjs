@@ -3334,7 +3334,7 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
       } catch (error) { database.exec("ROLLBACK"); throw error; }
       if (inspection.classification !== "missing") removeWorkspace(record, statePath);
       removeEmptyWorkspaceContainer(record);
-      updateState(database, record, "released", `owner ended retained custody: ${inspection.reason}`);
+      updateState(database, record, "released", `terminal retained custody released: ${inspection.reason}`);
       return {ok:true, record:recordBy(database,{id:record.id}), action:"released", inspection, removedCaches};
     }, deadline);
   }, selected.groupId, deadline));
@@ -3581,6 +3581,8 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
   if (observation.errors.length) return { code: "owner-unknown" };
   const unended = verdicts.find((verdict, index) => verdict.kind !== "ended" && (existsSync(group[index].path) || verdict.kind === "live"));
   if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
+  const directWake = observation.wakes.some(wake => group.some(record => wake.agentId === record.owner || wake.heldFor === record.owner));
+  if (directWake) return { code: "pending-owner-wake" };
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
   if (group.some(candidate => existsSync(candidate.path) && (generatedOnlySourceCustody(database, candidate.id) || retainedParent(database, candidate.path))))
@@ -3653,7 +3655,7 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
     owner TEXT NOT NULL, verdict_json TEXT NOT NULL, observation_json TEXT NOT NULL, result_json TEXT NOT NULL)`);
   const insert = database.prepare("INSERT INTO workspace_owner_liveness_release(workspace_id,request_id,occurred_at,owner,verdict_json,observation_json,result_json) VALUES(?,?,?,?,?,?,?)");
   return settled.map(item => {
-    const verdict = released.byId.get(item.record.id), requestId = item.releaseSettlement?.requestId ?? "unknown";
+    const verdict = released.byId.get(item.record.id), requestId = item.releaseSettlement?.requestId ?? randomUUID();
     insert.run(item.record.id, requestId, Date.now(), verdict.owner, JSON.stringify(verdict),
       JSON.stringify({ observations: released.fresh.observations, observedAt: released.fresh.observedAt }),
       JSON.stringify({ action: item.action, physicalDisposition: item.physicalDisposition, futureGrowthSettlement: item.futureGrowthSettlement ?? null, capacitySample: samples.get(item.record.id) ?? null,
