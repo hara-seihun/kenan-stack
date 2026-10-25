@@ -178,3 +178,12 @@ test('a measurement that cannot complete keeps the full future-growth allowance'
   assert.ok(fs.existsSync(path.join(f.source,'proof')));
  }finally{fs.chmodSync(sealed,0o700);}
 }));
+
+test('an explicit --after walk visits every candidate once and ends',()=>fixture(STOPPED,f=>{
+ const second=path.join(f.root,'second-ws');f.git('clone',path.join(f.root,'remote.git'),second);
+ f.run(['register','--path',second,'--root',f.root,'--owner',STOPPED,'--source-commit',f.git('-C',second,'rev-parse','HEAD'),'--json']);
+ f.observe({agents:[{id:STOPPED,channel:'beta',state:'running',archived:false}],wakes:[]});
+ const seen=[];let after='start';
+ for(let i=0;i<5;i++){const r=f.run(['release-ended-owners','--root',f.root,'--max-records','1','--after',after,'--json']);seen.push(...r.results.map(x=>x.record.id));if(!r.nextAfter)break;after=r.nextAfter;}
+ assert.equal(seen.length,2);assert.equal(new Set(seen).size,2);
+}));

@@ -3659,14 +3659,20 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
   const saved = execute && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope = ?").get(scope)?.after_id : undefined;
   const after = one(args, "after", saved ?? "start");
+  const ordered = records.map(record => record.id);
+  let unwrapped = records.length;
   if (after !== "start") {
     const anchor = database.prepare("SELECT root, path FROM workspace WHERE id = ?").get(after);
     if (anchor) {
       const pivot = records.findIndex(record => record.root > anchor.root || (record.root === anchor.root && record.path > anchor.path));
-      if (pivot >= 0) records = [...records.slice(pivot), ...records.slice(0, pivot)];
+      if (pivot >= 0) { records = [...records.slice(pivot), ...records.slice(0, pivot)]; unwrapped = ordered.length - pivot; }
+      else unwrapped = 0;
     }
   }
-  const page = records.slice(0, maxRecords);
+  // An explicit --after walk ends at the end of the pool; an unselected executing run continues
+  // from its saved cursor and wraps, so a timer covers every candidate.
+  const explicitWalk = one(args, "after") !== undefined;
+  const page = (explicitWalk ? records.slice(0, unwrapped) : records).slice(0, maxRecords);
   const members = page.flatMap(record => recordsInGroup(database, record));
   const observation = ownerLivenessObservation(members.map(record => record.owner), deadline);
   const results = [], visited = new Set();
@@ -3688,7 +3694,7 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   for (const item of results) counts[item.action === "none" ? item.code : item.action] = (counts[item.action === "none" ? item.code : item.action] ?? 0) + 1;
   print({ ok: observation.errors.length === 0, kind: "owner-liveness-release", execute, candidates: records.length, examined: results.length, counts,
     observation: { errors: observation.errors, observations: observation.observations, observedAt: observation.observedAt },
-    nextAfter: page.length < records.length ? last ?? null : null, results }, true);
+    nextAfter: last !== undefined && ordered.indexOf(last) < ordered.length - 1 && (explicitWalk ? page.length < unwrapped : page.length < records.length) ? last : null, results }, true);
   if (observation.errors.length) process.exitCode = 75;
 }
 
