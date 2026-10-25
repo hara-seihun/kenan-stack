@@ -20,7 +20,7 @@ const goodBytes = (b) => typeof b === 'number' && Number.isFinite(b) && b >= 0;
 
 // Returns {effectiveRemainingBytes, fullReservation, reason, observedGrowthBytes, holdUntilMs,
 // windowStartMs, basis, historyNeeded}. reason is one of: invalid-original (effectiveRemainingBytes null),
-// invalid-input, fresh-workspace, explicit-restore, fresh-burst, stale-samples, history-incomplete,
+// invalid-input, fresh-workspace, explicit-restore, fresh-burst, repriced-stale-rate, history-incomplete,
 // repriced-samples, repriced-bootstrap.
 export function repriceGrowthReservation(input = {}) {
   const {originalGrowthBytes, samples = [], restoreAt, currentAllocationBytes, completedBaselineBytes} = input;

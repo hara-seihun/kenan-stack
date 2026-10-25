@@ -71,7 +71,23 @@ test('an exact terminal qualification releases future growth, while a listed tra
   assert.deepEqual(f.projection().priced,[6*G]);
   write(`producer-admission/${id}.completed.json`,{state:'completed',identity:request.pipeline});
   assert.deepEqual(f.projection().priced,[]);assert.equal(f.projection().growthRepricing[0].reason,'terminal-qualification');assert.equal(f.projection().headroomBytes,8*G);
+  const terminal=path.join(data,`producer-admission/${id}.completed.json`);fs.utimesSync(terminal,new Date(Date.now()-1000),new Date(Date.now()-1000));
+  f.db.prepare('INSERT OR REPLACE INTO workspace_growth_policy VALUES(?,?)').run(f.row.id,JSON.stringify({version:1,planGrowthBytes:6*G,samples:[],restoreAt:Date.now()}));
+  assert.deepEqual(f.projection().priced,[6*G]); // An explicitly resumed writer supersedes the old terminal preparation.
+  f.db.prepare('DELETE FROM workspace_growth_policy WHERE workspace_id=?').run(f.row.id);
   write('merge-queue/state.json',{batches:[{name,leaves:request.pipeline.leaves,owners:['fixture']}]});assert.deepEqual(f.projection().priced,[6*G]);
   write('merge-queue/state.json',{batches:[]});write(`producer-admission/${id}.completed.json`,{state:'completed',identity:{...request.pipeline,base:'d'.repeat(40)}});assert.deepEqual(f.projection().priced,[6*G]);
  }finally{if(old===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=old;}
+}));
+
+test('a completed qualification does not retire future growth for its independent source root',()=>fixture(f=>{
+ const data=path.join(f.root,'release-data'),id='11111111-2222-4333-8444-555555555555';
+ for(const d of ['qualification-authority-requests','prepared-qualifications','producer-admission','merge-queue'])fs.mkdirSync(path.join(data,d),{recursive:true});
+ const request={version:1,root:f.dir,rootSource:'c'.repeat(40),name:'complete',pipeline:{operation:id,owner:'fixture',base:'a'.repeat(40),leaves:['b'.repeat(40)]}};
+ fs.writeFileSync(path.join(data,'merge-queue/state.json'),JSON.stringify({batches:[]}));
+ fs.writeFileSync(path.join(data,`qualification-authority-requests/${id}.json`),JSON.stringify(request));
+ fs.writeFileSync(path.join(data,`prepared-qualifications/${id}.json.workspace.json`),JSON.stringify({id:'independent-preparation',path:f.dir+'-prepared'}));
+ fs.writeFileSync(path.join(data,`producer-admission/${id}.completed.json`),JSON.stringify({state:'completed',identity:request.pipeline}));
+ const old=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=data;
+ try{assert.deepEqual(f.projection().priced,[6*G]);}finally{if(old===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=old;}
 }));
