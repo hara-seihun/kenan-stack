@@ -4383,11 +4383,17 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
 // cache changes. A failed walk is stored as a failed sample, never as a smaller allocation.
 function measureWorkspaceRow(database, row, paths, deadline, statePath) {
   const store = sample => {
+    const priorRow=database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(row.id);
+    let priorSample;try{priorSample=priorRow?JSON.parse(priorRow.measurement_json):null;}catch{priorSample=null;}
     database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
       SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
     if(sample.ok) withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
       const fresh=database.prepare("SELECT w.created_at,w.state,c.plan_json FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=? AND w.state!='released'").get(row.id);
-      if(fresh)recordGrowthSample(database,{...row,...fresh},JSON.parse(fresh.plan_json),sample);
+      if(fresh){
+        const currentRow={...row,...fresh},plan=JSON.parse(fresh.plan_json);
+        if(priorSample?.ok&&priorSample.completedAt<=sample.completedAt)recordGrowthSample(database,currentRow,plan,priorSample);
+        recordGrowthSample(database,currentRow,plan,sample);
+      }
     },deadline);
     return sample;
   };
