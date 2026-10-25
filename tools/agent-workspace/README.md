@@ -764,3 +764,32 @@ Frozen source is never implicitly thawed by reclamation. A `pi-frozen-handoff.js
 ### Prepared qualification and queue train custody
 
 A prepared but undispatched qualification is still active custody, even when no native process or tool is running. Every source, physical-checkout and generated-cache terminal check also reads bounded Converge release authority and merge-queue records. Current requests and paired trains protect their root and prepared workspace. Exact completed settlement, explicit request withdrawal or an exact terminal refusal is required before treating an old request as settled; a retryable capacity refusal is not settlement. Malformed or contradictory records fail closed. Never reclaim all publisher roots from a general request to reclaim settled work.
+
+### Automatic behavior-based remaining growth
+
+Completed source-only and budgeted workspaces older than one hour retain the
+smaller of their original growth request and `max(512 MiB, twice the positive
+allocated growth observed in the last hour)`. This applies to active roots and
+reader-held roots as well; it neither ends their leases nor removes their source.
+The original plan remains preserved. New checkouts, pending construction,
+non-Git execution reservations, shared operating headroom and source import
+reservations keep their original protections. Missing, stale or malformed
+allocation or policy evidence retains the full original growth reservation.
+
+The periodic bounded sampler maintains a rolling observation journal. Until an
+hour of samples exists, the completed checkout baseline conservatively attributes
+all positive growth since creation to the last hour. Each measured increment over
+64 MiB restores the original amount for one hour; smaller measurement variance
+does not hold it forever. Positive increments are summed, so deletion cannot
+cancel later regrowth. Ordinary heartbeat renews custody without resetting idle
+pricing. `heartbeat --id ID --growth-mib N` explicitly restores at least the
+original growth amount for one hour, or requests a larger original amount. The
+increment must pass the normal device admission before policy or lease changes.
+A refused request changes neither. `capacity-status --root PATH --json` reports
+the exact effective reservations, original requests and causal policy decisions.
+
+Zero-future-growth retirement remains a separate explicit owner disposition.
+Its runtime observation now distinguishes stable read-only process references
+from writable descriptors under the root. Writable or unknown descriptors and
+uncovered native references continue to refuse retirement. This distinction
+never changes physical deletion, generated-cache or source-custody guards.

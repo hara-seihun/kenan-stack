@@ -79,7 +79,7 @@ export function repriceGrowthReservation(input = {}) {
     const d = series[i].bytes - series[i - 1].bytes;
     if (d > 0) observed += d;
     // The synthetic baseline interval counts toward the bound but is not an observed burst.
-    if (d > toleranceBytes && !(bootstrapFrom === 0 && i === 1)) lastBurstAt = series[i].at;
+    if (d > toleranceBytes && series[i].at > windowStartMs && !(bootstrapFrom === 0 && i === 1)) lastBurstAt = series[i].at;
   }
   const common = {observedGrowthBytes: observed, windowStartMs, basis, historyNeeded: null};
   if (lastBurstAt !== null) return {effectiveRemainingBytes: originalGrowthBytes, fullReservation: true, reason: 'fresh-burst', holdUntilMs: lastBurstAt + HOUR_MS, ...common};

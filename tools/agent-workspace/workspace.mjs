@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
 import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
 import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
 import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
@@ -319,6 +320,7 @@ function initializeRegistry(database) {
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
     old_plan_json TEXT NOT NULL, new_plan_json TEXT NOT NULL, measurement_json TEXT NOT NULL
   )`);
+  ensureGrowthPolicyStore(database);
   if (database.prepare("PRAGMA journal_mode").get().journal_mode !== "wal") {
     database.exec("PRAGMA journal_mode = WAL");
   }
@@ -373,7 +375,7 @@ function openRegistry(statePath = DEFAULT_STATE) {
   registryPaths.set(database, statePath);
   try {
     database.exec("PRAGMA busy_timeout = 5000");
-    if (registrySchemaVersion(database) !== REGISTRY_SCHEMA_VERSION || !hasPendingIndex(database) || !hasCapacityLedger(database) || !hasCapacityMeasurements(database) || !hasReassignmentLedger(database) ||
+    if (registrySchemaVersion(database) !== REGISTRY_SCHEMA_VERSION || !hasPendingIndex(database) || !hasCapacityLedger(database) || !hasCapacityMeasurements(database) || !hasReassignmentLedger(database) || !database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_growth_policy'").get() ||
       database.prepare("PRAGMA journal_mode").get().journal_mode !== "wal") {
       withResourceLock(statePath, "registry-schema", () => initializeRegistry(database));
     }
@@ -1957,7 +1959,7 @@ function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device,
     if (!stats.isDirectory() || String(stats.dev) !== device || sample.device !== device || String(stats.ino) !== sample.inode) return { ok: false, code: "allocated-block-cache-root-changed", error: "allocated-block cache root identity changed" };
   } catch (error) { return { ok: false, code: "allocated-block-cache-root-unavailable", error: `allocated-block cache root unavailable: ${error.code ?? error.message}` }; }
   const marginBytes = Math.max(CAPACITY_MEASUREMENT_MARGIN_BYTES, Math.ceil(sample.bytes / 100));
-  return { ok: true, bytes: Math.max(0, sample.bytes - marginBytes), allocatedBytes: sample.allocatedBytes,
+  return { ok: true, bytes: Math.max(0, sample.bytes - marginBytes), rawBytes: sample.bytes, allocatedBytes: sample.allocatedBytes,
     startedAt: sample.startedAt, completedAt: sample.completedAt, marginBytes };
 }
 
@@ -1982,8 +1984,8 @@ function capacityReservations(database, device, reservedPath, measure) {
     unpricedDormant += 1;
   }
   let headroomBytes = 0;
-  const measurementFailures = [];
-  const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
+  const measurementFailures = [], growthRepricing=[];
+  const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
     WHERE c.device_id=? AND w.path!=? AND w.state!='released' ORDER BY w.created_at DESC, w.id`)
     .all(device, reservedPath ?? "");
   const priced = rows.map(row => {
@@ -1996,6 +1998,11 @@ function capacityReservations(database, device, reservedPath, measure) {
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
       const liability = ledgerLiability(plan, row.state, measurement);
+      const policy = projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement);
+      if (policy!==null) {
+        liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : policy.effectiveRemainingBytes??plan.growthBytes;
+        growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy});
+      }
       headroomBytes = Math.max(headroomBytes, liability.headroomBytes);
       return liability.reservedBytes;
     }).filter(bytes => bytes > 0);
@@ -2016,7 +2023,7 @@ function capacityReservations(database, device, reservedPath, measure) {
     priced.push(execution.growthBytes);
     headroomBytes = Math.max(headroomBytes, execution.headroomBytes);
   }
-  return { priced, headroomBytes, unpricedDormant, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
+  return { priced, headroomBytes, unpricedDormant, growthRepricing, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
 // Diagnostic projection only: the admission decision still uses capacityRequirement.
@@ -2038,6 +2045,7 @@ function capacityRefusalDetails(plan, reservations) {
     sourceImports: reservations.sourceImports ?? [],
     unpricedDormant: reservations.unpricedDormant,
     measurementFailures: reservations.measurementFailures === undefined ? [] : reservations.measurementFailures,
+    automaticGrowthRepricing: reservations.growthRepricing??[],
     sourceImport: plan.sourceImportBytes === undefined ? { state: "unset" } : { state: "set", bytes: plan.sourceImportBytes },
     sourceForecast: unestimated ? { state: "unset" } : { state: "set", plan },
   };
@@ -3213,8 +3221,8 @@ function cancelCreationCommand(database, args) {
   print(recordBy(database, { id: record.id }), bool(args, "json"));
 }
 
-function heartbeatCommand(database, args) {
-  assertOnly(args, ["id", "path", "lease-seconds", "json"]);
+function heartbeatCommand(database, args, statePath) {
+  assertOnly(args, ["id", "path", "lease-seconds", "growth-mib", "json"]);
   const record = recordBy(database, selectorFrom(args, 'heartbeat'));
   if (["released", "reclaiming", "creating"].includes(record.state)) fail(`workspace cannot renew from state ${record.state}`);
   if (!existsSync(record.path)) fail(`workspace path is absent: ${record.path}`);
@@ -3223,6 +3231,28 @@ function heartbeatCommand(database, args) {
   const records = recordsInGroup(database, record);
   if (records.some((candidate) => candidate.state === "creating")) fail("workspace group has a pending creation; resume it before renewal");
   for (const candidate of records) assertGrowthWritable(database,candidate);
+  if (one(args,"growth-mib")!==undefined) {
+    const requested=Math.ceil(numberFlag(args,"growth-mib",0)*1024**2);
+    if(!Number.isSafeInteger(requested)||requested<=0)fail("heartbeat --growth-mib must be a positive byte-representable amount");
+    // The explicit request applies to the selected workspace; other group leases are renewed,
+    // not silently expanded. Admission precedes every source/lease/policy change.
+    const row=database.prepare("SELECT device_id,plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+    if(!row)fail("heartbeat growth restoration requires an existing priced workspace");
+    const old=JSON.parse(row.plan_json);
+    withWorkspaceLock(database,record.path,()=>withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
+      const sample=cachedWorkspaceAllocation(database,record.id,record.path,row.device_id);
+      const current=database.prepare("SELECT created_at FROM workspace WHERE id=?").get(record.id);
+      const policy=projectGrowthPolicy(database,{...current,id:record.id,state:record.state},old,sample.ok?{...sample,bytes:sample.rawBytes}:sample);
+      const next={...old,growthBytes:Math.max(old.growthBytes,requested)};
+      const liability={...ledgerLiability(old,record.state,sample),reservedBytes:policy?.effectiveRemainingBytes??ledgerLiability(old,record.state,sample).reservedBytes};
+      const admission=assertCapacity(path.dirname(record.path),args,database,record.path,{...next,constructionBytes:0},{kind:"reprice",liability});
+      database.exec("BEGIN IMMEDIATE");try{
+        if(next.growthBytes!==old.growthBytes)database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=? AND plan_json=?").run(JSON.stringify(next),record.id,row.plan_json);
+        restoreGrowthPolicy(database,{id:record.id},next,now);
+        database.exec("COMMIT");
+      }catch(error){database.exec("ROLLBACK");throw error;}
+    }));
+  }
   const statement = database.prepare("UPDATE workspace SET lease_expires_at = ?, updated_at = ?, state = 'active', detail = 'lease renewed' WHERE id = ?");
   for (const candidate of records) statement.run(expires, now, candidate.id);
   const renewed = records.map((candidate) => recordBy(database, { id: candidate.id }));
@@ -3601,7 +3631,7 @@ function refreshEndedOwnerSample(database, record, deadline, statePath) {
     route = "unprivileged-after-read-capability-failure";
   }
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(value => value.path);
-  const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline - 5_000, Date.now() + budget));
+  const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline - 5_000, Date.now() + budget),statePath);
   return sample.ok && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok ? { kind: "measured", route } : { kind: "failed", route, detail: sample.error ?? "sample not current" };
 }
 function endedOwnerSummary(record) {
@@ -3816,6 +3846,7 @@ function pruneReleased(database, now = Date.now(), root) {
   }
   database.exec("DELETE FROM workspace_capacity WHERE workspace_id NOT LIKE 'execution:%' AND NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity.workspace_id)");
   database.exec("DELETE FROM workspace_capacity_measurement WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_capacity_measurement.workspace_id)");
+  if(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_growth_policy'").get()) database.exec("DELETE FROM workspace_growth_policy WHERE NOT EXISTS (SELECT 1 FROM workspace WHERE workspace.id=workspace_growth_policy.workspace_id)");
   return pruned;
 }
 
@@ -4249,6 +4280,16 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
       const cached = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!cached.ok) growthError("growth-sample-required", cached.error);
       const safety = terminalSafety(database, record, deadline);
+      if(safety.references.length && !safety.errors.length){
+        const pids=[...new Set(safety.references.map(r=>r.pid).filter(pid=>Number.isSafeInteger(pid)&&pid>0))];
+        const units=[...new Set(safety.references.map(r=>r.id).filter(id=>typeof id==="string"&&id.endsWith(".service")))];
+        const observer=new URL("./growth-writer-observation.mjs",import.meta.url).href;
+        const input=JSON.stringify({roots:[record.path],pids,units});
+        const script=`import {observeGrowthWriters} from ${JSON.stringify(observer)};console.log(JSON.stringify(observeGrowthWriters(JSON.parse(process.argv[1]))));`;
+        const observed=command("sudo",["-n",process.execPath,"--input-type=module","-e",script,input],{timeout:Math.max(1,Math.min(8000,deadline-Date.now()-1000))});
+        try{safety.growthWriters=observed.status===0?JSON.parse(observed.stdout):{complete:false,references:[],errors:[observed.stderr||"growth writer observer failed"]};}
+        catch{safety.growthWriters={complete:false,references:[],errors:["growth writer observation invalid"]};}
+      }
       if (Date.now() >= deadline) growthError("growth-observation-timeout", "retirement observation budget exhausted");
       validateRetirement(disposition, binding, safety);
       const next = {...plan, growthLifecycle:{kind:"retired-future-growth", remainingGrowthBytes:0,
@@ -4340,10 +4381,14 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
 
 // One checkout's allocated-block sample under its own checkout lock; only the measurement
 // cache changes. A failed walk is stored as a failed sample, never as a smaller allocation.
-function measureWorkspaceRow(database, row, paths, deadline) {
+function measureWorkspaceRow(database, row, paths, deadline, statePath) {
   const store = sample => {
     database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
       SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
+    if(sample.ok) withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
+      const fresh=database.prepare("SELECT w.created_at,w.state,c.plan_json FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=? AND w.state!='released'").get(row.id);
+      if(fresh)recordGrowthSample(database,{...row,...fresh},JSON.parse(fresh.plan_json),sample);
+    },deadline);
     return sample;
   };
   try {
@@ -4358,6 +4403,14 @@ function measureWorkspaceRow(database, row, paths, deadline) {
 // in full because their sample is missing, failed or stale (largest charge first), then
 // current samples closest to expiry. Rows the ledger never measures are skipped, not walked.
 // A targeted --id/--path request always measures the selected row.
+function capacityStatusCommand(database,args) {
+  assertOnly(args,["root","json"]);
+  const root=path.resolve(required(args,"root")),stats=statfsSync(root),device=String(statSync(root).dev);
+  const reservations=capacityReservations(database,device);
+  print({kind:"capacity-status",observedAt:Date.now(),device,freeBytes:stats.bavail*stats.bsize,
+    effectiveReservedBytes:reservations.priced.reduce((a,b)=>a+b,0),...reservations},bool(args,"json"));
+}
+
 function measureCapacityCommand(database, args, statePath) {
   assertOnly(args, ["root", "path", "id", "budget-ms", "json"]);
   const budgetMs = numberFlag(args, "budget-ms", 40_000);
@@ -4392,7 +4445,7 @@ function measureCapacityCommand(database, args, statePath) {
       results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
       continue;
     }
-    const sample = measureWorkspaceRow(database, row, paths, deadline);
+    const sample = measureWorkspaceRow(database, row, paths, deadline, statePath);
     counts[sample.ok ? "measured" : "error"] += 1;
     results.push({ path: row.path, status: sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...sample });
   }
@@ -4792,7 +4845,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["capacity-status", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -4823,7 +4876,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {
       const record = recordBy(database, selectorFrom(args, commandName));
       withWorkspaceLock(database, record.path, () => {
-        if (commandName === "heartbeat") heartbeatCommand(database, args);
+        if (commandName === "heartbeat") heartbeatCommand(database, args, statePath);
         else if (commandName === "cancel-creation") cancelCreationCommand(database, args);
         else if (commandName === "finalize-creation") finalizeCreationCommand(database, args, statePath);
         else releaseCommand(database, args, statePath);
@@ -4833,6 +4886,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "bind-native-owners") bindNativeOwnersCommand(database, args, statePath);
     else if (commandName === "release-ended-owners") releaseEndedOwnersCommand(database, args, statePath);
     else if (commandName === "measure-capacity") measureCapacityCommand(database, args, statePath);
+    else if (commandName === "capacity-status") capacityStatusCommand(database,args);
     else if (commandName === "growth-status") growthStatusCommand(database, args, statePath);
     else if (commandName === "cache-safety") cacheSafetyCommand(database,args,statePath);
     else if (commandName === "cache-plan" || commandName === "retire-cache") workspaceCacheCommand(database,args,statePath,commandName === "cache-plan");
