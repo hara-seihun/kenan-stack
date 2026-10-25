@@ -197,3 +197,7 @@ test("the census is bounded and only reads", () => {
   assert.equal(fs.readdirSync(f.directories.requestsDir).length, before);
   assert.equal(qualificationReferences(["relative"], f.directories).complete, false);
 });
+
+test("a current request also protects its carried root workspace before dispatch",()=>{
+ const f=fixture();try{f.addRequest(A);const carried=`${CLONES}/carry-root-${A}`;f.write(path.join(f.directories.preparedDir,`${A}.json.root-workspace.json`),{id:B,path:carried,root:BASE});const result=census(f);assert.deepEqual(result.errors,[]);assert.equal(protects(result,carried),true);assert.equal(protects(result,carried+'/infrastructure'),true);}finally{fs.rmSync(f.data,{recursive:true,force:true});}
+});

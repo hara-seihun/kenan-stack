@@ -221,6 +221,12 @@ function preparedPaths(budget, directories, id, request, errors) {
   const paths = [];
   const workspace = readJson(budget, path.join(directories.preparedDir, `${id}.json.workspace.json`));
   const assembly = readJson(budget, path.join(directories.preparedDir, `${id}.json.assembly.json`));
+  const carried = readJson(budget, path.join(directories.preparedDir, `${id}.json.root-workspace.json`));
+  if (carried.error) errors.push(carried.error);
+  else if (!carried.missing) {
+    if (isObject(carried.value) && absolute(carried.value.path)) paths.push(carried.value.path);
+    else errors.push(`${directories.preparedDir}/${id}.json.root-workspace.json: no exact carried root path`);
+  }
   let workspaceId = null;
   if (workspace.error) errors.push(workspace.error);
   else if (!workspace.missing) {
