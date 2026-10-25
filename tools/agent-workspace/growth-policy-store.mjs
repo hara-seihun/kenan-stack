@@ -30,9 +30,10 @@ function append(state,sample){
 export function projectGrowthPolicy(db,row,plan,sample,now=Date.now()){
  const full=(reason)=>({effectiveRemainingBytes:plan.growthBytes,fullReservation:true,reason});
  if(row.state==='creating'||!['source-only','budgeted'].includes(plan.intent)||plan.growthBytes===0||plan.growthLifecycle)return null;
- if(!sample?.ok)return full('measurement-unavailable');
+ if(sample?.code?.startsWith('allocated-block-cache-root-')||sample?.code==='allocated-block-cache-future-dated')return full('measurement-identity-unavailable');
  const state=read(db,row,plan);if(state===null)return full('invalid-policy-state');
  const next=append(state,sample);
+ if(!next.samples.length)return full('measurement-unavailable');
  return repriceGrowthReservation({now,createdAt:row.created_at,originalGrowthBytes:plan.growthBytes,
   samples:next.samples,restoreAt:state.restoreAt,completedBaselineBytes:plan.completedAllocationBytes,
   maxSampleAgeMs:15*60_000});

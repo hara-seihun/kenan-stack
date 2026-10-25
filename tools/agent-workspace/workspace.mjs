@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {allocationSlice} from './incremental-allocation.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
 import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
@@ -1999,12 +2000,12 @@ function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device,
     if (!Number.isSafeInteger(value) || value < 0) fail("invalid capacity allocation cache");
   }
   if (sample.completedAt < sample.startedAt || sample.completedAt > now) return { ok: false, code: "allocated-block-cache-future-dated", error: `allocated-block cache future-dated (completed ${sample.completedAt}, observed ${now})` };
-  if (now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) return { ok: false, code: "allocated-block-cache-stale", ageMs: now - sample.startedAt,
-    error: `allocated-block cache stale (age ${Math.round((now - sample.startedAt) / 1000)} s; limit ${CAPACITY_MEASUREMENT_MAX_AGE_MS / 1000} s)` };
   try {
     const stats = lstatSync(workspacePath);
     if (!stats.isDirectory() || String(stats.dev) !== device || sample.device !== device || String(stats.ino) !== sample.inode) return { ok: false, code: "allocated-block-cache-root-changed", error: "allocated-block cache root identity changed" };
   } catch (error) { return { ok: false, code: "allocated-block-cache-root-unavailable", error: `allocated-block cache root unavailable: ${error.code ?? error.message}` }; }
+  if (now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) return { ok: false, code: "allocated-block-cache-stale", ageMs: now - sample.startedAt,
+    lastObservation: sample, error: `allocated-block cache stale (age ${Math.round((now - sample.startedAt) / 1000)} s; limit ${CAPACITY_MEASUREMENT_MAX_AGE_MS / 1000} s)` };
   const marginBytes = Math.max(CAPACITY_MEASUREMENT_MARGIN_BYTES, Math.ceil(sample.bytes / 100));
   return { ok: true, bytes: Math.max(0, sample.bytes - marginBytes), rawBytes: sample.bytes, allocatedBytes: sample.allocatedBytes,
     startedAt: sample.startedAt, completedAt: sample.completedAt, marginBytes };
@@ -2016,6 +2017,12 @@ function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device,
 function measuredBudgetBytes(plan, state) {
   if (retainedGrowth(plan)) return 0;
   return plan.growthBytes + (state === "creating" ? plan.constructionBytes : 0);
+}
+
+function terminalQualificationPaths(paths) {
+  const census = qualificationReferences(paths, process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT ? {dataRoot:process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT} : {});
+  if (!census.complete) return new Set();
+  return new Set(census.released.flatMap(item=>item.paths??[]).filter(p=>!census.references.some(ref=>ref.paths.some(q=>q===p||q.startsWith(p+path.sep)||p.startsWith(q+path.sep)))));
 }
 
 function capacityReservations(database, device, reservedPath, measure) {
@@ -2035,6 +2042,7 @@ function capacityReservations(database, device, reservedPath, measure) {
   const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
     WHERE c.device_id=? AND w.path!=? AND w.state!='released' ORDER BY w.created_at DESC, w.id`)
     .all(device, reservedPath ?? "");
+  const settled = terminalQualificationPaths(rows.map(row=>row.path));
   const priced = rows.map(row => {
       const plan = JSON.parse(row.plan_json);
       if (!["source-only", "budgeted", "unestimated"].includes(plan.intent) ||
@@ -2045,7 +2053,7 @@ function capacityReservations(database, device, reservedPath, measure) {
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
       const liability = ledgerLiability(plan, row.state, measurement);
-      const policy = projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement);
+      const policy = row.state!=='creating' && settled.has(row.path) ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation ?? measurement);
       if (policy!==null) {
         liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : policy.effectiveRemainingBytes??plan.growthBytes;
         growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy});
@@ -4428,11 +4436,13 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
 
 // One checkout's allocated-block sample under its own checkout lock; only the measurement
 // cache changes. A failed walk is stored as a failed sample, never as a smaller allocation.
-function measureWorkspaceRow(database, row, paths, deadline, statePath) {
+function measureWorkspaceRow(database, row, paths, deadline, statePath, incremental = false) {
+  database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
+  database.prepare("INSERT OR REPLACE INTO workspace_capacity_attempt VALUES(?,?)").run(row.id,Date.now());
   const store = sample => {
     const priorRow=database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(row.id);
     let priorSample;try{priorSample=priorRow?JSON.parse(priorRow.measurement_json):null;}catch{priorSample=null;}
-    database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
+    if(sample.ok || !priorSample?.ok) database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
       SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
     if(sample.ok) withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
       const fresh=database.prepare("SELECT w.created_at,w.state,c.plan_json FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=? AND w.state!='released'").get(row.id);
@@ -4445,10 +4455,20 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath) {
     return sample;
   };
   try {
-    return withWorkspaceLock(database, row.path, () => store(workspaceAllocationSample(row.path, row.device_id, {
-      deadline: Math.min(deadline, Date.now() + 60_000), maxEntries: 2_000_000,
-      excludedPaths: paths.filter(candidate => candidate.startsWith(`${row.path}${path.sep}`)),
-    })), row.group_id, deadline);
+    return withWorkspaceLock(database, row.path, () => {
+      const excludedPaths=paths.filter(candidate=>candidate.startsWith(`${row.path}${path.sep}`));
+      if(!incremental)return store(workspaceAllocationSample(row.path,row.device_id,{deadline:Math.min(deadline,Date.now()+60_000),maxEntries:2_000_000,excludedPaths}));
+      database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
+      const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
+      let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
+      const slice=allocationSlice(row.path,row.device_id,prior,{deadline:Math.min(deadline,Date.now()+1000),excludedPaths});
+      if(slice.partial){
+        database.prepare("INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)").run(row.id,JSON.stringify(slice.state));
+        return {partial:true,visited:slice.visited,entries:slice.state.entries,startedAt:slice.state.startedAt};
+      }
+      database.prepare("DELETE FROM workspace_capacity_walk WHERE workspace_id=?").run(row.id);
+      return store(slice);
+    }, row.group_id, deadline);
   } catch (error) { return store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
 }
 
@@ -4478,30 +4498,40 @@ function measureCapacityCommand(database, args, statePath) {
     WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)`).all(selected, selected, root, root);
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
   const skipped = { "retired-future-growth": 0, "zero-liability": 0 };
+  database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
+  const settled=terminalQualificationPaths(rows.map(row=>row.path));
   const queue = [];
   for (const row of rows) {
     const plan = JSON.parse(row.plan_json);
     const budget = measuredBudgetBytes(plan, row.state);
     if (selected === null && budget === 0) { skipped[retainedGrowth(plan) ? "retired-future-growth" : "zero-liability"] += 1; continue; }
     const cached = cachedWorkspaceAllocation(database, row.id, row.path, row.device_id, started);
-    queue.push({ row, budget, cached });
+    if(selected===null && settled.has(row.path)){skipped['terminal-qualification']=(skipped['terminal-qualification']??0)+1;continue;}
+    const attempt=database.prepare("SELECT attempted_at FROM workspace_capacity_attempt WHERE workspace_id=?").get(row.id)?.attempted_at ?? 0;
+    queue.push({ row, budget, cached, attempt });
   }
   queue.sort((a, b) => (a.cached.ok - b.cached.ok)
-    || (a.cached.ok ? a.cached.startedAt - b.cached.startedAt : b.budget - a.budget)
+    || (a.cached.ok ? a.cached.startedAt - b.cached.startedAt : a.attempt-b.attempt || (a.cached.lastObservation?.startedAt??0)-(b.cached.lastObservation?.startedAt??0) || b.budget-a.budget)
     || (a.row.id < b.row.id ? -1 : a.row.id > b.row.id ? 1 : 0));
   const chargedBefore = queue.filter(item => !item.cached.ok).reduce((sum, item) => sum + item.budget, 0);
   const results = [];
   const counts = { measured: 0, error: 0, deferred: 0 };
-  for (const { row, budget, cached } of queue) {
-    if (Date.now() >= deadline) {
-      counts.deferred += 1;
-      results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
-      continue;
+  let pending=queue;
+  do {
+    const next=[];
+    for (const { row, budget, cached } of pending) {
+      if (Date.now() >= deadline) {
+        counts.deferred += 1;
+        results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
+        continue;
+      }
+      const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline,Date.now()+2000), statePath, selected===null);
+      counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
+      results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...sample });
+      if(sample.partial)next.push({row,budget,cached});
     }
-    const sample = measureWorkspaceRow(database, row, paths, deadline, statePath);
-    counts[sample.ok ? "measured" : "error"] += 1;
-    results.push({ path: row.path, status: sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...sample });
-  }
+    pending=next;
+  } while(pending.length && Date.now()<deadline);
   const now = Date.now();
   let chargedAfter = 0, oldestCurrentStartedAt = null;
   const after = {};

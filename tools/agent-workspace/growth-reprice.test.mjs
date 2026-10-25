@@ -94,11 +94,18 @@ test('malformed, corrupt or stale input fails closed to the full reservation', (
   assert.equal(rp({...base, createdAt: now + 1, samples: ok}).reason, 'invalid-input');
   assert.equal(rp({...base, samples: ok, currentAllocationBytes: -5}).reason, 'invalid-input');
   assert.equal(rp({...base, samples: ok, completedBaselineBytes: NaN}).reason, 'invalid-input');
-  assert.equal(rp({...base, samples: [s(90, GiB), s(50, GiB)]}).reason, 'stale-samples');
+  assert.equal(rp({...base, samples: [s(90, GiB), s(50, GiB)]}).reason, 'repriced-stale-rate');
   for (const o of [-1, NaN, Infinity, undefined]) { const r = rp({...base, originalGrowthBytes: o, samples: ok}); assert.equal(r.reason, 'invalid-original'); assert.equal(r.effectiveRemainingBytes, null); assert.equal(r.fullReservation, true); }
 });
 test('ISO timestamps and duplicate identical samples are accepted', () => {
   const iso = (m) => new Date(now - m * 60000).toISOString();
   const r = rp({...base, now: new Date(now).toISOString(), createdAt: new Date(T0).toISOString(), samples: [{at: iso(90), bytes: GiB}, {at: iso(5), bytes: GiB}, {at: iso(5), bytes: GiB}]});
   assert.equal(r.effectiveRemainingBytes, 512 * MIB);
+});
+
+test('stale observations retain the last hourly growth rate with a safety floor, not original growth',()=>{
+ const idle=rp({...base,samples:[s(180,GiB),s(120,GiB)]});assert.equal(idle.reason,'repriced-stale-rate');assert.equal(idle.effectiveRemainingBytes,512*MIB);
+ const series=[];for(let m=180;m>=120;m-=1)series.push(s(m,GiB+(180-m)*10*MIB));
+ assert.equal(rp({...base,samples:series}).effectiveRemainingBytes,1200*MIB);
+ assert.equal(rp({...base,samples:series,restoreAt:now-1000}).reason,'explicit-restore');
 });

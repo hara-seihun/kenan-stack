@@ -823,3 +823,25 @@ and verifies the exact commit. The manifest contains Git object identities, not
 SHA-256 hashes of individual file bytes. URLs and credentials are not recorded.
 The existing `freeze-source` atomic immutable recipient transfer is unchanged;
 its accepted custody guarantee is distinct from an informally frozen Git commit.
+
+
+### Incremental allocation sampling and stale growth rates
+
+Fleet sampling gives each eligible checkout a bounded slice and persists traversal
+progress outside the source tree. Oldest attempted stale reservations come first,
+with the oldest successful observation and largest reservation breaking ties.
+Partial walks rotate fairly and continue in additional rounds while the pass has
+budget. Only a complete walk publishes allocation bytes; failures preserve the
+last successful observation. Root identity and nested checkout exclusions are
+checked again before a saved traversal is resumed. The two million entry bound
+still applies. Progress across timer passes prevents a large tree from restarting
+at its root on every exhausted budget.
+
+A stale allocation never supplies physical-byte credit. Automatic future-growth
+pricing instead keeps the last observed hourly positive-growth rate, doubled and
+capped by the original request, with a 512 MiB safety floor. Missing or malformed
+history and explicit growth restores still preserve the full allowance. An exact
+completed qualification or terminal refusal removes remaining preparation growth
+only when the complete qualification census shows no current request or train
+reference. Its source retention, original plan, lease and operating headroom do
+not change. The supported release command remains the route for physical cleanup.

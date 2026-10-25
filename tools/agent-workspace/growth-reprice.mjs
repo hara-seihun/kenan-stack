@@ -60,17 +60,23 @@ export function repriceGrowthReservation(input = {}) {
     else if (last.bytes !== currentAllocationBytes) return full('invalid-input');
   }
   if (!pts.length) return full('history-incomplete', {historyNeeded: {sinceMs: windowStartMs, reason: 'no-current-sample'}});
-  if (now - pts[pts.length - 1].at > maxSampleAgeMs) return full('stale-samples', {historyNeeded: {sinceMs: pts[pts.length - 1].at, reason: 'latest-sample-too-old'}});
+  const latestAt = pts[pts.length - 1].at;
+  const stale = now - latestAt > maxSampleAgeMs;
+  // Staleness is not new growth. Project the last observed hourly rate, without
+  // granting stale allocation bytes as physical credit or inventing a current sample.
+  const observationStartMs = (stale ? latestAt : now) - HOUR_MS;
 
   // Anchor: the last sample at or before the window start; otherwise the completed baseline is a
   // bootstrap upper bound, attributing every byte of growth since baseline to the last hour.
   let anchorIdx = -1;
-  for (let i = 0; i < pts.length; i++) if (pts[i].at <= windowStartMs) anchorIdx = i;
+  for (let i = 0; i < pts.length; i++) if (pts[i].at <= observationStartMs) anchorIdx = i;
   let series, basis, bootstrapFrom = null;
   if (anchorIdx >= 0) {
     series = pts.slice(anchorIdx); basis = 'samples';
   } else if (goodBytes(completedBaselineBytes)) {
-    series = [{at: windowStartMs, bytes: completedBaselineBytes}, ...pts]; basis = 'bootstrap-baseline'; bootstrapFrom = 0;
+    series = [{at: observationStartMs, bytes: completedBaselineBytes}, ...pts]; basis = 'bootstrap-baseline'; bootstrapFrom = 0;
+  } else if (stale && pts.length >= 2) {
+    series = pts; basis = 'samples';
   } else {
     return full('history-incomplete', {historyNeeded: {sinceMs: windowStartMs, reason: 'no-sample-at-or-before-window-start-and-no-baseline'}});
   }
@@ -83,6 +89,8 @@ export function repriceGrowthReservation(input = {}) {
   }
   const common = {observedGrowthBytes: observed, windowStartMs, basis, historyNeeded: null};
   if (lastBurstAt !== null) return {effectiveRemainingBytes: originalGrowthBytes, fullReservation: true, reason: 'fresh-burst', holdUntilMs: lastBurstAt + HOUR_MS, ...common};
-  const effective = Math.min(originalGrowthBytes, Math.max(FLOOR_BYTES, MULTIPLIER * observed));
-  return {effectiveRemainingBytes: effective, fullReservation: effective === originalGrowthBytes, reason: basis === 'samples' ? 'repriced-samples' : 'repriced-bootstrap', holdUntilMs: null, ...common};
+  const span = Math.max(1, latestAt - series[0].at);
+  const hourlyGrowth = stale ? Math.ceil(observed * HOUR_MS / span) : observed;
+  const effective = Math.min(originalGrowthBytes, Math.max(FLOOR_BYTES, MULTIPLIER * hourlyGrowth));
+  return {effectiveRemainingBytes: effective, fullReservation: effective === originalGrowthBytes, reason: stale ? 'repriced-stale-rate' : basis === 'samples' ? 'repriced-samples' : 'repriced-bootstrap', holdUntilMs: null, ...common};
 }

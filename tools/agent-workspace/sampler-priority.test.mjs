@@ -26,6 +26,7 @@ function fixture(action){
   const put=(name,text)=>db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(rows[name].id,device,text);
   put('retired',plan(8*G,{growthLifecycle:{kind:'retired-future-growth',remainingGrowthBytes:0,retainedUse:'source',dispositionSha256:'a'.repeat(64),retiredAt:1}}));
   put('zero',plan(0));put('small',plan(1*G));put('large',plan(4*G));put('current',plan(2*G));
+  db.exec('DELETE FROM workspace_capacity_measurement');
   action({root,state,rows,db,device,run});
  }finally{db?.close();if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;fs.rmSync(root,{recursive:true,force:true});}
 }
@@ -57,4 +58,18 @@ test('stale and future-dated samples carry separate codes',()=>fixture(f=>{
  const reservations=workspaceTesting.capacityReservations(f.db,f.device,undefined);
  assert.deepEqual(reservations.measurementFailures.map(failure=>[path.basename(failure.path),failure.code]).sort(),
   [['current','allocated-block-cache-missing'],['small','allocated-block-cache-missing']]);
+}));
+
+test('oldest attempts rotate first so repeated failure cannot starve another stale reservation',()=>fixture(f=>{
+ f.run(['measure-capacity','--id',f.rows.small.id,'--json']);
+ f.run(['measure-capacity','--id',f.rows.large.id,'--json']);
+ const now=Date.now();
+ for(const [name,age] of [['small',4000],['large',1000]]){
+  const sample=JSON.parse(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows[name].id).measurement_json);
+  sample.startedAt=now-20*60000;sample.completedAt=now-20*60000;
+  f.db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify(sample),f.rows[name].id);
+  f.db.prepare('UPDATE workspace_capacity_attempt SET attempted_at=? WHERE workspace_id=?').run(now-age,f.rows[name].id);
+ }
+ const pass=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--json']);
+ assert.deepEqual(pass.results.map(r=>path.basename(r.path)),['current','small','large']);
 }));

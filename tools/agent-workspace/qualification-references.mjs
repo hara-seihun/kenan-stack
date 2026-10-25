@@ -149,12 +149,12 @@ export function qualificationReferences(roots = null, options = {}) {
     if (terminal.error) { errors.push(terminal.error); }
     if (terminal.state === "completed") {
       if (terminal.contradiction) errors.push(`${terminal.file}: settlement contradicts the request identity (${terminal.contradiction})`);
-      else if (train === undefined) { released.push({ id, state: "completed", evidence: terminal.file }); continue; }
+      else if (train === undefined) { released.push({ id, state: "completed", evidence: terminal.file, paths }); continue; }
       // A completed request whose train is still listed stays protected through the train reference.
       else { released.push({ id, state: "completed-train-listed", evidence: terminal.file, note: "request settled; the listed train protects its roots" }); continue; }
     }
     const refusal = refusalEvidence(budget, directories, id, request.sha256, errors);
-    if (refusal.state === "terminal-refusal") { released.push({ id, state: "refused", evidence: refusal.file }); continue; }
+    if (refusal.state === "terminal-refusal") { released.push({ id, state: "refused", evidence: refusal.file, paths }); continue; }
     const grant = readJson(budget, path.join(directories.preparedDir, `${id}.json.grant.json`));
     if (grant.error) errors.push(grant.error);
     const state = refusal.state ?? (grant.missing ? "undispatched" : grant.value ? "dispatched-unsettled" : "unverifiable");
