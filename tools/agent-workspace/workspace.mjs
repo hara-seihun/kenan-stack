@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
+import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
@@ -2157,7 +2158,9 @@ function capacityReservations(database, device, reservedPath, measure) {
         ? projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation)
         : {effectiveRemainingBytes:plan.growthBytes,fullReservation:true,reason:'measurement-unavailable'};
       if (policy!==null) {
-        liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : forecast ? Math.max(forecast.uncertaintyBytes, policy.effectiveRemainingBytes??plan.growthBytes) : policy.effectiveRemainingBytes??plan.growthBytes;
+        // Forecast uncertainty discounts historical consumed-allocation credit;
+        // it must not become a second floor on the independent future-write rate.
+        liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : policy.effectiveRemainingBytes??plan.growthBytes;
         growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy,
           ...(forecast ? {effectiveRemainingBytes:liability.reservedBytes, forecastUncertaintyBytes:forecast.uncertaintyBytes} : {})});
       }
@@ -2187,8 +2190,14 @@ function capacityReservations(database, device, reservedPath, measure) {
 // Only a pre-effect admission refusal may retry. Acquire the device fence for
 // each decision/commit, but release it before acquiring another checkout's fence.
 function withCapacityAdmission(database, statePath, device, action) {
+  return withCapacityRefresh(database, statePath, device,
+    () => withResourceLock(statePath, `capacity:${device}`, action));
+}
+
+function withCapacityRefresh(database, statePath, device, action, options = {}) {
   try{return admitWithRefresh({
-    decide: () => {try{return withResourceLock(statePath, `capacity:${device}`, action);}finally{nativeTerminalProjection=null;}},
+    ...options,
+    decide: () => {try{return action();}finally{nativeTerminalProjection=null;}},
     candidates: error => {
       const failures=error.capacity?.breakdown?.measurementFailures??[];
       const charged=new Map((error.capacity?.breakdown?.automaticGrowthRepricing??[]).map(item=>[item.path,item.effectiveRemainingBytes]));
@@ -3326,33 +3335,54 @@ function creationRecord(database, id) {
 }
 
 function completeCreation(database, id, repository, leaseSeconds, detail, args) {
-  const row = database.prepare("SELECT w.path, c.device_id, c.plan_json FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=? AND w.state='creating'").get(id);
-  let plan;
-  if (row !== undefined) {
-    plan = JSON.parse(row.plan_json);
-    const measurement = workspaceAllocationSample(row.path, row.device_id);
-    if (measurement.ok) plan.completedAllocationBytes = measurement.allocatedBytes;
-    else {
-      plan.completedAllocationBytes = null;
-      plan.completedAllocationError = measurement.error;
-      process.stderr.write(`capacity baseline unavailable at ${row.path}; retaining full growth reservation: ${measurement.error}\n`);
+  const statePath = registryPaths.get(database);
+  const initial = database.prepare("SELECT path,group_id FROM workspace WHERE id=? AND state='creating'").get(id);
+  if (initial === undefined) fail("pending creation changed before completion");
+  return withWorkspaceLock(database, initial.path, () => {
+    const row = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json
+      FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id
+      WHERE w.id=? AND w.state='creating'`).get(id);
+    if (row === undefined) fail("pending creation capacity changed before completion");
+    const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(item => item.path);
+    // Construction owns this checkout, not the device. Large completed trees must
+    // get their own bounded full observation rather than a 500 ms best effort.
+    // The sampler takes the device fence only to publish, never while walking.
+    const measurement = measureWorkspaceRow(database, row, paths, Date.now() + 60_000, statePath);
+    if (!measurement.ok || measurement.partial) {
+      fail(`creation allocation measurement unavailable at ${row.path}; pending creation retained for resume: ${measurement.error ?? "incomplete observation"}`);
     }
-    measurement.planSha256 = createHash("sha256").update(JSON.stringify(plan)).digest("hex");
-    measurement.rootPath = row.path;
-    database.prepare("INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json) VALUES(?,?)").run(id, JSON.stringify(measurement));
-  }
-  const now = Date.now();
-  database.exec("BEGIN IMMEDIATE");
-  try {
-    if (plan !== undefined) database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(JSON.stringify(plan), id);
-    database.prepare("UPDATE workspace SET repository=?, state='active', detail=?, updated_at=?, lease_expires_at=? WHERE id=? AND state='creating'")
-      .run(repository, detail, now, now + leaseSeconds * 1000, id);
-    database.exec("COMMIT");
-  } catch (error) {
-    database.exec("ROLLBACK");
-    throw error;
-  }
-  print(creationRecord(database, id), bool(args, "json"));
+    return withResourceLock(statePath, `capacity:${row.device_id}`, () => {
+      const current = database.prepare(`SELECT w.path,w.state,c.device_id,c.plan_json
+        FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=?`).get(id);
+      const root = lstatSync(row.path);
+      if (current?.state !== "creating" || current.path !== row.path || current.device_id !== row.device_id ||
+          current.plan_json !== row.plan_json || !root.isDirectory() || String(root.dev) !== measurement.device ||
+          String(root.ino) !== measurement.inode) fail("pending creation or allocation root changed before completion");
+      const plan = JSON.parse(current.plan_json);
+      plan.completedAllocationBytes = measurement.allocatedBytes;
+      delete plan.completedAllocationError;
+      const planJson = JSON.stringify(plan);
+      const bound = { ...measurement, rootPath: row.path,
+        planSha256: createHash("sha256").update(planJson).digest("hex") };
+      const now = Date.now();
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?").run(planJson, id);
+        database.prepare("UPDATE workspace SET repository=?, state='active', detail=?, updated_at=?, lease_expires_at=? WHERE id=? AND state='creating'")
+          .run(repository, detail, now, now + leaseSeconds * 1000, id);
+        // Activation changes the plan binding. Rebind the complete observation
+        // and journal it atomically with activation, not as another tree walk.
+        recordGrowthSample(database, { ...row, state: "active" }, plan, bound);
+        database.prepare("INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json) VALUES(?,?)")
+          .run(id, JSON.stringify(bound));
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+      print(creationRecord(database, id), bool(args, "json"));
+    });
+  }, initial.group_id);
 }
 
 function finalizeCreationCommand(database, args, statePath) {
@@ -4146,7 +4176,8 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
   if(!reducing&&!selection.ok)throw Object.assign(new GrowthLifecycleError(selection.error.code,selection.error.detail),{nextAction:selection.error.nextAction});
   const selected = reducing ? growthSelected(database, args) : recordBy(database, selection.value.id===undefined?{path:selection.value.path}:{id:selection.value.id});
   if(resume&&selection.value.path!==undefined&&selected.path!==path.resolve(selection.value.path))growthError("growth-identity-changed", "resume-growth id and path do not name the same workspace");
-  return duringInspection(deadline, () => withWorkspaceLock(database, selected.path, () => {
+  const device = database.prepare("SELECT device_id FROM workspace_capacity WHERE workspace_id=?").get(selected.id)?.device_id;
+  const decide = () => duringInspection(deadline, () => withWorkspaceLock(database, selected.path, () => {
     const record = recordBy(database, { id: selected.id });
     if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) fail(`workspace cannot reprice capacity from state ${record.state}`);
     const row = database.prepare("SELECT device_id,plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
@@ -4230,6 +4261,11 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     }, deadline);
     print(creationRecord(database, record.id), bool(args, "json"));
   }, selected.groupId, deadline));
+  // Release both the original checkout and device locks before sampling any
+  // deciding reservation, preventing cross-checkout lock inversion on retries.
+  // Each retry rebuilds its candidate and can commit only after admission.
+  return reducing ? decide() : withCapacityRefresh(database, statePath, device, decide,
+    {budgetMs: Math.max(0, deadline - Date.now())});
 }
 
 
@@ -4660,26 +4696,11 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
 function measureWorkspaceRow(database, row, paths, deadline, statePath, incremental = false) {
   database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
   database.prepare("INSERT OR REPLACE INTO workspace_capacity_attempt VALUES(?,?)").run(row.id,Date.now());
-  const store = sample => {
-    if (sample.ok) {
-      const current = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(row.id);
-      if (current) sample.planSha256 = createHash("sha256").update(current.plan_json).digest("hex");
-      sample.rootPath = row.path;
-    }
-    const priorRow=database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(row.id);
-    let priorSample;try{priorSample=priorRow?JSON.parse(priorRow.measurement_json):null;}catch{priorSample=null;}
-    if(sample.ok || !priorSample?.ok) database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)
-      SELECT ?,? WHERE EXISTS(SELECT 1 FROM workspace WHERE id=? AND state!='released')`).run(row.id, JSON.stringify(sample), row.id);
-    if(sample.ok) withResourceLock(statePath,`capacity:${row.device_id}`,()=>{
-      const fresh=database.prepare("SELECT w.created_at,w.state,c.plan_json FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=? AND w.state!='released'").get(row.id);
-      if(fresh){
-        const currentRow={...row,...fresh},plan=JSON.parse(fresh.plan_json);
-        if(priorSample?.ok&&priorSample.completedAt<=sample.completedAt)recordGrowthSample(database,currentRow,plan,priorSample);
-        recordGrowthSample(database,currentRow,plan,sample);
-      }
-    },deadline);
-    return sample;
-  };
+  const store = sample => sample.ok
+    ? withResourceLock(statePath, `capacity:${row.device_id}`,
+        () => persistAllocationSample(database, row, sample), deadline)
+    : persistAllocationSample(database, row, sample);
+
   try {
     return withWorkspaceLock(database, row.path, () => {
       const excludedPaths=paths.filter(candidate=>candidate.startsWith(`${row.path}${path.sep}`));

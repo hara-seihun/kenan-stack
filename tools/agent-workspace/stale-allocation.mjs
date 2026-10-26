@@ -7,7 +7,7 @@ export function staleAllocationForecast(sample, plan, state, now, history) {
       !valid(plan.growthBytes) || !valid(plan.completedAllocationBytes) || !valid(now) ||
       sample?.ok !== true || sample.partial || !valid(sample.bytes) || !valid(sample.allocatedBytes) ||
       sample.bytes > sample.allocatedBytes || !valid(sample.startedAt) || !valid(sample.completedAt) ||
-      sample.completedAt < sample.startedAt || sample.completedAt > now || !Array.isArray(history) || !history.length) return null;
+      sample.completedAt < sample.startedAt || sample.completedAt > now || !Array.isArray(history) || !history.length || history.length > 512) return null;
   let positive = 0, previous = null;
   for (const point of history) {
     if (!point || !valid(point.at) || !valid(point.bytes) || point.at > sample.completedAt ||
@@ -15,6 +15,16 @@ export function staleAllocationForecast(sample, plan, state, now, history) {
     if (previous) positive += Math.max(0, point.bytes - previous.bytes);
     if (!Number.isSafeInteger(positive)) return null;
     previous = point;
+  }
+  // Historical non-atomic writers could publish a complete bound cache before
+  // its rate journal. Reconcile that actual observation in memory, never invent
+  // a current sample or repair malformed/conflicting authority into credit.
+  if (previous.at < sample.completedAt) {
+    if (history.length === 512) return null;
+    history = [...history, {at:sample.completedAt, bytes:sample.bytes}];
+    positive += Math.max(0, sample.bytes - previous.bytes);
+    if (!Number.isSafeInteger(positive)) return null;
+    previous = history.at(-1);
   }
   if (previous.at !== sample.completedAt || previous.bytes !== sample.bytes) return null;
   // One sample uses the source baseline as a conservative one-hour bootstrap;

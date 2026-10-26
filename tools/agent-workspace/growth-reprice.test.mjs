@@ -109,3 +109,42 @@ test('stale observations retain the last hourly growth rate with a safety floor,
  assert.equal(rp({...base,samples:series}).effectiveRemainingBytes,1200*MIB);
  assert.equal(rp({...base,samples:series,restoreAt:now-1000}).reason,'explicit-restore');
 });
+
+const staleBoundaryMs = 900000;
+const frozenSample = (minutesBeforeLatest, bytes) => ({at: now - minutesBeforeLatest * 60000, bytes});
+const boundaryHistories = [
+  {name: 'idle', samples: [frozenSample(90, 5 * GiB), frozenSample(60, 5 * GiB), frozenSample(0, 5 * GiB)], expected: 512 * MIB, observed: 0},
+  {name: 'steady increments', samples: Array.from({length: 61}, (_, i) => frozenSample(60 - i, GiB + i * 20 * MIB)), expected: 2400 * MIB, observed: 1200 * MIB},
+  // This burst is already older than one wall-clock hour at all three reads, but remains
+  // in the latest observed hour. An idle gap must not remove its growth from that rate.
+  {name: 'older burst', samples: [frozenSample(90, GiB), frozenSample(50, GiB + 512 * MIB), frozenSample(0, GiB + 512 * MIB)], expected: 1024 * MIB, observed: 512 * MIB},
+  {name: 'deletion and regrowth', samples: [frozenSample(60, 8 * GiB), ...Array.from({length: 51}, (_, i) => frozenSample(50 - i, 2 * GiB + i * 10 * MIB))], expected: 1000 * MIB, observed: 500 * MIB},
+  {name: 'partial steady history', samples: Array.from({length: 31}, (_, i) => frozenSample(30 - i, GiB + i * 10 * MIB)), expected: 1200 * MIB, observed: 300 * MIB},
+];
+for (const {name, samples, expected, observed} of boundaryHistories) {
+  test(`frozen ${name} has no reservation jump at the stale threshold`, () => {
+    for (const ageMs of [899999, 900000, 900001]) {
+      const result = rp({...base, now: now + ageMs, samples, maxSampleAgeMs: staleBoundaryMs});
+      assert.equal(result.effectiveRemainingBytes, expected, `sample age ${ageMs}`);
+      assert.equal(result.observedGrowthBytes, observed, `sample age ${ageMs}`);
+      assert.equal(result.basis, 'samples');
+      assert.equal(result.reason, ageMs > staleBoundaryMs ? 'repriced-stale-rate' : 'repriced-samples');
+    }
+  });
+}
+test('fresh and stale bootstrap rates use the same latest observed hour', () => {
+  for (const ageMs of [899999, 900000, 900001]) {
+    const result = rp({...base, now: now + ageMs, maxSampleAgeMs: staleBoundaryMs,
+      completedBaselineBytes: GiB, samples: [frozenSample(0, 2 * GiB)]});
+    assert.equal(result.effectiveRemainingBytes, 2 * GiB);
+    assert.equal(result.basis, 'bootstrap-baseline');
+    assert.equal(result.reason, ageMs > staleBoundaryMs ? 'repriced-stale-rate' : 'repriced-bootstrap');
+  }
+});
+test('a single sample without a baseline remains insufficient on either side of staleness', () => {
+  for (const ageMs of [899999, 900000, 900001]) {
+    const result = rp({...base, now: now + ageMs, maxSampleAgeMs: staleBoundaryMs, samples: [frozenSample(0, GiB)]});
+    assert.equal(result.reason, 'history-incomplete');
+    assert.equal(result.effectiveRemainingBytes, base.originalGrowthBytes);
+  }
+});

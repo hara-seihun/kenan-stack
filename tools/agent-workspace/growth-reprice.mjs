@@ -1,6 +1,8 @@
 // Pure repricing of a workspace's remaining future-growth reservation from observed behavior.
-// Rule: a workspace older than one hour keeps max(512 MiB, 2 x growth observed in the last hour),
-// capped at its original requested growth. A fresh positive-growth burst (> 64 MiB between two
+// Rule: a workspace older than one hour keeps max(512 MiB, 2 x conservative hourly growth),
+// using the latest observed hour and capped at its original requested growth. Short histories
+// are projected to an hour; an older anchor never discounts observed positive growth.
+// A fresh positive-growth burst (> 64 MiB between two
 // consecutive samples) or an explicit growth restore inside the last hour gives the full original
 // amount back. Anything missing, malformed or out of order fails closed to the full amount.
 export const MIB = 1024 * 1024;
@@ -62,9 +64,10 @@ export function repriceGrowthReservation(input = {}) {
   if (!pts.length) return full('history-incomplete', {historyNeeded: {sinceMs: windowStartMs, reason: 'no-current-sample'}});
   const latestAt = pts[pts.length - 1].at;
   const stale = now - latestAt > maxSampleAgeMs;
-  // Staleness is not new growth. Project the last observed hourly rate, without
-  // granting stale allocation bytes as physical credit or inventing a current sample.
-  const observationStartMs = (stale ? latestAt : now) - HOUR_MS;
+  // Staleness changes diagnostics, not the observation window or rate. Anchor both
+  // fresh and stale histories to their latest real sample; idle time is not evidence
+  // of zero growth, physical credit, or a new current sample.
+  const observationStartMs = latestAt - HOUR_MS;
 
   // Anchor: the last sample at or before the window start; otherwise the completed baseline is a
   // bootstrap upper bound, attributing every byte of growth since baseline to the last hour.
@@ -75,10 +78,10 @@ export function repriceGrowthReservation(input = {}) {
     series = pts.slice(anchorIdx); basis = 'samples';
   } else if (goodBytes(completedBaselineBytes)) {
     series = [{at: observationStartMs, bytes: completedBaselineBytes}, ...pts]; basis = 'bootstrap-baseline'; bootstrapFrom = 0;
-  } else if (stale && pts.length >= 2) {
+  } else if (pts.length >= 2) {
     series = pts; basis = 'samples';
   } else {
-    return full('history-incomplete', {historyNeeded: {sinceMs: windowStartMs, reason: 'no-sample-at-or-before-window-start-and-no-baseline'}});
+    return full('history-incomplete', {historyNeeded: {sinceMs: observationStartMs, reason: 'no-sample-at-or-before-window-start-and-no-baseline'}});
   }
   let observed = 0, lastBurstAt = null;
   for (let i = 1; i < series.length; i++) {
@@ -89,8 +92,10 @@ export function repriceGrowthReservation(input = {}) {
   }
   const common = {observedGrowthBytes: observed, windowStartMs, basis, historyNeeded: null};
   if (lastBurstAt !== null) return {effectiveRemainingBytes: originalGrowthBytes, fullReservation: true, reason: 'fresh-burst', holdUntilMs: lastBurstAt + HOUR_MS, ...common};
-  const span = Math.max(1, latestAt - series[0].at);
-  const hourlyGrowth = stale ? Math.ceil(observed * HOUR_MS / span) : observed;
+  // A partial history gets an hourly upper projection. An anchor before the
+  // observation window must not dilute the positive growth charged to that hour.
+  const span = Math.max(1, Math.min(HOUR_MS, latestAt - series[0].at));
+  const hourlyGrowth = Math.ceil(observed * HOUR_MS / span);
   const effective = Math.min(originalGrowthBytes, Math.max(FLOOR_BYTES, MULTIPLIER * hourlyGrowth));
   return {effectiveRemainingBytes: effective, fullReservation: effective === originalGrowthBytes, reason: stale ? 'repriced-stale-rate' : basis === 'samples' ? 'repriced-samples' : 'repriced-bootstrap', holdUntilMs: null, ...common};
 }

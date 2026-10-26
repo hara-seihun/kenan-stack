@@ -95,3 +95,38 @@ test('explicit growth restoration and damaged or differently bound rate history 
   assert.deepEqual(f.projection().priced,[8*G]);
  }
 }));
+
+test('a real complete newer cache reconciles an interrupted history publication without fabricating an observation',()=>{
+ const older=[{at:sample.completedAt-H,bytes:sample.bytes},{at:sample.completedAt-1000,bytes:sample.bytes}];
+ assert.deepEqual(staleAllocationForecast(sample,plan,'active',now,older),staleAllocationForecast(sample,plan,'active',now,[...older,{at:sample.completedAt,bytes:sample.bytes}]));
+ assert.equal(older.length,2,'the projection must not mutate persisted authority');
+});
+
+test('historical cache publication gap does not restore an unrelated idle reservation to full growth',()=>fixture(f=>{
+ const original=JSON.parse(f.db.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(f.row.id).state_json);
+ original.samples.pop();
+ f.db.prepare('UPDATE workspace_growth_policy SET state_json=? WHERE workspace_id=?').run(JSON.stringify(original),f.row.id);
+ const r=f.projection();assert.ok(r.priced[0]<8*G);assert.equal(r.staleAllocationForecasts.length,1);
+ assert.deepEqual(JSON.parse(f.db.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(f.row.id).state_json),original);
+}));
+
+test('consumed-allocation uncertainty cannot override a separately qualified future-growth rate',()=>fixture(f=>{
+ f.db.prepare('UPDATE workspace SET created_at=? WHERE id=?').run(Date.now()-10*H,f.row.id);
+ const at=f.s.completedAt;
+ const history={version:1,planGrowthBytes:plan.growthBytes,allocationBinding:{rootPath:f.s.rootPath,planSha256:f.s.planSha256,device:f.s.device,inode:f.s.inode},samples:[{at:at-5*H,bytes:f.s.bytes-2*G},{at:at-4*H,bytes:f.s.bytes},{at:at-H,bytes:f.s.bytes},{at,bytes:f.s.bytes}]};
+ f.db.prepare('UPDATE workspace_growth_policy SET state_json=? WHERE workspace_id=?').run(JSON.stringify(history),f.row.id);
+ const r=f.projection();assert.ok(r.staleAllocationForecasts[0].uncertaintyBytes>.5*G);assert.deepEqual(r.priced,[.5*G]);
+ assert.equal(r.growthRepricing[0].effectiveRemainingBytes,.5*G);
+}));
+
+test('historical publication reconciliation preserves bounds and refuses ambiguous authority',()=>{
+ const tail={at:sample.completedAt,bytes:sample.bytes};
+ assert.equal(staleAllocationForecast(sample,plan,'active',now,[{...tail,bytes:tail.bytes+1}]),null);
+ assert.equal(staleAllocationForecast(sample,plan,'active',now,[{...tail,at:tail.at+1}]),null);
+ assert.equal(staleAllocationForecast(sample,plan,'active',now,[{at:tail.at-2,bytes:tail.bytes},{at:tail.at-3,bytes:tail.bytes}]),null);
+ const full=Array.from({length:512},(_,i)=>({at:tail.at-513+i,bytes:tail.bytes}));
+ assert.equal(staleAllocationForecast(sample,plan,'active',now,full),null);
+ assert.ok(staleAllocationForecast(sample,plan,'active',now,[tail]));
+ const burst=[{at:tail.at-H,bytes:tail.bytes-G}];
+ const r=staleAllocationForecast(sample,plan,'active',now,burst);assert.equal(r.hourlyGrowthBytes,G);
+});

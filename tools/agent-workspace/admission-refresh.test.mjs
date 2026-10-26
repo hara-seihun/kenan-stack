@@ -119,3 +119,13 @@ test('native admission samples a smaller deciding reservation after a busy large
   records.forEach((r,i)=>{assert.deepEqual(db.prepare('SELECT * FROM workspace WHERE id=?').get(r.id),before[i].row);assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(r.id).plan_json,before[i].plan);});
  }finally{holder?.kill('SIGTERM');db?.close();if(prior===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=prior;fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('admission continues past ten refreshed entries until the deciding stale reservation fits',()=>{
+ let admitted=false,now=0;const measured=[];
+ const candidates=Array.from({length:30},(_,index)=>({path:`/stale-${index}`}));
+ const result=admitWithRefresh({budgetMs:30000,now:()=>now,
+  decide:()=>{if(!admitted)throw refusal();return 'admitted';},candidates:()=>candidates,
+  refresh:entry=>{measured.push(entry.path);now+=100;if(entry.path==='/stale-19')admitted=true;return {kind:'measured'};}});
+ assert.equal(result,'admitted');assert.equal(measured.length,20);
+ assert.equal(measured.at(-1),'/stale-19');assert.ok(now<30000);
+});

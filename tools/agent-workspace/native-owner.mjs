@@ -19,7 +19,10 @@ import {OWNER_AGENT_ID} from './owner-liveness.mjs';
 //    conversation on exactly one serving channel.
 // Anything else stays unbound; an unbound non-native owner remains "unknown" to owner liveness.
 
-const CALL_ID=/^[A-Za-z0-9_:.-]{1,256}$/;
+// The runtime retains Codex calls as a complete call id plus response function item id.
+// Accept only that exact composite shape in addition to the existing simple ids; neither
+// segment is a substitute for the full native-store identity.
+const CALL_ID=/^(?:[A-Za-z0-9_:.-]{1,256}|call_[a-f0-9]{32}\|fc_[a-f0-9]{50})$/;
 const CHANNEL=/^[a-z][a-z0-9-]{0,23}$/;
 const MAX_PAIRS=512;
 
@@ -118,9 +121,14 @@ export function toolCallAuthenticationSql(pairs){
  if(!Array.isArray(pairs)||!pairs.length||pairs.length>MAX_PAIRS||pairs.some(pair=>!OWNER_AGENT_ID.test(pair.agentId)||!CALL_ID.test(pair.callId)))throw new Error('bounded exact (agent, tool call) pairs required');
  const values=pairs.map(pair=>`(${literal(pair.agentId)},${literal(pair.callId)})`).join(',');
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='8000ms';
- SELECT coalesce(json_agg(json_build_object('agentId',v.agent_id,'callId',v.call_id)),'[]'::json) FROM (VALUES ${values}) v(agent_id,call_id)
- WHERE EXISTS (SELECT 1 FROM agent a JOIN message m ON m.conversation_id=a.conversation_id
-  WHERE a.id::text=v.agent_id AND m.parts @> jsonb_build_array(jsonb_build_object('type','tool','callId',v.call_id))); ROLLBACK;`;
+ WITH requested(agent_id,call_id) AS (VALUES ${values}),
+ identities AS MATERIALIZED (SELECT v.agent_id,v.call_id,a.conversation_id FROM requested v JOIN agent a ON a.id::text=v.agent_id),
+ conversations AS (SELECT DISTINCT conversation_id FROM identities),
+ calls AS MATERIALIZED (SELECT c.conversation_id,p->>'callId' AS call_id FROM conversations c
+  CROSS JOIN LATERAL (SELECT parts FROM message WHERE conversation_id=c.conversation_id OFFSET 0) m
+  CROSS JOIN LATERAL jsonb_array_elements(m.parts) p WHERE p->>'type'='tool')
+ SELECT coalesce(json_agg(json_build_object('agentId',v.agent_id,'callId',v.call_id)),'[]'::json) FROM identities v
+ WHERE EXISTS (SELECT 1 FROM calls c WHERE c.conversation_id=v.conversation_id AND c.call_id=v.call_id); ROLLBACK;`;
 }
 
 // Which pairs the native store confirms, per channel. Any channel failure fails the whole

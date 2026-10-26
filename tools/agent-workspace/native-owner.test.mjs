@@ -85,6 +85,26 @@ test('admission receipts require byte-equal creation requests and consistent ide
  assert.equal(admissionReceipts(jobs({a:{environment:{KENAN_AGENT:A,KENAN_TOOL_CALL_ID:'c1'},request:{},raw:{request:'[[['}}}),WS,REQUEST).code,'receipt-request-unreadable');
 });
 
+const COMPOSITE='call_'+ 'a'.repeat(32)+'|fc_'+ 'b'.repeat(50);
+test('native composite call ids preserve the complete authenticated identity without admitting arbitrary pipes',()=>{
+ const binding={agentId:A,channel:'beta',callId:COMPOSITE};
+ assert.deepEqual(nativeCaller({caller:()=>binding}),binding);
+ const r=admissionReceipts(jobs({a:good(A,COMPOSITE)}),WS,REQUEST);
+ assert.equal(r.kind,'receipt');assert.equal(r.pairs[0].callId,COMPOSITE);
+ const authenticated={errors:[],confirmed:new Map([[A+'\0'+COMPOSITE,['beta']]])};
+ const result=receiptBinding(r,authenticated);
+ assert.equal(result.kind,'bindable');assert.equal(result.binding.callId,COMPOSITE);
+ const d=db();bindNativeOwner(d,WS,result.binding,'admission-receipt',result.evidence);
+ assert.equal(canonicalNativeOwner(d,{id:WS,owner:'custom-root-label'}),A);
+ assert.equal(nativeOwnerBinding(d,WS).callId,COMPOSITE);
+ assert.equal(receiptBinding(r,{errors:[],confirmed:new Map([[A+'\0'+COMPOSITE.split('|')[0],['beta']]])}).code,'receipt-tool-call-unconfirmed','a partial call id never authenticates');
+ for(const invalid of ['call_a|fc_b',COMPOSITE+'|extra',COMPOSITE.replace('|','||'),COMPOSITE.slice(0,-1),COMPOSITE+'b',COMPOSITE.toUpperCase(),'label|label',COMPOSITE+'\n',COMPOSITE+"'"]){
+  assert.equal(admissionReceipts(jobs({a:good(A,invalid)}),WS,REQUEST).code,'receipt-identity-malformed',invalid);
+  assert.throws(()=>toolCallAuthenticationSql([{agentId:A,callId:invalid}]),/bounded exact/);
+ }
+ assert.match(toolCallAuthenticationSql([{agentId:A,callId:COMPOSITE}]),new RegExp(COMPOSITE.replace('|','\\|')));
+});
+
 const receipt=pairs=>({kind:'receipt',agentId:A,pairs:pairs.map(([callId,job])=>({agentId:A,callId,job}))});
 const seen=(...entries)=>({errors:[],confirmed:new Map(entries.map(([call,channels])=>[A+'\0'+call,channels]))});
 
@@ -153,12 +173,16 @@ test('actual PostgreSQL: only a tool call that exists in that agent\'s own conve
   const schema=`CREATE TABLE agent(id text PRIMARY KEY,conversation_id text NOT NULL);CREATE TABLE message(id serial PRIMARY KEY,conversation_id text NOT NULL,role text,parts jsonb NOT NULL);`;
   psql('kenan_beta',schema+`INSERT INTO agent VALUES('${A}','conv-a'),('${B}','conv-b');
    INSERT INTO message(conversation_id,role,parts) VALUES('conv-a','tool','[{"type":"text","text":"x"},{"type":"tool","callId":"c1"}]'),
+   ('conv-a','assistant','[{"type":"tool","callId":"${COMPOSITE}"}]'),('conv-a','tool','[{"type":"tool","callId":"${COMPOSITE}"}]'),
    ('conv-b','tool','[{"type":"tool","callId":"c2"}]'),('conv-a','assistant','[{"type":"text","callId":"c3"}]'),('conv-a','tool','[{"type":"tool","callId":"dup"}]');`);
   psql('kenan_production',schema+`INSERT INTO agent VALUES('${A}','conv-p');INSERT INTO message(conversation_id,role,parts) VALUES('conv-p','tool','[{"type":"tool","callId":"dup"}]');`);
   const execute=(command,args,options)=>{const rewritten=args.map((value,index)=>args[index-1]==='--host'?root:value);const r=spawnSync(path.join(bin,command),rewritten,{...options});return {status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error};};
-  const result=authenticateToolCalls([pair('c1'),pair('c2'),pair('c3'),pair('dup'),pair('absent')],{deadline:Date.now()+20000,channels:()=>['beta','production'],execute,user:()=>'fixture'});
+  const result=authenticateToolCalls([pair('c1'),pair('c2'),pair('c3'),pair('dup'),pair('absent'),pair(COMPOSITE),pair(COMPOSITE,B),pair(COMPOSITE.split('|')[0])],{deadline:Date.now()+20000,channels:()=>['beta','production'],execute,user:()=>'fixture'});
   assert.deepEqual(result.errors,[]);
   assert.deepEqual(result.confirmed.get(A+'\0c1'),['beta']);
+  assert.deepEqual(result.confirmed.get(A+'\0'+COMPOSITE),['beta']);
+  assert.equal(result.confirmed.has(B+'\0'+COMPOSITE),false,'the full native id in another conversation is not owned by B');
+  assert.equal(result.confirmed.has(A+'\0'+COMPOSITE.split('|')[0]),false,'a composite id is never truncated');
   assert.equal(result.confirmed.has(A+'\0c2'),false,'agent B owns c2, not agent A');
   assert.equal(result.confirmed.has(A+'\0c3'),false,'a text part is not a tool call');
   assert.equal(result.confirmed.has(A+'\0absent'),false);

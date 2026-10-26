@@ -27,3 +27,20 @@ for(const same of [false,true])test(same?'same-checkout contention is bounded by
  const output=JSON.parse(sample.stdout).results;assert.equal(output[0].status,same?'error':'measured');
  if(same){assert.equal(output[0].ok,false);assert.match(output[0].error,/resource busy/);}
 });
+
+test('capacity-lock deadline after a complete walk advances neither successful cache nor growth history',async t=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'measure-atomic-deadline-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const source=path.join(root,'source');fs.mkdirSync(source);execFileSync('git',['init','-q',source]);execFileSync('git',['-C',source,'-c','user.name=F','-c','user.email=f@example.invalid','commit','-q','--allow-empty','-m','fixture']);
+ const state=path.join(root,'registry.sqlite3'),env={...process.env,PI_WORKSPACE_STATE:state,PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty'};
+ const run=args=>spawnSync(tool,args,{env,encoding:'utf8',timeout:5000});
+ const reg=run(['register','--path',source,'--owner','fixture','--intent','source-only','--headroom-gib','8','--growth-mib','512','--json']);assert.equal(reg.status,0,reg.stderr);const row=JSON.parse(reg.stdout);
+ assert.equal(run(['measure-capacity','--id',row.id,'--budget-ms','2000','--json']).status,0);
+ const db=new DatabaseSync(state);t.after(()=>db.close());
+ const prior=db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(row.id).measurement_json;
+ const history=db.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id).state_json;
+ const release=await heldLock(root,`capacity:${fs.statSync(source).dev}`);t.after(release);
+ const measured=run(['measure-capacity','--id',row.id,'--budget-ms','1500','--json']);assert.equal(measured.status,0,measured.stderr);
+ assert.equal(JSON.parse(measured.stdout).results[0].status,'error');
+ assert.equal(db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(row.id).measurement_json,prior);
+ assert.equal(db.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id).state_json,history);
+});

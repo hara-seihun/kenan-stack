@@ -4,7 +4,7 @@
 
 ## Refusal-driven sampling and terminal source growth
 
-New source and registration admissions and explicit growth heartbeats refresh the stale or missing samples that contribute to a capacity refusal, largest remaining liability first. Sampling runs outside the device admission fence with a 30-second total budget. Each decision rereads physical capacity and all reservations under the fence. Admission stops sampling as soon as it fits. A failed or incomplete observation never grants credit or changes a source lease, plan, checkout or cache. Foreground source preparation delegates slow work to its original durable request rather than occupying its short foreground budget.
+New source and registration admissions, ordinary repricing, and explicit growth heartbeats refresh the stale or missing samples that contribute to a capacity refusal, largest remaining liability first. Sampling runs outside the device admission fence with a 30-second total budget. Each decision rereads physical capacity and all reservations under the fence. Admission stops sampling as soon as it fits. A failed or incomplete observation never grants credit or changes a source lease, plan, checkout or cache. Foreground source preparation delegates slow work to its original durable request rather than occupying its short foreground budget.
 
 Explicit `measure-capacity` selectors use their full requested deadline rather than a two-second fleet slice. Fleet observations remain incremental, and incomplete walks preserve prior successful measurements.
 
@@ -892,9 +892,11 @@ or a guaranteed maximum write rate.
 For allocation accounting, credit is at most the last observed consumed growth
 after the existing `max(64 MiB, 1 percent)` margin, less `U`, and never negative.
 The forecast does not claim that uncertainty bytes are already allocated. The
-separate existing automatic future-growth policy remains, but its projected
-remaining allowance cannot be smaller than `U`; new workspaces keep their original
-allowance less only this discounted consumed-growth credit. Explicit growth
+separate automatic future-growth policy uses twice the positive hourly growth
+anchored to the latest actual observation, with the same calculation before and
+after the 900-second freshness boundary. Its 512 MiB minimum is independent of
+`U`, which discounts historical allocation credit, not future writes. New
+workspaces keep their original allowance less only this discounted consumed-growth credit. Explicit growth
 restores retain the original allowance. Status and refusal details expose the
 forecast, observed consumption, credit, uncertainty, age and rate separately.
 
@@ -955,3 +957,20 @@ After normal component deployment, `bash tools/agent-workspace/install-owner-rea
 Native root precheck plans in `/home/kenan/data/converge-root-precheck/*.plan.json` protect every absolute execution dependency from stage, finish and candidate-finish arguments, not only root and smoke checkouts. A plan remains custody even between native runs or after a terminal-looking state. Only an explicit `.custody-released.json` sidecar with the exact plan SHA-256, publisher owner, reason and complete dependency paths can end this protection; malformed or contradictory records retain custody. An archived original owner never overrides publisher adoption or plan custody.
 
 Prepared Original40 configurations in `/home/kenan/data/omni-loop-9681/host-preparation-*/CONFIG.json`, the current configuration pointer and explicit publisher adoption records retain their source and helper dependencies before a process is launched. A host exit never gives up prepared custody. New publisher adoptions belong in `/home/kenan/data/converge-releases/publisher-custody`; malformed or contradictory custody fails closed. The exact configuration digest and full dependency list must match a publisher disposition before cleanup can remove its source.
+
+### Atomic allocation observation and admission recovery
+
+A completed successful allocation observation and its matching growth journal
+commit in one transaction under the checkout and device locks. Capacity-lock
+exhaustion or journal failure preserves both previous records. Historical split
+publication can be reconciled read-only by appending the exact complete cached
+observation to an otherwise valid, identically bound history; malformed,
+conflicting, overlong or differently bound history never gains credit.
+
+Ordinary repricing uses the same bounded deciding-reservation refresh as source
+admission, releasing its original checkout and device locks before walking
+another checkout. Every retry rebuilds the proposal, rereads actual free blocks
+and shared headroom, and can journal consumption only once. A fleet sampling
+command can finish successfully with explicitly reported deferred rows; admission
+continues sampling the rows it needs within its own deadline rather than assuming
+that an exit status of zero made the entire fleet fresh.
