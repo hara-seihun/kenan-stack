@@ -64,7 +64,6 @@ for(const cache of ['missing','stale'])test(`a reserved checkout child refreshes
   if(cache==='missing')db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(oldRecord.id);
   else {const row=db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(oldRecord.id),sample=JSON.parse(row.measurement_json);sample.startedAt-=2*3600000;sample.completedAt-=2*3600000;db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify(sample),oldRecord.id);}
   db.prepare('DELETE FROM workspace_growth_policy WHERE workspace_id=?').run(oldRecord.id);
-  if(cache==='stale'){const p=JSON.parse(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(oldRecord.id).plan_json);delete p.completedAllocationBytes;db.prepare('UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?').run(JSON.stringify(p),oldRecord.id);}
   const head=execFileSync('git',['-C',sourcePath,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
   const stat=fs.statfsSync(root),growthMiB=Math.floor((stat.bavail*stat.bsize-9*1024**3)/1024**2);
   const capacity={intent:'budgeted',headroomBytes:8*1024**3,growthBytes:growthMiB*1024**2};

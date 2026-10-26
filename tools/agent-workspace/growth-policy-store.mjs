@@ -40,8 +40,12 @@ export function projectGrowthPolicy(db,row,plan,sample,now=Date.now()){
 }
 export function recordGrowthSample(db,row,plan,sample){
  if(!sample?.ok||row.state==='creating'||!['source-only','budgeted'].includes(plan.intent)||plan.growthLifecycle)return;
- const state=read(db,row,plan);if(state===null)return; // Malformed authority is never silently repaired into credit.
+ let state=read(db,row,plan);if(state===null)return; // Malformed authority is never silently repaired into credit.
+ const binding=sample.rootPath && sample.planSha256 ? {rootPath:sample.rootPath,planSha256:sample.planSha256,device:sample.device,inode:sample.inode} : null;
+ // A new root or plan cannot inherit another allocation's rate history.
+ if(binding && JSON.stringify(state.allocationBinding)!==JSON.stringify(binding))state={...state,samples:[]};
  const next=append(state,sample),cut=sample.completedAt-HOUR_MS;
+ if(binding)next.allocationBinding=binding;
  // Retain one real anchor before the window and all observations in the window.
  let anchor=-1;for(let i=0;i<next.samples.length;i++)if(next.samples[i].at<=cut)anchor=i;
  if(anchor>0)next.samples=next.samples.slice(anchor);

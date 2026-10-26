@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
+import {staleAllocationForecast} from './stale-allocation.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
@@ -565,6 +566,8 @@ function register(database, input) {
       // An absent baseline could make later samples spend future growth on
       // already-existing files. Unknown allocation therefore admits no writer.
       plan.completedAllocationBytes = measurement.allocatedBytes;
+      measurement.planSha256 = createHash("sha256").update(JSON.stringify(plan)).digest("hex");
+      measurement.rootPath = input.path;
       const inspected = registrationInspection(input.path,registryPaths.get(database));
       if (inspected.head !== info.head) growthError("registration-source-changed","checkout changed during registration admission");
       database.exec("BEGIN IMMEDIATE");
@@ -1998,18 +2001,25 @@ function workspaceAllocationSample(workspacePath, device, options) {
 function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device, now = Date.now()) {
   const row = database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(workspaceId);
   if (row === undefined) return { ok: false, code: "allocated-block-cache-missing", error: "allocated-block cache missing" };
-  const sample = JSON.parse(row.measurement_json);
-  if (!sample.ok) return { ok: false, code: "allocated-block-measurement-failed", error: `allocated-block measurement failed: ${sample.error}` };
+  let sample;
+  try { sample = JSON.parse(row.measurement_json); } catch { return {ok:false,code:"allocated-block-cache-invalid",error:"malformed allocated-block cache"}; }
+  if (!sample || typeof sample !== "object" || sample.partial) return {ok:false,code:"allocated-block-cache-invalid",error:"incomplete allocated-block cache"};
+  if (sample.ok !== true) return { ok: false, code: "allocated-block-measurement-failed", error: `allocated-block measurement failed: ${sample.error}` };
   for (const value of [sample.startedAt, sample.completedAt, sample.bytes, sample.allocatedBytes]) {
-    if (!Number.isSafeInteger(value) || value < 0) fail("invalid capacity allocation cache");
+    if (!Number.isSafeInteger(value) || value < 0) return {ok:false,code:"allocated-block-cache-invalid",error:"invalid capacity allocation cache"};
   }
+  if (sample.bytes > sample.allocatedBytes) return {ok:false,code:"allocated-block-cache-invalid",error:"exclusive bytes exceed allocated bytes"};
   if (sample.completedAt < sample.startedAt || sample.completedAt > now) return { ok: false, code: "allocated-block-cache-future-dated", error: `allocated-block cache future-dated (completed ${sample.completedAt}, observed ${now})` };
   try {
     const stats = lstatSync(workspacePath);
     if (!stats.isDirectory() || String(stats.dev) !== device || sample.device !== device || String(stats.ino) !== sample.inode) return { ok: false, code: "allocated-block-cache-root-changed", error: "allocated-block cache root identity changed" };
   } catch (error) { return { ok: false, code: "allocated-block-cache-root-unavailable", error: `allocated-block cache root unavailable: ${error.code ?? error.message}` }; }
-  if (now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) return { ok: false, code: "allocated-block-cache-stale", ageMs: now - sample.startedAt,
+  if (now - sample.startedAt > CAPACITY_MEASUREMENT_MAX_AGE_MS) {
+    const plan = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(workspaceId);
+    if (!plan || sample.rootPath !== workspacePath || sample.planSha256 !== createHash("sha256").update(plan.plan_json).digest("hex")) return {ok:false,code:"allocated-block-cache-plan-changed",error:"stale allocation is not bound to the current capacity plan"};
+    return { ok: false, code: "allocated-block-cache-stale", ageMs: now - sample.startedAt,
     lastObservation: sample, error: `allocated-block cache stale (age ${Math.round((now - sample.startedAt) / 1000)} s; limit ${CAPACITY_MEASUREMENT_MAX_AGE_MS / 1000} s)` };
+  }
   const marginBytes = Math.max(CAPACITY_MEASUREMENT_MARGIN_BYTES, Math.ceil(sample.bytes / 100));
   return { ok: true, bytes: Math.max(0, sample.bytes - marginBytes), rawBytes: sample.bytes, allocatedBytes: sample.allocatedBytes,
     startedAt: sample.startedAt, completedAt: sample.completedAt, marginBytes };
@@ -2079,7 +2089,7 @@ function capacityReservations(database, device, reservedPath, measure) {
     unpricedDormant += 1;
   }
   let headroomBytes = 0;
-  const measurementFailures = [], growthRepricing=[];
+  const measurementFailures = [], growthRepricing=[], staleAllocationForecasts=[];
   const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
     WHERE c.device_id=? AND w.path!=? AND w.state!='released' ORDER BY w.created_at DESC, w.id`)
     .all(device, reservedPath ?? "");
@@ -2096,11 +2106,32 @@ function capacityReservations(database, device, reservedPath, measure) {
       const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
-      const liability = ledgerLiability(plan, row.state, measurement);
-      const policy = terminal ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation ?? measurement);
+      // Only the pricing projection may use a stale forecast. cachedWorkspaceAllocation
+      // remains false for lifecycle reductions and for fair on-demand sampling.
+      let forecast = null;
+      if (measurement.code === 'allocated-block-cache-stale') {
+        try {
+          const history = JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json ?? 'null');
+          const last = measurement.lastObservation;
+          const binding = {rootPath:last.rootPath,planSha256:last.planSha256,device:last.device,inode:last.inode};
+          if (history?.version === 1 && history.planGrowthBytes === plan.growthBytes && history.samples?.length <= 512 &&
+              JSON.stringify(history.allocationBinding) === JSON.stringify(binding) &&
+              last.startedAt >= row.created_at && history.samples[0]?.at >= row.created_at &&
+              (history.restoreAt === undefined || Number.isSafeInteger(history.restoreAt) && history.restoreAt >= 0 && history.restoreAt <= Date.now()))
+            forecast = staleAllocationForecast(measurement.lastObservation, plan, row.state, Date.now(), history.samples);
+        } catch {} // Missing or malformed history never produces forecast credit.
+      }
+      if (forecast) staleAllocationForecasts.push({id:row.id,path:row.path,...forecast});
+      const liability = ledgerLiability(plan, row.state, forecast ? {ok:true,bytes:forecast.bytes} : measurement);
+      const trustworthy = measurement.ok || measurement.code === 'allocated-block-cache-stale' && forecast !== null;
+      const policyEligible = row.state !== 'creating' && ['source-only','budgeted'].includes(plan.intent) && plan.growthBytes > 0 && !plan.growthLifecycle;
+      const policy = terminal ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : !policyEligible ? null : trustworthy
+        ? projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation)
+        : {effectiveRemainingBytes:plan.growthBytes,fullReservation:true,reason:'measurement-unavailable'};
       if (policy!==null) {
-        liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : policy.effectiveRemainingBytes??plan.growthBytes;
-        growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy});
+        liability.reservedBytes=policy.reason==='fresh-workspace' ? liability.reservedBytes : forecast ? Math.max(forecast.uncertaintyBytes, policy.effectiveRemainingBytes??plan.growthBytes) : policy.effectiveRemainingBytes??plan.growthBytes;
+        growthRepricing.push({id:row.id,path:row.path,originalGrowthBytes:plan.growthBytes,...policy,
+          ...(forecast ? {effectiveRemainingBytes:liability.reservedBytes, forecastUncertaintyBytes:forecast.uncertaintyBytes} : {})});
       }
       headroomBytes = Math.max(headroomBytes, liability.headroomBytes);
       return liability.reservedBytes;
@@ -2122,7 +2153,7 @@ function capacityReservations(database, device, reservedPath, measure) {
     priced.push(execution.growthBytes);
     headroomBytes = Math.max(headroomBytes, execution.headroomBytes);
   }
-  return { priced, headroomBytes, unpricedDormant, growthRepricing, sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
+  return { priced, headroomBytes, unpricedDormant, growthRepricing, ...(staleAllocationForecasts.length ? {staleAllocationForecasts} : {}), sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
 // Only a pre-effect admission refusal may retry. Acquire the device fence for
@@ -2133,7 +2164,7 @@ function withCapacityAdmission(database, statePath, device, action) {
     candidates: error => {
       const failures=error.capacity?.breakdown?.measurementFailures??[];
       const charged=new Map((error.capacity?.breakdown?.automaticGrowthRepricing??[]).map(item=>[item.path,item.effectiveRemainingBytes]));
-      const candidates=failures.filter(item=>['allocated-block-cache-stale','allocated-block-cache-missing','allocated-block-measurement-failed'].includes(item.code)
+      const candidates=failures.filter(item=>['allocated-block-cache-stale','allocated-block-cache-missing','allocated-block-measurement-failed','allocated-block-cache-plan-changed','allocated-block-cache-invalid'].includes(item.code)
         && (charged.get(item.path)??item.reservedBytes)>0)
         .sort((a,b)=>(charged.get(b.path)??b.reservedBytes)-(charged.get(a.path)??a.reservedBytes));
       if(!candidates.length)return [];
@@ -2177,6 +2208,7 @@ function capacityRefusalDetails(plan, reservations) {
     unpricedDormant: reservations.unpricedDormant,
     measurementFailures: reservations.measurementFailures === undefined ? [] : reservations.measurementFailures,
     automaticGrowthRepricing: reservations.growthRepricing??[],
+    staleAllocationForecasts: reservations.staleAllocationForecasts??[],
     sourceImport: plan.sourceImportBytes === undefined ? { state: "unset" } : { state: "set", bytes: plan.sourceImportBytes },
     sourceForecast: unestimated ? { state: "unset" } : { state: "set", plan },
   };
@@ -2198,7 +2230,7 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
   const device = String(statSync(root).dev);
   const reservations = capacityReservations(database, device, reservedPath);
   for (const failure of reservations.measurementFailures ?? []) {
-    process.stderr.write(`capacity measurement unavailable at ${failure.path}; retaining full ${(failure.reservedBytes / 1024 ** 3).toFixed(2)} GiB reservation: ${failure.error}\n`);
+    process.stderr.write(`capacity measurement unavailable at ${failure.path}; original budget ${(failure.reservedBytes / 1024 ** 3).toFixed(2)} GiB (current pricing is in capacity-detail): ${failure.error}\n`);
   }
   const stats = statfsSync(root);
   const freeBytes = stats.bavail * stats.bsize;
@@ -3271,13 +3303,15 @@ function completeCreation(database, id, repository, leaseSeconds, detail, args) 
   if (row !== undefined) {
     plan = JSON.parse(row.plan_json);
     const measurement = workspaceAllocationSample(row.path, row.device_id);
-    database.prepare("INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json) VALUES(?,?)").run(id, JSON.stringify(measurement));
     if (measurement.ok) plan.completedAllocationBytes = measurement.allocatedBytes;
     else {
       plan.completedAllocationBytes = null;
       plan.completedAllocationError = measurement.error;
       process.stderr.write(`capacity baseline unavailable at ${row.path}; retaining full growth reservation: ${measurement.error}\n`);
     }
+    measurement.planSha256 = createHash("sha256").update(JSON.stringify(plan)).digest("hex");
+    measurement.rootPath = row.path;
+    database.prepare("INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json) VALUES(?,?)").run(id, JSON.stringify(measurement));
   }
   const now = Date.now();
   database.exec("BEGIN IMMEDIATE");
@@ -4599,6 +4633,11 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
   database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
   database.prepare("INSERT OR REPLACE INTO workspace_capacity_attempt VALUES(?,?)").run(row.id,Date.now());
   const store = sample => {
+    if (sample.ok) {
+      const current = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(row.id);
+      if (current) sample.planSha256 = createHash("sha256").update(current.plan_json).digest("hex");
+      sample.rootPath = row.path;
+    }
     const priorRow=database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(row.id);
     let priorSample;try{priorSample=priorRow?JSON.parse(priorRow.measurement_json):null;}catch{priorSample=null;}
     if(sample.ok || !priorSample?.ok) database.prepare(`INSERT OR REPLACE INTO workspace_capacity_measurement(workspace_id,measurement_json)

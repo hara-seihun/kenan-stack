@@ -787,8 +787,9 @@ allocated growth observed in the last hour)`. This applies to active roots and
 reader-held roots as well; it neither ends their leases nor removes their source.
 The original plan remains preserved. New checkouts, pending construction,
 non-Git execution reservations, shared operating headroom and source import
-reservations keep their original protections. Missing, stale or malformed
-allocation or policy evidence retains the full original growth reservation.
+reservations keep their original protections. Missing or malformed allocation
+or policy evidence retains the full original growth reservation. Complete stale
+observations use the conservative admission forecast described below.
 
 The periodic bounded sampler maintains a rolling observation journal. Until an
 hour of samples exists, the completed checkout baseline conservatively attributes
@@ -853,10 +854,40 @@ checked again before a saved traversal is resumed. The two million entry bound
 still applies. Progress across timer passes prevents a large tree from restarting
 at its root on every exhausted budget.
 
-A stale allocation never supplies physical-byte credit. Automatic future-growth
-pricing instead keeps the last observed hourly positive-growth rate, doubled and
-capped by the original request, with a 512 MiB safety floor. Missing or malformed
-history and explicit growth restores still preserve the full allowance. An exact
+Staleness alone does not erase a complete allocation measurement. Admission may
+use a forecast only when that measurement and its complete rate history name the
+same absolute root, device, inode and exact capacity-plan SHA256. Old unbound
+samples require a supported refresh first. Missing, malformed, partial,
+future-dated, changed-plan or changed-root samples keep the full allowance;
+detached rate history cannot supply credit. The existing fair on-demand sampler
+still sees stale samples as stale and refreshes them when they decide admission.
+
+The forecast is the last complete measured size plus an uncertainty allowance
+`U = min(original growth, 512 MiB + ceil(2 * positive hourly rate * age in hours))`.
+Age starts at measurement start, including time spent walking. The rate sums
+positive deltas, so deletions never cancel later regrowth; a single complete
+sample conservatively attributes all growth over the completed source baseline
+to one hour. The 512 MiB minimum protects an idle observation against a new burst,
+and positive growth increases uncertainty with age until no allocation credit
+remains. This is a disclosed admission estimate, not an enforced filesystem quota
+or a guaranteed maximum write rate.
+
+For allocation accounting, credit is at most the last observed consumed growth
+after the existing `max(64 MiB, 1 percent)` margin, less `U`, and never negative.
+The forecast does not claim that uncertainty bytes are already allocated. The
+separate existing automatic future-growth policy remains, but its projected
+remaining allowance cannot be smaller than `U`; new workspaces keep their original
+allowance less only this discounted consumed-growth credit. Explicit growth
+restores retain the original allowance. Status and refusal details expose the
+forecast, observed consumption, credit, uncertainty, age and rate separately.
+
+Unobserved external deletions remain estimation risk, not newly freed capacity.
+A known lifecycle cache/source removal must invalidate the allocation sample;
+a missing sample also disables detached rate-history pricing until a complete
+refresh. Fresh-sample requirements for reductions, repricing, retirement and
+writer admission are unchanged. Source construction, source imports, non-Git
+execution reservations, actual free blocks and maximum shared headroom retain
+their existing protections. An exact
 completed qualification or terminal refusal removes remaining preparation growth
 only when the complete qualification census shows no current request or train
 reference. Its source retention, original plan, lease and operating headroom do

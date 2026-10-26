@@ -1,5 +1,6 @@
 import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {execFileSync} from 'node:child_process';import {DatabaseSync} from 'node:sqlite';
+import {createHash} from 'node:crypto';
 import {main,workspaceTesting} from './workspace.mjs';import {recordGrowthSample,restoreGrowthPolicy} from './growth-policy-store.mjs';
 const G=1024**3,H=3600000;
 function fixture(fn){const root=fs.mkdtempSync(path.join(os.tmpdir(),'auto-growth-')),state=path.join(root,'registry.sqlite3'),dir=path.join(root,'source');let db;
@@ -12,7 +13,7 @@ function fixture(fn){const root=fs.mkdtempSync(path.join(os.tmpdir(),'auto-growt
  db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(row.id);
  const baseline=1024*1024,plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:baseline,completedAllocationBytes:baseline,growthBytes:6*G,headroomBytes:8*G};
  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(row.id,device,JSON.stringify(plan));
- const sample=(bytes,at=Date.now())=>({ok:true,bytes,allocatedBytes:bytes,device,inode:String(st.ino),startedAt:at,completedAt:at});
+ const sample=(bytes,at=Date.now())=>({ok:true,rootPath:dir,planSha256:createHash("sha256").update(JSON.stringify(plan)).digest("hex"),bytes,allocatedBytes:bytes,device,inode:String(st.ino),startedAt:at,completedAt:at});
  const cache=s=>db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(row.id,JSON.stringify(s));
  const projection=()=>workspaceTesting.capacityReservations(db,device);
  const rr={...row,created_at:created,state:'active'};fn({root,dir,state,db,row:rr,run,plan,baseline,device,sample,cache,projection});
@@ -25,8 +26,8 @@ test('sampler journals successful allocated observations and a real burst restor
  const r=f.projection();assert.deepEqual(r.priced,[6*G]);assert.equal(r.growthRepricing[0].reason,'fresh-burst');
 }));
 test('missing and malformed policy samples fail closed; stale samples retain observed growth; pending creation does not reprice',()=>fixture(f=>{
- assert.deepEqual(f.projection().priced,[6*G]);f.cache(f.sample(f.baseline,Date.now()-16*60000));assert.deepEqual(f.projection().priced,[.5*G]);f.cache(f.sample(f.baseline));
- f.db.prepare('INSERT INTO workspace_growth_policy VALUES(?,?)').run(f.row.id,'{bad');assert.deepEqual(f.projection().priced,[6*G]);f.db.prepare('DELETE FROM workspace_growth_policy').run();f.db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(f.row.id);assert.equal(f.projection().growthRepricing.length,0);
+ assert.deepEqual(f.projection().priced,[6*G]);const old=f.sample(f.baseline,Date.now()-16*60000);f.cache(old);recordGrowthSample(f.db,f.row,f.plan,old);assert.deepEqual(f.projection().priced,[.5*G]);f.cache(f.sample(f.baseline));
+ f.db.prepare('INSERT OR REPLACE INTO workspace_growth_policy VALUES(?,?)').run(f.row.id,'{bad');assert.deepEqual(f.projection().priced,[6*G]);f.db.prepare('DELETE FROM workspace_growth_policy').run();f.db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(f.row.id);assert.equal(f.projection().growthRepricing.length,0);
 }));
 test('ordinary heartbeat retains idle pricing; explicit heartbeat restores original amount even with a smaller request',()=>fixture(f=>{
  f.cache(f.sample(f.baseline));f.run(['heartbeat','--id',f.row.id,'--json']);assert.deepEqual(f.projection().priced,[.5*G]);
@@ -48,7 +49,7 @@ test('explicit growth heartbeat can request a larger original amount through ord
  f.cache(f.sample(f.baseline));f.run(['heartbeat','--id',f.row.id,'--growth-mib','8192','--json']);assert.equal(JSON.parse(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(f.row.id).plan_json).growthBytes,8*G);assert.deepEqual(f.projection().priced,[8*G]);
 }));
 
-test('many old reservations with an exhausted sampler retain the observed rate and operating headroom',()=>fixture(f=>{
+test('failed and absent roots cannot spend detached policy history even after an exhausted sampler',()=>fixture(f=>{
  const old=f.sample(f.baseline,Date.now()-40*60000);f.cache(old);recordGrowthSample(f.db,f.row,f.plan,old);
  // A finite sampler failed before refreshing this row. Its successful observation must survive.
  f.cache({ok:false,startedAt:Date.now(),completedAt:Date.now(),error:'allocated-block measurement budget exhausted'});
@@ -57,7 +58,7 @@ test('many old reservations with an exhausted sampler retain the observed rate a
   f.db.prepare('INSERT INTO workspace_capacity VALUES(?,?,?)').run(id,f.device,JSON.stringify(f.plan));
   f.db.prepare('INSERT INTO workspace_growth_policy SELECT ?,state_json FROM workspace_growth_policy WHERE workspace_id=?').run(id,f.row.id);
  }
- const r=f.projection();assert.equal(r.priced.length,101);assert.equal(r.priced.reduce((a,b)=>a+b,0),101*.5*G);assert.equal(r.headroomBytes,8*G);
+ const r=f.projection();assert.equal(r.priced.length,101);assert.equal(r.priced.reduce((a,b)=>a+b,0),101*6*G);assert.equal(r.headroomBytes,8*G);
 }));
 test('an exact terminal qualification releases future growth, while a listed train or pending request preserves it',()=>fixture(f=>{
  const data=path.join(f.root,'release-data'),id='11111111-2222-4333-8444-555555555555',name='fixture-train';
