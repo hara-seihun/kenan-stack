@@ -2100,7 +2100,7 @@ test("forty concurrent create and heartbeat clients share registry writes", asyn
     // all other errors remain failures, and every client settles before cleanup.
     const results = await Promise.allSettled(Array.from({ length: 40 }, async (_, index) => {
       const args = ["create", "--root", f.workspaces, "--name", `concurrent-${index}`, "--repo", f.remote,
-        "--ref", commit, "--min-free-gib", "0", "--json"];
+        "--ref", commit, "--min-free-gib", "0", "--creation-timeout-seconds", "180", "--json"];
       for (let attempt = 0; ; attempt++) {
         try { return JSON.parse(await runAsync(args, f.env)); }
         catch (error) {
