@@ -175,9 +175,13 @@ test('actual PostgreSQL: only a tool call that exists in that agent\'s own conve
    INSERT INTO message(conversation_id,role,parts) VALUES('conv-a','tool','[{"type":"text","text":"x"},{"type":"tool","callId":"c1"}]'),
    ('conv-a','assistant','[{"type":"tool","callId":"${COMPOSITE}"}]'),('conv-a','tool','[{"type":"tool","callId":"${COMPOSITE}"}]'),
    ('conv-b','tool','[{"type":"tool","callId":"c2"}]'),('conv-a','assistant','[{"type":"text","callId":"c3"}]'),('conv-a','tool','[{"type":"tool","callId":"dup"}]');`);
+  // Historical scalar payloads must not poison an unrelated current call, or authenticate lookalikes.
+  psql('kenan_beta',`INSERT INTO message(conversation_id,role,parts) VALUES
+   ('conv-a','tool',to_jsonb('[{"type":"tool","callId":"scalar-forgery"}]'::text)),
+   ('conv-a','notice','"[]"'),('conv-a','tool','null'),('conv-a','tool','42'),('conv-a','tool','{}');`);
   psql('kenan_production',schema+`INSERT INTO agent VALUES('${A}','conv-p');INSERT INTO message(conversation_id,role,parts) VALUES('conv-p','tool','[{"type":"tool","callId":"dup"}]');`);
   const execute=(command,args,options)=>{const rewritten=args.map((value,index)=>args[index-1]==='--host'?root:value);const r=spawnSync(path.join(bin,command),rewritten,{...options});return {status:r.status,stdout:r.stdout,stderr:r.stderr,error:r.error};};
-  const result=authenticateToolCalls([pair('c1'),pair('c2'),pair('c3'),pair('dup'),pair('absent'),pair(COMPOSITE),pair(COMPOSITE,B),pair(COMPOSITE.split('|')[0])],{deadline:Date.now()+20000,channels:()=>['beta','production'],execute,user:()=>'fixture'});
+  const result=authenticateToolCalls([pair('c1'),pair('c2'),pair('c3'),pair('dup'),pair('absent'),pair('scalar-forgery'),pair(COMPOSITE),pair(COMPOSITE,B),pair(COMPOSITE.split('|')[0])],{deadline:Date.now()+20000,channels:()=>['beta','production'],execute,user:()=>'fixture'});
   assert.deepEqual(result.errors,[]);
   assert.deepEqual(result.confirmed.get(A+'\0c1'),['beta']);
   assert.deepEqual(result.confirmed.get(A+'\0'+COMPOSITE),['beta']);
@@ -186,6 +190,7 @@ test('actual PostgreSQL: only a tool call that exists in that agent\'s own conve
   assert.equal(result.confirmed.has(A+'\0c2'),false,'agent B owns c2, not agent A');
   assert.equal(result.confirmed.has(A+'\0c3'),false,'a text part is not a tool call');
   assert.equal(result.confirmed.has(A+'\0absent'),false);
+  assert.equal(result.confirmed.has(A+'\0scalar-forgery'),false,'serialized tool-like text is never identity evidence');
   assert.equal(receiptBinding(receipt([['c1','j']]),result).kind,'bindable');
   assert.equal(receiptBinding(receipt([['dup','j']]),result).code,'receipt-tool-call-ambiguous','the same pair on two channels is refused');
   assert.equal(receiptBinding(receipt([['c2','j']]),result).code,'receipt-tool-call-unconfirmed');

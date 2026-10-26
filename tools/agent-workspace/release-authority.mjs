@@ -53,8 +53,15 @@ export function authorizeWorkspaceRelease(database,records,statePath,{caller=rel
   const binding=self.binding;
   const authentication=authenticate([binding],{deadline});
   const channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
-  if(authentication.errors.length||channels.length!==1||channels[0]!==binding.channel)
-    return refused('release-caller-unverified','The exact caller tool call is not uniquely authenticated in its native store.');
+  if(authentication.errors.length||channels.length!==1||channels[0]!==binding.channel) {
+    const code=authentication.errors.length?'caller-tool-store-unavailable':channels.length===0?'caller-tool-unconfirmed':channels.length>1?'caller-tool-channel-ambiguous':'caller-tool-channel-mismatch';
+    // Keep the first bounded error line, not SQL context, quoted values or the private identity.
+    const errors=authentication.errors.slice(0,16).map(error=>String(error).split(/[\r\n]/)[0]
+      .replaceAll(binding.agentId,'[agent]').replaceAll(binding.callId,'[call]')
+      .replace(/['"][^'"\r\n]*['"]/g,'[value]').replace(/[\x00-\x1f\x7f]/g,'').slice(0,350));
+    return {...refused('release-caller-unverified',`The exact caller tool call is not uniquely authenticated in its native store (${code}; ${channels.length} channels).`),
+      diagnostic:{code,channelCount:channels.length,errors}};
+  }
   for(const record of records) {
     const owner=ownerOf(database,record,statePath,deadline,authenticate);
     if(!owner.ok)return owner;

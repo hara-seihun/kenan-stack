@@ -60,7 +60,7 @@ import { pathToFileURL } from "node:url";
 import { runSourceJob, readSourceJobRequest, writeSourceJobProgress, finishSourceJob, sourceJobId, abandonSourceJob } from "./source-job.mjs";
 import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
-import { currentStackQueueReferences } from "./cache-queue.mjs";
+import { procScope, currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
 import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
@@ -772,15 +772,19 @@ function serializedPathReference(serialized, workspacePath) {
 
 // A release unit necessarily names its target in --path. Ignore only that exact
 // authenticated ancestor, never another unit, a checkout cwd or executable.
+let currentReleaseAuthority = null;
 function ownReleaseUnit(unit, workspacePath, context) {
   if (!context || context.command !== "release" || context.target !== workspacePath ||
       !Number.isSafeInteger(unit.mainPid) || unit.mainPid <= 1 ||
       !context.ancestors.has(unit.mainPid) ||
       unit.workingDirectory === null || within(workspacePath, unit.workingDirectory) ||
-      unit.execStart.includes(`${workspacePath}/`) ||
-      unit.execStart.split(workspacePath).length !== 2 ||
-      !unit.execStart.includes(`--path ${workspacePath} `)) return false;
+      unit.execStart.includes(`${workspacePath}/`)) return false;
+  const wrapper=context.wrapper;
+  const authenticatedBatch=wrapper?.background===true && wrapper.unit===unit.id && unit.manager==='system' &&
+    wrapper.binding?.agentId===wrapper.agentId && wrapper.binding?.callId===wrapper.callId && wrapper.binding?.channel===wrapper.channel;
+  if (!authenticatedBatch && (unit.execStart.split(workspacePath).length !== 2 || !unit.execStart.includes(`--path ${workspacePath} `))) return false;
   try {
+    if (authenticatedBatch && context.read(`/proc/${unit.mainPid}/cgroup`).trim()!==`0::${wrapper.group}`) return false;
     const status = context.read(`/proc/${unit.mainPid}/status`);
     if (Number(status.match(/^Uid:\s+(\d+)/mu)?.[1]) !== context.uid) return false;
     const cwd = context.link(`/proc/${unit.mainPid}/cwd`);
@@ -788,13 +792,20 @@ function ownReleaseUnit(unit, workspacePath, context) {
     return cwd !== null && executable !== null && !within(workspacePath, cwd) && !within(workspacePath, executable);
   } catch { return false; }
 }
-function releaseInspectionContext() {
+function releaseInspectionContext(authority=currentReleaseAuthority) {
   const args = process.argv.slice(2);
   if (args[0] !== "release") return null;
   const index = args.indexOf("--path");
   const target = index < 0 ? args.find(arg => arg.startsWith("--path="))?.slice(7) : args[index + 1];
   if (!target || !path.isAbsolute(target)) return null;
-  return { command: "release", target: path.resolve(target), uid: process.getuid?.(),
+  let wrapper=null;
+  if(authority?.kind==='native') {
+    try {
+      const observed=procScope(process.pid);
+      if(observed?.background===true) wrapper={...observed,binding:authority.binding};
+    } catch { /* Unknown scope identity never permits a batch exemption. */ }
+  }
+  return { wrapper, command: "release", target: path.resolve(target), uid: process.getuid?.(),
     ancestors: processAncestry(), read: file => readFileSync(file, "utf8"), link: readLink };
 }
 function systemdReferences(workspacePath, snapshot = systemdSnapshot(), context = releaseInspectionContext()) {
@@ -3799,6 +3810,12 @@ function settleReleasedFutureGrowth(database, item, requestId, statePath) {
 const BLOCKED_RELEASE_EXIT = 2;
 
 function releaseCommand(database, args, statePath, authorityDependencies) {
+  const previous=currentReleaseAuthority;
+  currentReleaseAuthority=null;
+  try { return ownedReleaseCommand(database,args,statePath,authorityDependencies); }
+  finally { currentReleaseAuthority=previous; }
+}
+function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
   const record = recordBy(database, selectorFrom(args, 'release'));
   const records = recordsInGroup(database, record);
@@ -3809,6 +3826,7 @@ function releaseCommand(database, args, statePath, authorityDependencies) {
     process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
   }
+  currentReleaseAuthority=authority;
   if (bool(args, "end-retention")) {
     if (bool(args, "reap-expired")) growthError("invalid-retention-release", "terminal retained release never stops runtime references");
     const result = terminalRetentionRelease(database, recordBy(database, selectorFrom(args, 'release')), args, statePath);
@@ -5259,7 +5277,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {

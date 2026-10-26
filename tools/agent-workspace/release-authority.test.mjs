@@ -206,3 +206,11 @@ test('the actual native CLI releases its own pushed source with identity environ
     const outcome=JSON.parse(result.stdout);assert.equal(outcome.action,'released');assert.equal(outcome.leaseRelease.kind,'released');assert.equal(fs.existsSync(f.source),false);
   });
 });
+
+test('caller authentication exposes sanitized query cause and channel count without private SQL',()=>fixture(f=>{
+ const result=f.invoke(authority(PARENT,{authenticate:()=>({errors:['native tool-call observation unavailable: beta: ERROR: cannot extract elements from a scalar'],confirmed:new Map()})}));
+ assert.equal(result.result.error.code,'release-caller-unverified');
+ assert.equal(result.result.diagnostic.code,'caller-tool-store-unavailable');
+ assert.equal(result.result.diagnostic.channelCount,0);
+ assert.match(result.result.diagnostic.errors[0],/cannot extract elements from a scalar/);
+}));

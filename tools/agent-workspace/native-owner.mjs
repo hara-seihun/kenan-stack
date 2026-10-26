@@ -127,7 +127,7 @@ export function toolCallAuthenticationSql(pairs){
  conversations AS (SELECT DISTINCT conversation_id FROM identities),
  calls AS MATERIALIZED (SELECT c.conversation_id,p->>'callId' AS call_id FROM conversations c
   CROSS JOIN LATERAL (SELECT parts FROM message WHERE conversation_id=c.conversation_id OFFSET 0) m
-  CROSS JOIN LATERAL jsonb_array_elements(m.parts) p WHERE p->>'type'='tool')
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(m.parts)='array' THEN m.parts ELSE '[]'::jsonb END) p WHERE p->>'type'='tool')
  SELECT coalesce(json_agg(json_build_object('agentId',v.agent_id,'callId',v.call_id)),'[]'::json) FROM identities v
  WHERE EXISTS (SELECT 1 FROM calls c WHERE c.conversation_id=v.conversation_id AND c.call_id=v.call_id); ROLLBACK;`;
 }
