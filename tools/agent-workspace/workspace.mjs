@@ -2367,11 +2367,17 @@ function repositoryRemotes(repository) {
   };
 }
 
-// An explicit push URL disables Git's `url.<base>.pushInsteadOf` rewriting for the remote, so a
-// checkout preserves an explicit source push URL even when equal to fetch. A
-// programme checkout cloned from a read-only URL then still pushes through the host's rewrite.
+// Do not turn an effective host pushInsteadOf route into an explicit grant. Explicit
+// source grants remain intact, except Converge's redundant HTTPS default: pinning it
+// disables the host's work deploy-key route (including workflow-file pushes).
+function needsExplicitPushUrl(upstream) {
+  const convergeDefault = /^https:\/\/github\.com\/owi-link\/converge(?:\.git)?$/u.test(upstream.fetch)
+    && upstream.push === upstream.fetch;
+  return !convergeDefault && (upstream.explicitPush ?? upstream.push !== upstream.fetch);
+}
+
 function configurePushUrl(gitArgs, upstream) {
-  if (upstream.explicitPush || upstream.push !== upstream.fetch) {
+  if (needsExplicitPushUrl(upstream)) {
     run("git", [...gitArgs, "remote", "set-url", "--push", "origin", upstream.push]);
   } else if (command("git", [...gitArgs, "config", "--get", "remote.origin.pushurl"]).status === 0) {
     run("git", [...gitArgs, "config", "--unset-all", "remote.origin.pushurl"]);
@@ -2661,7 +2667,7 @@ function prepareMirror(statePath, mirror, repository, upstream) {
       if (has(`remote.${name}.url`, url)) continue;
       run("git", ["--git-dir", mirror, "remote", current.has(`remote.${name}.url`) ? "set-url" : "add", name, url]);
     }
-    const explicitPush = upstream.explicitPush || upstream.push !== upstream.fetch;
+    const explicitPush = needsExplicitPushUrl(upstream);
     if (explicitPush ? !has("remote.origin.pushurl", upstream.push) : current.has("remote.origin.pushurl")) {
       configurePushUrl(["--git-dir", mirror], upstream);
     }
