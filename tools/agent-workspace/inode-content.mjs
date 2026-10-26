@@ -9,17 +9,18 @@ const payloadKeys=['dev','ino','birthtimeNs','mtimeNs','size','blocks','mode','u
 const valid=r=>r?.version===1&&r.metadata&&/^[a-f0-9]{64}$/.test(r.sha256)&&Number.isSafeInteger(r.lastPayloadWriteAt)&&r.lastPayloadWriteAt>=0;
 export function observeInodeContent(file,prior,{deadline=Date.now()+1000}={}) {
  const initial=fs.lstatSync(file,{bigint:true});const raw=Math.ceil(Number(initial.ctimeNs)/1e6);
+ const unknown=()=>({complete:false,lastWriteAt:Math.max(raw,Math.ceil(Number(initial.mtimeNs)/1e6))});
  if(!initial.isFile())return {lastWriteAt:Math.max(raw,Math.ceil(Number(initial.mtimeNs)/1e6))};
  const metadata=encode(initial);
  // Large payloads remain conservative rather than exhausting every short slice.
  if(initial.size>64n*1024n*1024n)return {lastWriteAt:Math.max(raw,Math.ceil(Number(initial.mtimeNs)/1e6))};
  const fd=fs.openSync(file,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let sha256;
  try{
-  if(!same(metadata,encode(fs.fstatSync(fd,{bigint:true}))))throw Error('content identity changed before hashing');
+  if(!same(metadata,encode(fs.fstatSync(fd,{bigint:true}))))return unknown();
   const hash=createHash('sha256'),buffer=Buffer.allocUnsafe(128*1024);let n;
   while((n=fs.readSync(fd,buffer,0,buffer.length,null))>0){if(Date.now()>=deadline)throw Object.assign(Error('content proof budget exhausted'),{code:'content-proof-deadline'});hash.update(buffer.subarray(0,n));}
   sha256=hash.digest('hex');
-  if(!same(metadata,encode(fs.fstatSync(fd,{bigint:true})))||!same(metadata,encode(fs.lstatSync(file,{bigint:true}))))throw Error('content or link identity changed during hashing');
+  if(!same(metadata,encode(fs.fstatSync(fd,{bigint:true})))||!same(metadata,encode(fs.lstatSync(file,{bigint:true}))))return unknown();
  }finally{fs.closeSync(fd);}
  if(valid(prior)&&same(metadata,prior.metadata)&&sha256===prior.sha256)return {lastWriteAt:prior.lastPayloadWriteAt,record:prior};
  const linkOnly=valid(prior)&&prior.metadata.nlink!==metadata.nlink&&same(metadata,prior.metadata,payloadKeys)&&sha256===prior.sha256;
@@ -40,9 +41,11 @@ export function contentObserver(database,{deadline=Date.now()+1000}={}) {
   const key=`${s.dev}:${s.ino}:${s.birthtimeNs}`;let prior;try{prior=pending.get(key)??JSON.parse(read.get(key)?.evidence_json??'null');}catch{}
   if(!baselines.has(key))baselines.set(key,prior);
   const result=observeInodeContent(file,prior,{deadline});
+  if(result.complete===false)observe.complete=false;
   if(result.record&&result.record!==prior)pending.set(key,result.record);
   return result.lastWriteAt;
  };
+ observe.complete=true;
  observe.flush=()=>{
   if(!pending.size)return;
   database.exec('BEGIN IMMEDIATE');
@@ -63,5 +66,5 @@ export function contentObserver(database,{deadline=Date.now()+1000}={}) {
 }
 export function withContentObservation(database,options,run){
  const observe=contentObserver(database,options);
- try{return run(observe);}finally{observe.flush();}
+ try{const result=run(observe);return result&&typeof result==='object'?{...result,writeObservationComplete:result.writeObservationComplete!==false&&observe.complete}:result;}finally{observe.flush();}
 }

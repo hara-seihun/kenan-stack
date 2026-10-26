@@ -3363,7 +3363,7 @@ function completeCreation(database, id, repository, leaseSeconds, detail, args) 
     // Construction owns this checkout, not the device. Large completed trees must
     // get their own bounded full observation rather than a 500 ms best effort.
     // The sampler takes the device fence only to publish, never while walking.
-    const measurement = measureWorkspaceRow(database, row, paths, Date.now() + 60_000, statePath);
+    const measurement = measureWorkspaceRow(database, row, paths, Date.now() + 60_000, statePath, false, false);
     if (!measurement.ok || measurement.partial) {
       fail(`creation allocation measurement unavailable at ${row.path}; pending creation retained for resume: ${measurement.error ?? "incomplete observation"}`);
     }
@@ -4835,7 +4835,7 @@ function reduceRetainedHeadroomCommand(database, args, statePath) {
 // One checkout's allocated-block sample under its own checkout lock; only the measurement
 // cache and traversal progress change. Failed walks retain the last successful sample,
 // never publishing a partial total as a smaller allocation.
-function measureWorkspaceRow(database, row, paths, deadline, statePath, incremental = false) {
+function measureWorkspaceRow(database, row, paths, deadline, statePath, incremental = false, contentProof = true) {
   database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
   database.prepare("INSERT OR REPLACE INTO workspace_capacity_attempt VALUES(?,?)").run(row.id,Date.now());
   const store = sample => sample.ok
@@ -4847,7 +4847,14 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
   try {
     return withWorkspaceLock(database, row.path, () => {
       const excludedPaths=paths.filter(candidate=>candidate.startsWith(`${row.path}${path.sep}`));
-      if(!incremental)return store(withContentObservation(database,{deadline},observeContent=>workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths,observeContent})));
+      if(!incremental){
+        // Capacity admission needs allocated blocks, not proof of one-hour
+        // payload idleness. Shared hardlink churn must not fail a fully admitted
+        // checkout merely because its separate optional content census races.
+        const sample=contentProof?withContentObservation(database,{deadline},observeContent=>workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths,observeContent}))
+          : {...workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths}),writeObservationComplete:false};
+        return store(sample);
+      }
       database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
       const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
@@ -5193,7 +5200,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {

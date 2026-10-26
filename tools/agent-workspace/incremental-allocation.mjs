@@ -7,7 +7,7 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
  const stat=fs.lstatSync(root),inode=String(stat.ino);
  if(!stat.isDirectory()||String(stat.dev)!==device)throw Error('workspace root changed filesystem or type');
  let state=prior;
- if(!state||state.version!==3||state.root!==root||state.inode!==inode||state.device!==device||JSON.stringify(state.excludedPaths)!==JSON.stringify(excludedPaths))state={version:3,lastWriteAt:0,root,device,inode,excludedPaths,startedAt:Date.now(),pending:[root],seen:[],bytes:0,allocatedBytes:0,entries:0};
+ if(!state||state.version!==3||state.root!==root||state.inode!==inode||state.device!==device||JSON.stringify(state.excludedPaths)!==JSON.stringify(excludedPaths))state={version:3,writeObservationComplete:true,lastWriteAt:0,root,device,inode,excludedPaths,startedAt:Date.now(),pending:[root],seen:[],bytes:0,allocatedBytes:0,entries:0};
  const seen=new Set(state.seen),excluded=new Set(excludedPaths);let visited=0;
  while(state.pending.length && visited<maxEntries && Date.now()<deadline){
   const file=state.pending.pop();visited++;
@@ -28,7 +28,8 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
   }
  }
  const after=fs.lstatSync(root);if(String(after.ino)!==inode||String(after.dev)!==device)throw Error('workspace root changed during measurement');
+ state.writeObservationComplete=state.writeObservationComplete!==false&&observeContent?.complete!==false;
  state.seen=[...seen];
  if(state.pending.length)return {partial:true,state,visited};
- return {ok:true,lastWriteAt:state.lastWriteAt,bytes:state.bytes,allocatedBytes:state.allocatedBytes,device,inode,startedAt:state.startedAt,completedAt:Date.now(),visited};
+ return {ok:true,writeObservationComplete:state.writeObservationComplete,lastWriteAt:state.lastWriteAt,bytes:state.bytes,allocatedBytes:state.allocatedBytes,device,inode,startedAt:state.startedAt,completedAt:Date.now(),visited};
 }

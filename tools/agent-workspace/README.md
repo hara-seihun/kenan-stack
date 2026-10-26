@@ -1044,3 +1044,24 @@ cannot replace newer inode evidence or lower a proved payload-write timestamp.
 This is cooperative admission and content observation, not kernel enforcement.
 An unsupported external writer remains possible; a changed payload, unknown
 observation or final write race retains the original reservation truthfully.
+
+### Creation capacity and payload-idleness evidence are separate
+
+CREATE and its pre-materialization recheck share the existing bounded sampled
+allocation/history/policy admission rules. Stale-cache warnings name conservative
+commitments; they are not by themselves a terminal creation failure. Final
+activation measures the admitted checkout's allocated blocks under its checkout
+lock and atomically binds the actual root identity, completed allocation baseline,
+capacity plan and active state. It does not require SHA-256 hashing of every
+payload as a prerequisite for capacity admission. An allocation-only sample is
+explicitly marked `writeObservationComplete: false` and cannot establish idle
+future-growth retirement. Repeat the original CREATE or use supported
+`finalize-creation` after genuine cessation; neither path deletes preserved files,
+forges a READY receipt or clears another reservation.
+
+A shared link changing during the separate payload census is incomplete idleness
+evidence, not failed allocated-block accounting. It publishes no content proof,
+retains the idleness veto across resumable slices and requires another complete
+successful payload census before automatic retirement. Actual root replacement,
+allocation measurement failure or budget exhaustion still refuses finalization,
+leaves the original pending operation recoverable and never fabricates capacity.

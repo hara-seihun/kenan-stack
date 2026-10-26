@@ -21,6 +21,7 @@ for(const [name,mutate,code] of [
  ['growth',v=>v.history.samples[0].bytes--,'idle-growth-unstable'],
  ['missing sample',v=>v.history.samples.shift(),'idle-growth-unstable'],
  ['same sample twice',v=>v.history.samples[0].at=v.history.samples[1].at,'idle-growth-unstable'],
+ ['incomplete content observation',v=>v.sample.writeObservationComplete=false,'idle-growth-sample-required'],
  ['recent same-size write',v=>v.sample.lastWriteAt=now-100,'idle-growth-recent-write'],
  ['missing last write',v=>delete v.sample.lastWriteAt,'idle-growth-recent-write'],
  ['fresh resumed admission',v=>v.history.restoreAt=now-1,'idle-growth-recent-write'],
