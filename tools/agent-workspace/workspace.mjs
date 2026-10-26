@@ -61,6 +61,7 @@ import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
 import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
+import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
 import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction, validateRetainedHeadroom } from "./growth-lifecycle.mjs";
@@ -1465,11 +1466,11 @@ function registerCommand(database, args) {
   print(creationRecord(database, record.id), bool(args, "json"));
 }
 
-/** @typedef {'workspace-not-registered' | 'path-mismatch' | 'state-not-reassignable' | 'state-mismatch' | 'mode-not-writer' | 'owner-mismatch' | 'source-mismatch' | 'assignment-unchanged' | 'assignment-history-mismatch' | 'checkout-type-mismatch' | 'repository-mismatch' | 'writer-branch-unknown' | 'head-mismatch' | 'checkout-inspection-failed' | 'resource-busy' | 'reassignment-failed'} ReassignmentErrorCode */
+/** @typedef {'workspace-not-registered' | 'path-mismatch' | 'state-not-reassignable' | 'state-mismatch' | 'mode-not-writer' | 'owner-mismatch' | 'source-mismatch' | 'assignment-unchanged' | 'assignment-history-mismatch' | 'checkout-type-mismatch' | 'repository-mismatch' | 'writer-branch-unknown' | 'head-mismatch' | 'checkout-inspection-failed' | 'resource-busy' | 'reassignment-failed' | 'release-caller-unverified' | 'release-owner-unverified' | 'release-owner-unbound' | 'release-owner-mismatch'} ReassignmentErrorCode */
 /** @typedef {{ok: true, record: object, transfer: object} | {ok: false, error: {code: ReassignmentErrorCode, detail: string}}} ReassignmentResult */
 
 /** @returns {ReassignmentResult} */
-function reassignWorkspace(database, input) {
+function reassignWorkspace(database, input, authorityDependencies) {
   const refuse = (code, detail) => ({ ok: false, error: { code, detail } });
   const row = database.prepare(`SELECT workspace.*, ${ASSIGNMENT_SOURCE} FROM workspace WHERE id = ?`).get(input.id);
   if (row === undefined) return refuse("workspace-not-registered", input.id);
@@ -1507,6 +1508,8 @@ function reassignWorkspace(database, input) {
   } catch (error) {
     return refuse("checkout-inspection-failed", error instanceof Error ? error.message : String(error));
   }
+  const authority = authorizeWorkspaceRelease(database, [record], registryPaths.get(database), authorityDependencies);
+  if (!authority.ok) return authority;
   const transfer = {
     workspaceId: record.id, path: record.path,
     oldOwner: record.owner, oldSourceCommit: record.sourceCommit,
@@ -1519,8 +1522,11 @@ function reassignWorkspace(database, input) {
     input.owner, input.sourceCommit, input.authorization, transfer.occurredAt);
   // source_commit stays immutable so clients from an earlier release cannot discard a new, unpublished baseline.
   database.prepare("UPDATE workspace SET owner = ?, updated_at = ? WHERE id = ?").run(input.owner, transfer.occurredAt, record.id);
-  const caller = nativeCaller();
-  reassignNativeOwner(database, record.id, caller, { command: "reassign", sequence: Number(event.lastInsertRowid) });
+  const caller = authority.kind === "native" ? authority.binding : null;
+  // An owner-issued transfer to another native UUID makes that recipient canonical. Free
+  // label changes keep the authenticated custodian; a label is never an identity grant.
+  const recipient = OWNER_AGENT_ID.test(input.owner) && input.owner !== caller?.agentId ? null : caller;
+  reassignNativeOwner(database, record.id, recipient, { command: "reassign", sequence: Number(event.lastInsertRowid) });
   return { ok: true, record: recordBy(database, { id: record.id }), transfer: { sequence: Number(event.lastInsertRowid), ...transfer } };
 }
 
@@ -1562,6 +1568,8 @@ function freezeSourceCommand(database,args) {
     const record=recordBy(database,{id:input.id}), marker=path.join(input.path,".git","pi-frozen-handoff.json");
     const previous=existsSync(marker)?JSON.parse(readFileSync(marker,"utf8")):null;
     assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    const authority = authorizeWorkspaceRelease(database,[record],registryPaths.get(database));
+    if (!authority.ok) growthError(authority.error.code,authority.error.detail);
     if (recordRetainsCustody(database,record.id)||retainedParent(database,record.path)) fail("writer-growth-admission-required");
     if (realpathSync(input.path)!==input.path || lstatSync(path.join(input.path,".git")).isSymbolicLink()) fail("snapshot-private-git-required");
     const clean=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
@@ -3736,8 +3744,17 @@ function settleReleasedFutureGrowth(database, item, requestId, statePath) {
 // A release that reports a blocked outcome did not release: callers must see a nonzero status.
 const BLOCKED_RELEASE_EXIT = 2;
 
-function releaseCommand(database, args, statePath) {
+function releaseCommand(database, args, statePath, authorityDependencies) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
+  const record = recordBy(database, selectorFrom(args, 'release'));
+  const records = recordsInGroup(database, record);
+  const authority = authorizeWorkspaceRelease(database, records.length ? records : [record], statePath, authorityDependencies);
+  if (!authority.ok) {
+    if (bool(args, "json")) print(authority, true);
+    else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);
+    process.exitCode = BLOCKED_RELEASE_EXIT;
+    return;
+  }
   if (bool(args, "end-retention")) {
     if (bool(args, "reap-expired")) growthError("invalid-retention-release", "terminal retained release never stops runtime references");
     const result = terminalRetentionRelease(database, recordBy(database, selectorFrom(args, 'release')), args, statePath);
@@ -3748,8 +3765,6 @@ function releaseCommand(database, args, statePath) {
   if (one(args, "owner") !== undefined || one(args, "expected-plan-sha256") !== undefined) {
     growthError("invalid-retention-release", "owner/plan binding requires explicit --end-retention");
   }
-  const record = recordBy(database, selectorFrom(args, 'release'));
-  const records = recordsInGroup(database, record);
   const previous = releaseSettlement(database, record.id);
   const planRow = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
   // An ordinary release may retire growth while a temporary consumer retains the tree.
@@ -5067,7 +5082,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { openRegistry, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {

@@ -47,6 +47,14 @@ working files, leases, foreign records and deletion guards are unchanged.
 
 Focused checks: `node --test tools/agent-workspace/release-reachability.test.mjs tools/agent-workspace/release-custody.test.mjs`.
 
+## Authenticated ordinary release custody
+
+Ordinary `release`, including `--end-retention` and grouped releases, authenticates the current native tool caller against its root-created scope and exact tool call in the native store before any release journal, lease, state or filesystem transition. Every selected group member must belong to that caller. A registered native UUID is authoritative; otherwise the stored native binding or a byte-exact checkout admission receipt authenticated in the native store determines custody. Unknown or conflicting custody refuses without mutation. Neither the free `--owner` label nor an authorization string grants another agent release rights.
+
+A native owner can explicitly transfer responsibility with `reassign` to the recipient's full native UUID. The authenticated current custodian must issue that transfer; the recipient may then release, while the previous owner cannot. Renaming a free task label retains the same native custodian. A native caller cannot seize an unbound historical task by writing an authorization string. The positively identified non-native operator route remains available for those old tasks. Missing native scope authentication or unreadable ancestry never silently selects that operator route. No environment variable or force flag bypasses these checks. The ended-owner sweep retains its separate native liveness proof and normal physical safety checks.
+
+The focused regression is `node --test tools/agent-workspace/release-authority.test.mjs`. It compares every registry row and checkout inode, mode, modification time and content hash before and after rejection, including grouped custody, admission recovery, explicit transfer, spoofed identity and the legacy operator route.
+
 ## Interrupted ordinary release
 
 Before dropping any single/group writing lease, ordinary release atomically records an original request identity and registered owner, an explicit `owned-retention` receipt, and `repair-required` state. This commit precedes native/queue/Git inspection and physical work. A caller deadline, TERM, or whole-process KILL cannot leave the previous ACTIVE/lease0/no-result combination. No signal handler, longer caller timeout, polling worker, or Stack-runtime change is required.

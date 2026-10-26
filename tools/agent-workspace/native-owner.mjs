@@ -70,7 +70,7 @@ export function reassignNativeOwner(database,workspaceId,caller,evidence){
 }
 
 export function nativeOwnerBinding(database,workspaceId){
- ensureNativeOwnerTable(database);
+ if(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_native_owner'").get()===undefined)return {state:'unset'};
  const row=database.prepare('SELECT agent_id,channel,call_id,source,bound_at FROM workspace_native_owner WHERE workspace_id=?').get(workspaceId);
  return row===undefined?{state:'unset'}:{state:'set',agentId:row.agent_id,channel:row.channel,callId:row.call_id,source:row.source,boundAt:row.bound_at};
 }
