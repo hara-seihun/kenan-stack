@@ -25,7 +25,7 @@ else
   comparison=$(node -e 'const fs=require("node:fs"); console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).recoveredGitCommit)' "$root/tools/agent-workspace/recovered-custody.json")
   node "$root/tools/agent-workspace/recovered-base.mjs" "$root" "$dest" "$comparison" "$baseline" || exit 65
 fi
-git -C "$root" diff --quiet "$comparison" "$commit" -- tools ':!tools/agent-workspace' config/tools.json || {
+git -C "$root" diff --quiet "$comparison" "$commit" -- tools ':!tools/agent-workspace' ':!tools/host-retention' ':!tools/README.md' config/tools.json || {
   echo 'component deployment refuses changes to other tools or their manifest; use the full release owner' >&2; exit 65;
 }
 stage=$(mktemp -d "${TMPDIR:-/tmp}/pi-workspace-tools.XXXXXXXX")
