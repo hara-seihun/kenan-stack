@@ -123,6 +123,17 @@ async function runAsync(args, env, cwd) {
   }
 }
 
+// A refused capacity lock has no unknown effect to replay. A failed checkout
+// is retryable only after its original job explicitly confirms private cleanup.
+function exactCapacityLockRefusal(error, budgetMs, { allowCeasedCheckout = false } = {}) {
+  if (error.killed || error.signal) return false;
+  const detail = String(error.message ?? "");
+  const lock = `workspace resource busy: capacity:[0-9]+: ${budgetMs}ms lock budget exhausted`;
+  if (error.code === 75 && new RegExp(`(?:^|\\n)agent-workspace: (?:agent-workspace: )?${lock}(?:\\r?\\n|$)`, "u").test(detail)) return true;
+  return allowCeasedCheckout && error.code === 2
+    && new RegExp(`(?:^|\\n)agent-workspace: checkout failed \\(checkout-materialization-failed\\): agent-workspace: ${lock}[\\s\\S]*private staging removed; destination not partially published`, "u").test(detail);
+}
+
 function runExit2(args, env, cwd) {
   try {
     execFileSync(entry, args, { cwd, env: { ...process.env, ...env }, encoding: "utf8", timeout: 90_000 });
@@ -1115,10 +1126,21 @@ test("concurrent budgeted build expansions cannot reuse filesystem capacity", as
     const before = created.map(record => db.prepare("SELECT * FROM workspace WHERE id=?").get(record.id));
     const stats = statfsSync(f.root);
     const growthMiB = Math.floor(stats.bavail * stats.bsize / 1024 ** 2 * 0.6);
-    const results = await Promise.allSettled(created.map(record => runAsync(["reprice-capacity", "--id", record.id,
-      "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", String(growthMiB), "--json"], f.env)));
+    const requests = created.map(record => ["reprice-capacity", "--id", record.id,
+      "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", String(growthMiB), "--json"]);
+    const results = await Promise.allSettled(requests.map(args => runAsync(args, f.env)));
     assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
     assert.equal(results.filter(result => result.status === "rejected").length, 1);
+    // Both original clients have ceased. Reconcile the refused loser's unchanged
+    // plan before repeating only that exact request to obtain a real denial.
+    const refusedIndex = results.findIndex(result => result.status === "rejected");
+    if (exactCapacityLockRefusal(results[refusedIndex].reason, 100)) {
+      assert.deepEqual(JSON.parse(db.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?")
+        .get(created[refusedIndex].id).plan_json), created[refusedIndex].capacity);
+      assert.equal(db.prepare("SELECT count(*) AS n FROM workspace_capacity_repricing").get().n, 1);
+      [results[refusedIndex]] = await Promise.allSettled([runAsync(requests[refusedIndex], f.env)]);
+      assert.equal(results[refusedIndex].status, "rejected", "the unchanged loser request must be denied capacity");
+    }
     assert.match(results.find(result => result.status === "rejected").reason.message, /GiB is required/);
     const loserIndex = results.findIndex(result => result.status === "rejected");
     assert.deepEqual(JSON.parse(db.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?")
@@ -2146,18 +2168,33 @@ process.exit(result.status ?? 1);
     const env = { ...f.env, PATH: `${bin}:${process.env.PATH}` };
     const create = ["create", "--root", f.workspaces, "--repo", f.source, "--min-free-gib", "0", "--json"];
     const commit = git(f.source, "rev-parse", "HEAD");
-    const settle=async promises=>{const results=await Promise.allSettled(promises);const errors=results.filter(r=>r.status==="rejected").map(r=>r.reason);if(errors.length)throw new AggregateError(errors,"concurrent original creators failed",{cause:errors[0]});return results.map(r=>r.value);};
-    const records = await settle(Array.from({ length: 24 }, async (_, index) =>
-      JSON.parse(await runAsync([...create, "--name", `local-${index}`], env))));
+    const settle = async requests => {
+      const execute = async args => JSON.parse(await runAsync(args, env));
+      const results = await Promise.allSettled(requests.map(execute));
+      // Settle the entire original wave before bounded recovery. Keep every
+      // request (including its destination and pending job custody) unchanged.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const refused = results.flatMap((result, index) => result.status === "rejected"
+          && exactCapacityLockRefusal(result.reason, 30_000, { allowCeasedCheckout: true }) ? [index] : []);
+        if (refused.length === 0) break;
+        const recovered = await Promise.allSettled(refused.map(index => execute(requests[index])));
+        refused.forEach((index, position) => { results[index] = recovered[position]; });
+      }
+      const errors = results.filter(result => result.status === "rejected").map(result => result.reason);
+      if (errors.length) throw new AggregateError(errors, "concurrent original creators failed", { cause: errors[0] });
+      return results.map(result => result.value);
+    };
+    const records = await settle(Array.from({ length: 24 }, (_, index) =>
+      [...create, "--name", `local-${index}`]));
     assert.equal(new Set(records.map(record => record.id)).size, 24);
     for (const record of records) {
       assert.equal(record.state, "active");
       assert.equal(record.sourceCommit, commit);
       assert.equal(git(record.path, "rev-parse", "HEAD"), commit);
     }
-    const remoteRecords = await settle(Array.from({ length: 24 }, async (_, index) =>
-      JSON.parse(await runAsync(["create", "--root", f.workspaces, "--repo", `file://${f.remote}`,
-        "--name", `remote-${index}`, "--min-free-gib", "0", "--json"], env))));
+    const remoteRecords = await settle(Array.from({ length: 24 }, (_, index) =>
+      ["create", "--root", f.workspaces, "--repo", `file://${f.remote}`,
+        "--name", `remote-${index}`, "--min-free-gib", "0", "--json"]));
     for (const record of remoteRecords) {
       assert.equal(record.state, "active");
       assert.equal(record.sourceCommit, commit);
@@ -4063,4 +4100,23 @@ test("qualified ancestral custody prices and fetches only receiver delta", () =>
     assert.ok(!conservative.sourceImportBaseCommits.includes(base));
     assert.ok(conservative.sourceImportBytes > 2 * 1024 ** 2);
   } finally { f.close(); }
+});
+
+
+test("fixture capacity lock recovery rejects unknown outcomes and unrelated refusals", () => {
+  const lock = "agent-workspace: workspace resource busy: capacity:2049: 30000ms lock budget exhausted";
+  const refusal = (message = lock, code = 75, extra = {}) => Object.assign(new Error(message), { code, ...extra });
+  assert.equal(exactCapacityLockRefusal(refusal(), 30_000), true);
+  assert.equal(exactCapacityLockRefusal(refusal(`Command failed: create\nagent-workspace: ${lock}\nagent-workspace: lock detail {}`), 30_000), true);
+  assert.equal(exactCapacityLockRefusal(refusal(lock.replace("30000ms", "100ms")), 100), true);
+  for (const error of [refusal(lock, 2), refusal(lock, 75, { killed: true }),
+    refusal(lock, 75, { signal: "SIGTERM" }), refusal(lock.replace("capacity:2049", "mirror:2049")),
+    refusal(lock.replace("30000ms", "100ms")), refusal(`${lock}; unknown outcome`),
+    refusal("workspace capacity refused: 1 GiB is required"), refusal(`unrelated diagnostic: ${lock}`)]) {
+    assert.equal(exactCapacityLockRefusal(error, 30_000, { allowCeasedCheckout: true }), false);
+  }
+  const checkout = `agent-workspace: checkout failed (checkout-materialization-failed): ${lock}; private staging removed; destination not partially published. Repeat the request`;
+  assert.equal(exactCapacityLockRefusal(refusal(checkout, 2), 30_000), false);
+  assert.equal(exactCapacityLockRefusal(refusal(checkout, 2), 30_000, { allowCeasedCheckout: true }), true);
+  assert.equal(exactCapacityLockRefusal(refusal(checkout.replace("private staging removed; destination not partially published", "cleanup unknown"), 2), 30_000, { allowCeasedCheckout: true }), false);
 });
