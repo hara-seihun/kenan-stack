@@ -14,14 +14,14 @@ if [[ ${5:-} != locked ]]; then
  # Install stable discovery from this committed source before fencing. All future
  # CLI calls share admission; detached originals are drained below, never killed.
  sudo install -Dm755 "$repo/tools/agent-workspace/admission-launcher" /usr/local/libexec/agent-workspace-admission
- sudo touch /run/lock/agent-workspace-admission.lock
- sudo chmod 0666 /run/lock/agent-workspace-admission.lock
+ sudo touch /run/lock/agent-workspace-admission.lock /run/lock/agent-workspace-admission.lock.turnstile
+ sudo chmod 0666 /run/lock/agent-workspace-admission.lock /run/lock/agent-workspace-admission.lock.turnstile
  sudo ln -sfn /usr/local/libexec/agent-workspace-admission /usr/local/bin/agent-workspace
  ln -sfn /usr/local/libexec/agent-workspace-admission "$operator_home/.local/bin/agent-workspace"
  sudo install -m644 "$repo/tools/agent-workspace/admission-tmpfiles.conf" /etc/tmpfiles.d/agent-workspace.conf
  # The installed sampler has a 240-second execution budget. Admission waiting
  # must outlast a legitimate shared holder; the separate drain stays bounded.
- if sudo flock --exclusive --nonblock --conflict-exit-code 75 /srv/pi/.pi-stack-deploy.lock timeout 400 flock --exclusive --wait 300 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock "$0" "$repo" "$base" "$expected" "$receipt" locked; then
+ if sudo flock --exclusive --nonblock --conflict-exit-code 75 /srv/pi/.pi-stack-deploy.lock flock --exclusive --wait 30 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock.turnstile timeout 400 flock --exclusive --wait 300 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock "$0" "$repo" "$base" "$expected" "$receipt" locked; then
   exit 0
  else
   status=$?

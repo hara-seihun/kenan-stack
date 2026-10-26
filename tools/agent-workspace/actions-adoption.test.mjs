@@ -20,7 +20,7 @@ function fixture(action){
  const response={id:40374067792,run_attempt:1,repository:{full_name:input.repository},head_repository:{full_name:input.repository},head_sha:commit,path:'.github/workflows/deploy.yml',status:'completed',conclusion:'failure'};
  const authority={caller:()=>({ok:true,kind:'native',binding}),authenticate:pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))})};
  let calls=0;
- const execute=(cmd,args,options)=>{calls++;assert.equal(cmd,'gh');assert.deepEqual(args,['api','repos/owi-link/converge/actions/runs/40374067792/attempts/1']);assert.equal(options.timeout,10000);return {status:0,stdout:JSON.stringify(response)};};
+ const execute=(cmd,args,options)=>{calls++;assert.equal(cmd,'/usr/local/bin/gh');assert.deepEqual(args,['api','--hostname','github.com','repos/owi-link/converge/actions/runs/40374067792/attempts/1']);assert.equal(options.timeout,10000);assert.deepEqual(Object.keys(options.env).sort(),["GH_HOST","GH_PROMPT_DISABLED","HOME","PATH"]);return {status:0,stdout:JSON.stringify(response)};};
  const run=(extra={})=>adoptEndedActions(db,record,root+'/registry.sqlite3',input,{authority,execute,head:commit,branch,...extra});
  const rows=()=>JSON.stringify(db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(({name})=>[name,db.prepare('SELECT * FROM '+name).all()]));
  try{action({root,db,input,record,request,response,authority,run,rows,store,calls:()=>calls});}finally{db.close();fs.rmSync(root,{recursive:true,force:true});}

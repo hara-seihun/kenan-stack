@@ -1,4 +1,5 @@
 import path from 'node:path';
+import {homedir} from 'node:os';
 import {createHash} from 'node:crypto';
 import {boundedCommand} from './bounded-command.mjs';
 import {authorizeWorkspaceRelease} from './release-authority.mjs';
@@ -24,7 +25,7 @@ export function adoptEndedActions(database,record,statePath,input,{execute=bound
  const receipt=admissionReceipts(statePath,record.id,bytes);
  if(receipt.kind!=='none')return refused('actions-adoption-native-receipt','A native or malformed caller receipt cannot be overridden by Actions adoption.');
  let result;
- try{result=execute('gh',['api',`repos/${repository}/actions/runs/${run}/attempts/${attempt}`],{encoding:'utf8',timeout:10000,maxBuffer:1048576});}catch{return refused('actions-adoption-observation-failed','The authenticated GitHub observation failed.');}
+ try{result=execute('/usr/local/bin/gh',['api','--hostname','github.com',`repos/${repository}/actions/runs/${run}/attempts/${attempt}`],{encoding:'utf8',timeout:10000,maxBuffer:1048576,env:{HOME:homedir(),PATH:'/usr/local/bin:/usr/bin:/bin',GH_HOST:'github.com',GH_PROMPT_DISABLED:'1'}});}catch{return refused('actions-adoption-observation-failed','The authenticated GitHub observation failed.');}
  if(result.status!==0||result.error)return refused('actions-adoption-observation-failed','The authenticated GitHub observation failed.');
  let actual;try{actual=JSON.parse(result.stdout);}catch{return refused('actions-adoption-observation-invalid','The GitHub response is not valid JSON.');}
  if(String(actual?.id)!==run||String(actual?.run_attempt)!==attempt||actual?.repository?.full_name!==repository||actual?.head_repository?.full_name!==repository||actual?.head_sha!==sourceCommit||actual?.path!=='.github/workflows/deploy.yml')return refused('actions-adoption-observation-mismatch','The GitHub run identity, repository, workflow and source must match the original request.');

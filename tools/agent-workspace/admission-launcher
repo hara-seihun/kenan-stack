@@ -1,7 +1,13 @@
 #!/bin/sh
-# Stable host admission: resolve selected implementation only AFTER shared admission.
-# Publisher takes exclusive admission with a finite wait and releases it on exit.
+# Stable host admission: resolve the selected implementation only AFTER admission.
+# The brief turnstile prevents new readers from starving a pending publisher.
 set -eu
 lock=${AGENT_WORKSPACE_ADMISSION_LOCK:-/run/lock/agent-workspace-admission.lock}
 selected=${AGENT_WORKSPACE_SELECTED_ROOT:-/srv/pi/tools/agent-workspace}
-exec flock --shared --wait 30 --conflict-exit-code 75 "$lock" sh -c 'target=$1; shift; exec "$target/main" "$@"' sh "$selected" "$@"
+exec 9>"$lock.turnstile"
+flock --shared --wait 30 --conflict-exit-code 75 9
+exec 8>"$lock"
+flock --shared --wait 30 --conflict-exit-code 75 8
+flock --unlock 9
+exec 9>&-
+exec "$selected/main" "$@"
