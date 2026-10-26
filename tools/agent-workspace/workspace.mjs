@@ -3748,7 +3748,7 @@ function retainedCustodyResult(record) {
 function terminalRetentionRelease(database, selected, args, statePath, automatic = false) {
   const owner = required(args, "owner");
   const expectedPlan = required(args, "expected-plan-sha256");
-  const deadline = Date.now() + 25_000;
+  const deadline = Date.now() + 60_000;
   return duringInspection(deadline, () => withWorkspaceLock(database, selected.path, () => {
     const record = recordBy(database, {id:selected.id});
     const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
@@ -3769,13 +3769,16 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
     const protect = inspection => ({ok:false, record:recordBy(database,{id:record.id}), action:"none", inspection,
       error:{code:inspection.code ?? "retention-release-protected", message:inspection.reason}});
     const observe = () => {
+      // One parallel whole-host census per freshness pass, shared with the growth
+      // writer check. Previously that check did a serial second census first and
+      // exhausted the deadline before its thread query even began.
+      const snapshot = safetySnapshot(database);
       {
-        const safety = growthSafety(database, record);
+        const safety = growthSafety(database, record, {snapshot});
         if (safety.errors.length || safety.references.length) return {classification:"blocked",
           reason:safety.errors.length ? `cannot prove terminal retention safety: ${safety.errors.join("; ")}` : "runtime/thread/process/borrower writing references remain",
           processes:safety.references, containers:[], systemdUnits:[]};
       }
-      const snapshot = safetySnapshot(database);
       const protection = stackQueueInspection(stackQueueSafety([record.path], snapshot, automatic ? "source" : "physical-checkout", deadline));
       if (protection) return protection;
       return inspectRecord(record, {ignoreLease:true, safety:snapshot, deadline,terminalSourceTransfer:!automatic});
@@ -4563,9 +4566,10 @@ function growthProcessReferences(paths) {
   const snapshot = processSnapshot(true,paths);
   return paths.flatMap(root => processReferences(root,snapshot).map(reference => ({...reference,root})));
 }
-function growthSafety(database, record, {preservationOnly=false}={}) {
+function growthSafety(database, record, {preservationOnly=false,snapshot}={}) {
   const isolated = process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
-  const dependencies = gitDependencySnapshot(database);
+  const dependencies = snapshot === undefined ? gitDependencySnapshot(database) :
+    {alternates:snapshot.gitAlternates,linkedWorktrees:snapshot.linkedWorktrees};
   const retainedBorrowers = [...dependencies.alternates.filter(value => value.recordId !== record.id && within(record.path, value.objectDirectory)),
     ...dependencies.linkedWorktrees.filter(value => value.recordId !== record.id && within(record.path, value.commonDirectory))];
   const borrowers = new Map(retainedBorrowers.map(value => [value.workspacePath, recordBy(database,{id:value.recordId})]));
@@ -4591,9 +4595,10 @@ function growthSafety(database, record, {preservationOnly=false}={}) {
       if (!Array.isArray(processes)) growthError("growth-writer-unknown", "process observation is not an array");
     }
   }
-  const docker = isolated ? {containers:[], available:false} : dockerSnapshot();
-  const systemd = isolated ? {units:[], available:false} : systemdSnapshot();
-  const threads = isolated && !process.env.PI_THREAD_DATABASE ? [] : threadSnapshot();
+  const docker = snapshot?.docker ?? (isolated ? {containers:[], available:false} : dockerSnapshot());
+  const systemd = snapshot?.systemd ?? (isolated ? {units:[], available:false} : systemdSnapshot());
+  const threads = snapshot?.threads ?? (isolated && !process.env.PI_THREAD_DATABASE ? [] :
+    threadSnapshot(undefined, {cacheFile:observationCache(database, "thread-references.v1.json")}));
   const containers = dockerReferences(record.path, docker);
   const units = systemdReferences(record.path, systemd);
   return {errors:[docker.error, systemd.error].filter(value => value !== undefined),
@@ -5413,7 +5418,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;

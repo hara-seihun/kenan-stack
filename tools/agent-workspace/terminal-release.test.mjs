@@ -19,9 +19,9 @@ function fixture(action) {
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'config','user.email','fixture@example.invalid');git('-C',source,'config','user.name','Fixture');
   writeFileSync(path.join(source,'.gitignore'),'node_modules/\n');writeFileSync(path.join(source,'proof'),'durable');git('-C',source,'add','.');git('-C',source,'commit','-m','durable');git('-C',source,'push','origin','HEAD');
   const head=git('-C',source,'rev-parse','HEAD');
-  const run=args=>{let out='';const write=process.stdout.write,code=process.exitCode;process.stdout.write=chunk=>{out+=chunk;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=code;}return JSON.parse(out);};
+  const run=args=>{let out='';const write=process.stdout.write,code=process.exitCode;process.stdout.write=chunk=>{out+=chunk;return true;};try{if(args[0]==='release'){const named=new Map();for(let i=1;i<args.length;i++){const key=args[i].slice(2);named.set(key,[args[i+1]?.startsWith('--')||i+1===args.length?'true':args[++i]]);}workspaceTesting.releaseCommand(db,{positional:[],named},state,{caller:()=>({ok:true,kind:'operator'})});}else main(args,state);}finally{process.stdout.write=write;process.exitCode=code;}return JSON.parse(out);};
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',head,'--json']);
-  db=new DatabaseSync(state);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(record.id);
+  db=workspaceTesting.openRegistry(state);db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(record.id);
   const plan=JSON.stringify({intent:'budgeted',constructionBytes:0,growthBytes:123456789,headroomBytes:8589934592,growthLifecycle:{kind:'retired-future-growth',remainingGrowthBytes:0,retainedUse:'source',dispositionSha256:'a'.repeat(64),retiredAt:Date.now()}});
   db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(statSync(source).dev),plan);
   const release=(owner='fixture',sha=digest(plan))=>run(['release','--id',record.id,'--end-retention','--owner',owner,'--expected-plan-sha256',sha,'--json']);
@@ -81,4 +81,26 @@ test('future-growth prerequisite supplies executable bound-selector actions and 
  assert.equal(caught.nextAction.steps.find(step=>step.kind==='prepare-disposition').schema.properties.growthWriters.const,'none');
  assert.throws(()=>run(['retire-growth','--id',record.id,'--owner','fixture','--json']),error=>error.code==='invalid-workspace-selector'&&error.nextAction.selector.kind==='all');
  assert.throws(()=>run(['release','--id',record.id,'--path',source,'--end-retention','--owner','fixture','--expected-plan-sha256',digest(priced),'--json']),error=>error.code==='invalid-workspace-selector'&&error.nextAction.selector.kind==='exactly-one');
+}));
+
+// A supplied, fresh whole-host snapshot must be consumed, not followed by a
+// serial database/systemd/Docker census with the same expiring deadline.
+test('growth safety consumes the shared snapshot and preserves its live thread and failed channels',()=>fixture(({source,record})=>{
+ const snapshot={gitAlternates:[],linkedWorktrees:[],threads:[{id:'live',cwd:source}],docker:{containers:[],error:'docker unavailable'},systemd:{units:[],error:'systemd unavailable'}};
+ const forbiddenDatabase={prepare(){throw new Error('duplicate topology census');}};
+ const safety=workspaceTesting.growthSafety(forbiddenDatabase,record,{snapshot});
+ assert.deepEqual(safety.errors,['docker unavailable','systemd unavailable']);
+ assert.ok(safety.references.some(row=>row.id==='live'));
+}));
+
+test('terminal release retains a checkout referenced by a real thread database',()=>fixture(({root,source,release})=>{
+ const file=path.join(root,'threads.sqlite3'),threads=new DatabaseSync(file),old=process.env.PI_THREAD_DATABASE;
+ try{
+  threads.exec(`CREATE TABLE thread(id TEXT PRIMARY KEY,cwd TEXT,state TEXT,metadata TEXT); CREATE TABLE thread_work(thread_id TEXT,status TEXT); CREATE TABLE thread_execution(thread_id TEXT,ended_at INTEGER)`);
+  threads.prepare('INSERT INTO thread VALUES(?,?,?,?)').run('live',source,'running','{}');
+  process.env.PI_THREAD_DATABASE=file;
+  const result=release();assert.equal(result.ok,false);assert.equal(existsSync(source),true);
+  threads.exec("UPDATE thread SET state='finished'");
+  assert.equal(release().action,'released');assert.equal(existsSync(source),false);
+ }finally{threads.close();if(old===undefined)delete process.env.PI_THREAD_DATABASE;else process.env.PI_THREAD_DATABASE=old;}
 }));
