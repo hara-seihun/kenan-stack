@@ -27,6 +27,7 @@ function checkBytes(f,head) {
 }
 test('explicit release settles ceased unpublished source future growth, preserving entire tree and floor',()=>fixture(f=>{
  const head=f.commit(),before=priced(f),r=f.release();
+ assert.ok(r.physicalDisposition,'Expected a physical release verdict; actual typed result: '+JSON.stringify(r));
  assert.equal(r.physicalDisposition.kind,'retained');assert.equal(r.record.state,'repair-required');
  assert.equal(r.futureGrowthSettlement.kind,'retired',JSON.stringify(r));
  assert.equal(r.record.capacity.growthLifecycle.remainingGrowthBytes,0);assert.equal(r.record.capacity.growthBytes,before.growthBytes);

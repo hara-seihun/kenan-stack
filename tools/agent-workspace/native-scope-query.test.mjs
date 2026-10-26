@@ -9,3 +9,10 @@ test('the alternate system bus read repairs actual root metadata timeout without
 test('a healthy primary read remains the fast single authenticated observation',()=>{let count=0;const r=queryNativeScope(unit,{execute:()=>{count++;return{status:0,stdout:'primary'};}});assert.equal(r.stdout,'primary');assert.equal(count,1);});
 for(const patch of [{Transient:{type:'b',data:false}},{ActiveState:str('inactive')},{Description:str('editable text')},{Description:{type:'s',data:'forged\nControlGroup='+group}},{Transient:{type:'s',data:'true'}}])test('alternate observations preserve strict identity checks '+JSON.stringify(patch),()=>{const io=observer(patch);assert.equal(procScope(1,{read:()=>`0::${group}\n`,query:u=>queryNativeScope(u,io)}),null);});
 test('a malformed or failed second route preserves the original typed failure',()=>{for(const result of [{status:1,stdout:''},{status:0,stdout:'not json'},{status:0,stdout:'{"type":"s","data":[]}'}]){let count=0;assert.deepEqual(queryNativeScope(unit,{execute:()=>count++?result:timeout}),timeout);}});
+
+test('a transient timeout of both authenticated routes gets one exact bounded read retry',()=>{
+ const calls=[];const r=queryNativeScope(unit,{execute:(cmd,args,options)=>{calls.push({cmd,args,options});return calls.length<3?timeout:{status:0,stdout:'exact retry'};}});
+ assert.equal(r.stdout,'exact retry');assert.equal(calls.length,3);assert.deepEqual(calls[0].args,calls[2].args);assert.equal(calls[2].options.timeout,2000);
+});
+test('persistent timeout remains unknown after a bounded second observation',()=>{let calls=0;assert.deepEqual(queryNativeScope(unit,{execute:()=>{calls++;return timeout;}}),timeout);assert.equal(calls,4);});
+test('a healthy but malformed or foreign primary never gets retried into permission',()=>{let calls=0;const bad={status:0,stdout:'foreign'};assert.deepEqual(queryNativeScope(unit,{execute:()=>{calls++;return bad;}}),bad);assert.equal(calls,1);});
