@@ -82,24 +82,31 @@ export function canonicalNativeOwner(database,record){
 
 // Admission receipts of one workspace's checkout jobs. Every job that carries a caller identity
 // must name the same agent and carry the record's exact creation request.
-export function admissionReceipts(statePath,workspaceId,creationRequest){
+export function admissionReceipts(statePath,workspaceId,creationRequest,{deadline=Date.now()+30000}={}){
  const directory=path.join(path.dirname(statePath),'checkout-jobs',workspaceId);
  if(!fs.existsSync(directory))return {kind:'none',code:'no-checkout-job'};
  const pairs=[];
- for(const entry of fs.readdirSync(directory,{withFileTypes:true})){
+ let entries=0;
+ const handle=fs.opendirSync(directory);
+ try{for(let entry;(entry=handle.readSync())!==null;){
+  if(Date.now()>=deadline)return {kind:'invalid',code:'receipt-deadline'};
+  if(++entries>2048)return {kind:'invalid',code:'receipt-job-limit'};
   if(!entry.isDirectory())continue;
   const job=path.join(directory,entry.name);
   let environment,request;
   const environmentFile=path.join(job,'environment.json'),requestFile=path.join(job,'request.json');
   if(!fs.existsSync(environmentFile))continue;
-  try{environment=JSON.parse(fs.readFileSync(environmentFile,'utf8'));}catch{return {kind:'invalid',code:'receipt-environment-unreadable',job:entry.name};}
+  try{if(fs.statSync(environmentFile).size>1048576)throw Error('oversized');environment=JSON.parse(fs.readFileSync(environmentFile,'utf8'));}catch{return {kind:'invalid',code:'receipt-environment-unreadable',job:entry.name};}
   if(environment===null||typeof environment!=='object')return {kind:'invalid',code:'receipt-environment-unreadable',job:entry.name};
   if(environment.KENAN_AGENT===undefined&&environment.KENAN_TOOL_CALL_ID===undefined)continue;
-  try{request=JSON.parse(fs.readFileSync(requestFile,'utf8'));}catch{return {kind:'invalid',code:'receipt-request-unreadable',job:entry.name};}
+  try{if(fs.statSync(requestFile).size>16*1048576)throw Error('oversized');request=JSON.parse(fs.readFileSync(requestFile,'utf8'));}catch{return {kind:'invalid',code:'receipt-request-unreadable',job:entry.name};}
   if(!OWNER_AGENT_ID.test(environment.KENAN_AGENT??'')||!CALL_ID.test(environment.KENAN_TOOL_CALL_ID??''))return {kind:'invalid',code:'receipt-identity-malformed',job:entry.name};
   if(typeof creationRequest!=='string'||creationRequest===''||request?.id!==workspaceId||request?.request!==creationRequest)return {kind:'invalid',code:'receipt-request-mismatch',job:entry.name};
+  if(pairs.length>=MAX_PAIRS)return {kind:'invalid',code:'receipt-pair-limit'};
   pairs.push({agentId:environment.KENAN_AGENT,callId:environment.KENAN_TOOL_CALL_ID,job:entry.name});
  }
+ }finally{handle.closeSync();}
+ pairs.sort((a,b)=>a.job.localeCompare(b.job));
  if(!pairs.length)return {kind:'none',code:'no-caller-receipt'};
  const agents=[...new Set(pairs.map(pair=>pair.agentId))];
  if(agents.length!==1)return {kind:'invalid',code:'receipt-agents-conflict',agents};

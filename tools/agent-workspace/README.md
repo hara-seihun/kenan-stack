@@ -897,3 +897,9 @@ repair budget and conservative treatment of incomplete samples are unchanged.
 An exhausted refusal includes `capacity-refresh` observations in its retained
 stderr, so wrappers do not lose which samples were attempted. Explicit targeted
 `measure-capacity` keeps its full requested budget unless `--incremental` is used.
+
+### Periodic authenticated owner reaper
+
+`agent-workspace reap-ended-owners --execute --json` first runs bounded authenticated receipt binding (128 records, 15 seconds), then the existing guarded ended-owner release (64 records, at most 40 seconds). The reaper accepts a total `--budget-ms` (default 90000, range 2000..120000); release receives at most 40000 milliseconds after the binding phase budget. A failed authentication observation prevents that pass from releasing anything. No free-label owner is guessed. Both phases persist independent fair cursors; binding authenticates at most 512 exact pairs per pass. `bind-native-owners` accepts `--max-records 1..512` and `--after ID|start` for explicit non-wrapping pages. Unselected executing passes wrap and skip already bound or native-ID records. Release observes a fair window of at most 512 owners before choosing its action page, prioritizing positively ended owners over live owners. All ordinary runtime, wake, frozen-source, dirty-file and unpublished-commit protections remain in force.
+
+After normal component deployment, `bash tools/agent-workspace/install-owner-reaper` installs the component-owned user service and timer. The service invokes the supported CLI through its host admission wrapper, with a 120-second startup limit (including the wrapper's 30-second admission wait), a five-second termination limit and one GiB of memory. The timer schedules the next pass one minute after the preceding service ends. Component deployment alone does not install or enable the timer.

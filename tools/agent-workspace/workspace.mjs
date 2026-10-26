@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
@@ -3888,32 +3889,65 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
 }
 // Binds existing records whose registered owner is not a native worker id to the native worker
 // that created them, from authenticated checkout-job admission receipts only. Idempotent.
-function bindNativeOwnersCommand(database, args, statePath) {
-  assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "json"]);
+function ownerCursor(database, args, scope, targeted) {
+  database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
+  const saved = bool(args,"execute") && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope=?").get(scope)?.after_id : undefined;
+  const after=one(args,"after",saved??"start");
+  const anchor=after==="start"?null:database.prepare("SELECT id,root,path FROM workspace WHERE id=?").get(after);
+  if(one(args,"after")!==undefined&&after!=="start"&&(!anchor||(one(args,"root")!==undefined&&anchor.root!==path.resolve(one(args,"root")))))fail("--after workspace is not in the selected pool: "+after);
+  return {after,anchor,save:id=>{
+    if(bool(args,"execute")&&!targeted)database.prepare("INSERT INTO reconciliation_cursor(scope,after_id) VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET after_id=excluded.after_id").run(scope,id);
+  }};
+}
+
+function bindNativeOwnersCommand(database, args, statePath, {authenticate=authenticateToolCalls}={}) {
+  assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "max-records", "after", "json"]);
+  const maxRecords=numberFlag(args,"max-records",128);
+  if(!Number.isSafeInteger(maxRecords)||maxRecords<1||maxRecords>512)fail("--max-records must be between 1 and 512");
   const budget = numberFlag(args, "budget-ms", 30_000);
   if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 120_000) fail("--budget-ms must be between 1000 and 120000");
   const execute = bool(args, "execute"), deadline = Date.now() + budget;
   const targeted = one(args, "id") !== undefined || one(args, "path") !== undefined;
   if (targeted && one(args, "root") !== undefined) fail("bind-native-owners accepts --root or a single --id/--path selector");
   ensureNativeOwnerTable(database);
-  const records = (targeted ? [recordBy(database, selectorFrom(args, "bind-native-owners"))] : listRecords(database, one(args, "root")))
-    .filter(record => record.state !== "released");
+  const scope="native-owner-binding:"+(one(args,"root")===undefined?"*":path.resolve(one(args,"root")));
+  const cursor=ownerCursor(database,args,scope,targeted), explicitWalk=one(args,"after")!==undefined;
+  // Do not deserialize every historical creation request just to authenticate one small page.
+  database.function("workspace_native_id",{deterministic:true},value=>OWNER_AGENT_ID.test(value??"")?1:0);
+  const root=one(args,"root")===undefined?null:path.resolve(one(args,"root"));
+  const predicate="state!='released' AND workspace_native_id(owner)=0 AND NOT EXISTS(SELECT 1 FROM workspace_native_owner n WHERE n.workspace_id=workspace.id) AND (? IS NULL OR root=?)";
+  const candidates=targeted?1:database.prepare("SELECT count(*) AS count FROM workspace WHERE "+predicate).get(root,root).count;
+  let page;
+  if(targeted)page=[recordBy(database,selectorFrom(args,"bind-native-owners"))];
+  else {
+    const query=(comparison,limit)=>database.prepare(`SELECT workspace.*, ${ASSIGNMENT_SOURCE} FROM workspace WHERE ${predicate}${cursor.anchor?` AND (root,path,id) ${comparison} (?,?,?)`:""} ORDER BY root,path,id LIMIT ?`)
+      .all(root,root,...(cursor.anchor?[cursor.anchor.root,cursor.anchor.path,cursor.anchor.id]:[]),limit).map(rowToRecord);
+    page=query(">",maxRecords);
+    if(cursor.anchor&&!explicitWalk&&page.length<maxRecords)page.push(...query("<=",maxRecords-page.length));
+  }
   const results = [], pending = [];
-  for (const record of records) {
+  let last, examined=0, pairs=0;
+  for (const record of page) {
+    if(Date.now()>=deadline)break;
     const summary = { id: record.id, path: record.path, owner: record.owner, state: record.state };
-    if (OWNER_AGENT_ID.test(record.owner)) { results.push({ record: summary, outcome: "native-registered-owner" }); continue; }
+    if (OWNER_AGENT_ID.test(record.owner)) { last=record.id;examined++;results.push({ record: summary, outcome: "native-registered-owner" }); continue; }
     const existing = nativeOwnerBinding(database, record.id);
-    if (existing.state === "set") { results.push({ record: summary, outcome: "already-bound", binding: existing }); continue; }
+    if (existing.state === "set") { last=record.id;examined++;results.push({ record: summary, outcome: "already-bound", binding: existing }); continue; }
     const row = database.prepare("SELECT creation_request FROM workspace WHERE id=?").get(record.id);
-    const receipt = row?.creation_request ? admissionReceipts(statePath, record.id, row.creation_request) : { kind: "none", code: "no-creation-request" };
+    const receipt = row?.creation_request ? admissionReceipts(statePath, record.id, row.creation_request, {deadline}) : { kind: "none", code: "no-creation-request" };
+    // Every receipt for a record must authenticate together. Do not split a record's proof.
+    if(receipt.kind==="receipt"&&pairs+receipt.pairs.length>512)break;
+    last=record.id;examined++;
     if (receipt.kind !== "receipt") { results.push({ record: summary, outcome: "unbound", code: receipt.code }); continue; }
+    pairs+=receipt.pairs.length;
     pending.push({ record, summary, receipt });
   }
-  const authentication = pending.length ? authenticateToolCalls(pending.flatMap(item => item.receipt.pairs), { deadline }) : { errors: [], confirmed: new Map() };
+  const authentication = pending.length ? authenticate(pending.flatMap(item => item.receipt.pairs), { deadline }) : { errors: [], confirmed: new Map() };
   for (const { record, summary, receipt } of pending) {
     const verdict = receiptBinding(receipt, authentication);
     if (verdict.kind !== "bindable") { results.push({ record: summary, outcome: "unbound", code: verdict.code, ...(verdict.detail ? { detail: verdict.detail } : {}) }); continue; }
     if (!execute) { results.push({ record: summary, outcome: "would-bind", binding: verdict.binding }); continue; }
+    if(Date.now()>=deadline){results.push({record:summary,outcome:"unbound",code:"binding-deferred"});continue;}
     withWorkspaceLock(database, record.path, () => {
       const current = recordBy(database, { id: record.id });
       if (current.owner !== record.owner || current.state === "released" || nativeOwnerBinding(database, record.id).state === "set") {
@@ -3921,7 +3955,7 @@ function bindNativeOwnersCommand(database, args, statePath) {
         return;
       }
       const currentRequest = database.prepare("SELECT creation_request FROM workspace WHERE id=?").get(record.id)?.creation_request;
-      const currentReceipt = currentRequest ? admissionReceipts(statePath, record.id, currentRequest) : {kind:"none"};
+      const currentReceipt = currentRequest ? admissionReceipts(statePath, record.id, currentRequest, {deadline}) : {kind:"none"};
       if (JSON.stringify(currentReceipt) !== JSON.stringify(receipt)) {
         results.push({record: summary, outcome: "unbound", code: "receipt-changed"}); return;
       }
@@ -3931,9 +3965,10 @@ function bindNativeOwnersCommand(database, args, statePath) {
   }
   const counts = {};
   for (const item of results) { const key = item.outcome === "unbound" ? `unbound:${item.code}` : item.outcome; counts[key] = (counts[key] ?? 0) + 1; }
-  print({ ok: authentication.errors.length === 0, kind: "native-owner-binding", execute, examined: results.length, counts,
-    observation: { errors: authentication.errors }, results }, true);
-  if (authentication.errors.length) process.exitCode = 75;
+  if(last!==undefined)cursor.save(last);
+  return { ok: authentication.errors.length === 0, kind: "native-owner-binding", execute, candidates, examined, maxRecords, authenticatedPairs:pairs, counts,
+    nextAfter:last!==undefined&&database.prepare("SELECT 1 FROM workspace WHERE "+predicate+" AND (root,path,id)>(SELECT root,path,id FROM workspace WHERE id=?) LIMIT 1").get(root,root,last)?last:null,
+    observation: { errors: authentication.errors }, results };
 }
 
 function releaseEndedOwnersCommand(database, args, statePath) {
@@ -3947,25 +3982,25 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   let records = targeted ? [recordBy(database, selectorFrom(args, "release-ended-owners"))] : listRecords(database, one(args, "root"));
   records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && (OWNER_AGENT_ID.test(canonicalNativeOwner(database, record)) || !existsSync(record.path)));
   const scope = `owner-liveness:${one(args, "root") === undefined ? "*" : path.resolve(one(args, "root"))}`;
-  database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
-  const saved = execute && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope = ?").get(scope)?.after_id : undefined;
-  const after = one(args, "after", saved ?? "start");
-  const ordered = records.map(record => record.id);
-  let unwrapped = records.length;
-  if (after !== "start") {
-    const anchor = database.prepare("SELECT root, path FROM workspace WHERE id = ?").get(after);
-    if (anchor) {
-      const pivot = records.findIndex(record => record.root > anchor.root || (record.root === anchor.root && record.path > anchor.path));
-      if (pivot >= 0) { records = [...records.slice(pivot), ...records.slice(0, pivot)]; unwrapped = ordered.length - pivot; }
-      else unwrapped = 0;
-    }
-  }
-  // An explicit --after walk ends at the end of the pool; an unselected executing run continues
-  // from its saved cursor and wraps, so a timer covers every candidate.
-  const explicitWalk = one(args, "after") !== undefined;
-  const page = (explicitWalk ? records.slice(0, unwrapped) : records).slice(0, maxRecords);
-  const members = page.flatMap(record => recordsInGroup(database, record));
-  const observation = ownerLivenessObservation(members.map(record => canonicalNativeOwner(database, record)), deadline);
+  const cursor=ownerCursor(database,args,scope,targeted), explicitWalk=one(args,"after")!==undefined;
+  const ordered=records.map(record=>record.id);
+  const pool=records;
+  records=ownerPage(records,cursor.anchor,{wrap:!explicitWalk});
+  // Look beyond the action page before choosing it, so live owners cannot consume every slot.
+  // A separate persisted scan cursor covers registries larger than the 512-owner SQL bound.
+  const scan=ownerCursor(database,{...args,named:new Map([...args.named].filter(([name])=>name!=="after"))},scope+":scan",targeted||explicitWalk);
+  const window=(explicitWalk||pool.length<=512?records:ownerPage(pool,scan.anchor)).slice(0,512);
+  const observedMembers=window.flatMap(record=>recordsInGroup(database,record));
+  const owners=[...new Set(observedMembers.map(record=>canonicalNativeOwner(database,record)).filter(owner=>OWNER_AGENT_ID.test(owner)))];
+  // Large groups cannot overflow native authentication; retain them instead of weakening proof.
+  const observation=ownerLivenessObservation(owners.slice(0,512),deadline);
+  const priority=record=>classifyOwner(canonicalNativeOwner(database,record),observation).kind==="ended"?0:1;
+  // A large scan window can contain more ended owners than one action page. Remember actual
+  // attempts, not just the window anchor, so repeatedly retained trees cannot starve its tail.
+  database.exec("CREATE TABLE IF NOT EXISTS workspace_owner_sweep_attempt(sequence INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, workspace_id TEXT NOT NULL, UNIQUE(scope,workspace_id))");
+  const attempts=new Map(database.prepare("SELECT workspace_id,sequence FROM workspace_owner_sweep_attempt WHERE scope=?").all(scope).map(row=>[row.workspace_id,row.sequence]));
+  const page=(explicitWalk?window:window.toSorted((a,b)=>priority(a)-priority(b)||(attempts.get(a.id)??0)-(attempts.get(b.id)??0)||records.indexOf(a)-records.indexOf(b))).slice(0,maxRecords);
+  if(window.length&&observation.errors.length===0)scan.save(window.at(-1).id);
   const results = [], visited = new Set();
   let last;
   for (const record of page) {
@@ -3978,17 +4013,33 @@ function releaseEndedOwnersCommand(database, args, statePath) {
       results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : error.code ?? "owner-liveness-release-failed", detail: error.message })));
     }
     last = record.id;
-    if (execute && !targeted && results.at(-1)?.code !== "deferred") database.prepare(
-      "INSERT INTO reconciliation_cursor (scope, after_id) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET after_id = excluded.after_id").run(scope, last);
+    if(results.at(-1)?.code!=="deferred"){
+      cursor.save(last);
+      if(execute&&!targeted&&!explicitWalk)database.prepare("INSERT OR REPLACE INTO workspace_owner_sweep_attempt(scope,workspace_id) VALUES(?,?)").run(scope,record.id);
+    }
   }
   const counts = {};
   // An executed release that retained the tree reports action "none" without a refusal code.
   const outcome = item => item.action !== "none" ? item.action : item.code ?? `release-retained:${item.inspection?.classification ?? "unknown"}`;
   for (const item of results) counts[outcome(item)] = (counts[outcome(item)] ?? 0) + 1;
-  print({ ok: observation.errors.length === 0, kind: "owner-liveness-release", execute, candidates: records.length, examined: results.length, counts,
+  return { ok: observation.errors.length === 0, kind: "owner-liveness-release", execute, candidates: records.length, examined: results.length, counts,
     observation: { errors: observation.errors, observations: observation.observations, observedAt: observation.observedAt },
-    nextAfter: last !== undefined && ordered.indexOf(last) < ordered.length - 1 && (explicitWalk ? page.length < unwrapped : page.length < records.length) ? last : null, results }, true);
-  if (observation.errors.length) process.exitCode = 75;
+    // Explicit walks are pool-order pagination, not the timer's priority order.
+    nextAfter: last !== undefined && ordered.indexOf(last) < ordered.length - 1 ? last : null, results };
+}
+
+function reapEndedOwnersCommand(database,args,statePath,dependencies={}) {
+  assertOnly(args,["root","execute","json","bind-budget-ms","bind-max-records","budget-ms","max-records"]);
+  const flags=(budget,max)=>({positional:[],named:new Map([
+    ...(one(args,"root")===undefined?[]:[["root",[one(args,"root")]]]),
+    ...(bool(args,"execute")?[["execute",["true"]]]:[]),["budget-ms",[String(budget)]],["max-records",[String(max)]],["json",["true"]]])});
+  // Validate both phases before the first mutation, even if binding later refuses.
+  const totalBudget=numberFlag(args,"budget-ms",90000),bindBudget=numberFlag(args,"bind-budget-ms",Math.min(15000,totalBudget-1000));
+  const releaseBudget=Math.min(40000,totalBudget-bindBudget);
+  const bindMax=numberFlag(args,"bind-max-records",128),releaseMax=numberFlag(args,"max-records",64);
+  if(!Number.isSafeInteger(totalBudget)||totalBudget<2000||totalBudget>120000||!Number.isSafeInteger(bindBudget)||bindBudget<1000||bindBudget>30000||releaseBudget<1000||!Number.isSafeInteger(bindMax)||bindMax<1||bindMax>512||!Number.isSafeInteger(releaseMax)||releaseMax<1||releaseMax>64)fail("owner reaper requires a 2000..120000 ms total budget, binding (1..512 records, 1000..30000 ms) and release (1..64 records, at most 40000 ms)");
+  return reapEndedOwners({bind:()=>bindNativeOwnersCommand(database,flags(bindBudget,bindMax),statePath,dependencies),
+    release:()=>releaseEndedOwnersCommand(database,flags(releaseBudget,releaseMax),statePath)});
 }
 
 // A released workspace whose tree is gone is history, not state. Keep a month
@@ -4869,7 +4920,8 @@ function help() {
                             [--budget-ms 20000] [--max-groups 32] [--after ID|start]
   agent-workspace release-ended-owners [--root PATH | ${selectorSyntax("release-ended-owners")}] [--execute]
                             [--budget-ms 30000] [--max-records 16] [--after ID|start] [--json]
-  agent-workspace bind-native-owners [--root PATH | --id ID | --path PATH] [--execute] [--budget-ms 30000] [--json]
+  agent-workspace bind-native-owners [--root PATH | --id ID | --path PATH] [--execute] [--budget-ms 30000] [--max-records 128] [--after ID|start] [--json]
+  agent-workspace reap-ended-owners [--root PATH] [--execute] [--bind-budget-ms 15000] [--bind-max-records 128] [--budget-ms 90000] [--max-records 64] [--json]
   agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--incremental] [--json]
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
@@ -4907,7 +4959,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { openRegistry, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
@@ -5080,8 +5132,10 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
       }, record.groupId);
     }
     else if (commandName === "reconcile") reconcileCommand(database, args, statePath);
-    else if (commandName === "bind-native-owners") bindNativeOwnersCommand(database, args, statePath);
-    else if (commandName === "release-ended-owners") releaseEndedOwnersCommand(database, args, statePath);
+    else if (["bind-native-owners","release-ended-owners","reap-ended-owners"].includes(commandName)) {
+      const result=commandName==="bind-native-owners"?bindNativeOwnersCommand(database,args,statePath):commandName==="release-ended-owners"?releaseEndedOwnersCommand(database,args,statePath):reapEndedOwnersCommand(database,args,statePath);
+      print(result,true);if(!result.ok)process.exitCode=75;
+    }
     else if (commandName === "measure-capacity") measureCapacityCommand(database, args, statePath);
     else if (commandName === "capacity-status") capacityStatusCommand(database,args);
     else if (commandName === "growth-status") growthStatusCommand(database, args, statePath);

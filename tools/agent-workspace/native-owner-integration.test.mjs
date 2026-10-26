@@ -5,8 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import {DatabaseSync} from 'node:sqlite';
-import {main} from './workspace.mjs';
+import {main,workspaceTesting} from './workspace.mjs';
 import {bindNativeOwner,nativeOwnerBinding} from './native-owner.mjs';
 const AGENT='22222222-2222-4222-8222-222222222222';
 function fixture(action){
@@ -17,11 +16,22 @@ function fixture(action){
  const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');git('-C',source,'commit','--allow-empty','-m','initial');git('-C',source,'push','origin','main');
-  const record=run(['register','--path',source,'--root',root,'--owner','task-label','--json']);db=new DatabaseSync(state);
+  const record=run(['register','--path',source,'--root',root,'--owner','task-label','--json']);db=workspaceTesting.openRegistry(state);
   const bind=()=>bindNativeOwner(db,record.id,{agentId:AGENT,channel:'beta',callId:'call_123'},'caller-scope',{fixture:true});
   const observe=(agentState,wakes=[])=>fs.writeFileSync(native,JSON.stringify({errors:[],agents:[{id:AGENT,channel:'beta',role:'worker',state:agentState,archived:agentState==='stopped',goalId:null,updatedAt:1}],wakes,observations:[],observedAt:Date.now()}));
   const release=(execute=false)=>run(['release-ended-owners','--id',record.id,...(execute?['--execute']:[]),'--json']);
-  action({root,source,state,record,db,run,bind,observe,release});
+    const args=(entries=[])=>({positional:[],named:new Map(entries.map(([k,v])=>[k,[String(v)]]))});
+  const authenticated=pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))});
+  const receipt=(r,number=1)=>{
+   const creation='{"fixture":"'+r.id+'"}';db.prepare('UPDATE workspace SET creation_request=? WHERE id=?').run(creation,r.id);
+   for(let i=0;i<number;i++){
+    const dir=path.join(root,'checkout-jobs',r.id,'job-'+i);fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,'request.json'),JSON.stringify({id:r.id,request:creation}));
+    fs.writeFileSync(path.join(dir,'environment.json'),JSON.stringify({KENAN_AGENT:AGENT,KENAN_TOOL_CALL_ID:'call_'+i}));
+   }
+  };
+  const reaper=(options={})=>workspaceTesting.reapEndedOwnersCommand(db,args([['execute',true],['root',root],...Object.entries(options)]),state,{authenticate:authenticated});
+  action({root,source,state,record,db,run,bind,observe,release,args,receipt,authenticated,reaper,git});
  }finally{db?.close();['PI_WORKSPACE_TEST_EXTERNAL_SAFETY','PI_WORKSPACE_TEST_OWNER_LIVENESS'].forEach((key,i)=>{if(previous[i]===undefined)delete process.env[key];else process.env[key]=previous[i];});fs.rmSync(root,{recursive:true,force:true});}
 }
 test('bound labels are eligible, live owners stay protected, stopped owner releases with its canonical identity',()=>fixture(f=>{
@@ -36,4 +46,70 @@ test('pending wakes for the canonical bound identity protect a labelled checkout
 }));
 test('migration has an explicit unbound outcome for registration without an admission receipt',()=>fixture(f=>{
  const result=f.run(['bind-native-owners','--id',f.record.id,'--execute','--json']);assert.equal(result.ok,true);assert.equal(result.results[0].outcome,'unbound');assert.equal(result.results[0].code,'no-creation-request');assert.deepEqual(nativeOwnerBinding(f.db,f.record.id),{state:'unset'});
+}));
+
+test('periodic reaper authenticates an unbound free label before the guarded release',()=>fixture(f=>{
+ f.receipt(f.record);f.observe('stopped');
+ const result=f.reaper();assert.equal(result.binding.counts.bound,1,JSON.stringify(result));
+ assert.equal(result.release.results[0].record.state,'released',JSON.stringify(result));assert.equal(fs.existsSync(f.source),false);
+}));
+for(const guard of ['live','dirty','unpushed','wake'])test('periodic reaper retains '+guard+' source after authentic binding',()=>fixture(f=>{
+ f.receipt(f.record);f.observe(guard==='live'?'running':'stopped',guard==='wake'?[{id:'wake',agentId:AGENT,status:'pending',text:'continue',heldFor:null}]:[]);
+ if(guard==='dirty')fs.writeFileSync(path.join(f.source,'valuable.txt'),'irreplaceable');
+ if(guard==='unpushed')f.git('-C',f.source,'commit','--allow-empty','-m','not published');
+ const before=f.git('-C',f.source,'rev-parse','HEAD');
+ const result=f.reaper();assert.equal(result.binding.counts.bound,1);assert.equal(fs.existsSync(f.source),true,JSON.stringify(result));
+ assert.equal(f.git('-C',f.source,'rev-parse','HEAD'),before);
+ if(guard==='dirty')assert.equal(fs.readFileSync(path.join(f.source,'valuable.txt'),'utf8'),'irreplaceable');
+}));
+test('bounded binding pages persist fair progress, wrap past unbindable records, and explicit cursors finish',()=>fixture(f=>{
+ const records=[f.record];for(let i=0;i<4;i++){
+  const dir=path.join(f.root,'checkout-'+i);f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
+  records.push(f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']));
+ }
+ const seen=[];const invoke=(extra=[])=>workspaceTesting.bindNativeOwnersCommand(f.db,f.args([['root',f.root],['execute',true],['max-records',2],...extra]),f.state,{authenticate:f.authenticated});
+ for(let n=0;n<3;n++){const page=invoke();assert.ok(page.examined<=2);seen.push(...page.results.map(x=>x.record.id));}
+ assert.equal(new Set(seen).size,5,'unbound labels cannot permanently occupy the first page');
+ assert.throws(()=>invoke([['max-records',513]]),/max-records/);
+ let after='start',walk=[];do{const page=invoke([['after',after]]);walk.push(...page.results.map(x=>x.record.id));after=page.nextAfter;}while(after);
+ assert.equal(walk.length,5);assert.equal(new Set(walk).size,5);
+ // Binding the final record still requires its authenticated receipt, not the task name.
+ const last=records.find(r=>r.id===walk.at(-1));f.receipt(last);
+ for(let n=0;n<3;n++)invoke();assert.equal(nativeOwnerBinding(f.db,last.id).agentId,AGENT);
+}));
+test('binding caps the entire authentication pass at 512 pairs and continues the deferred record next pass',()=>fixture(f=>{
+ f.receipt(f.record,400);
+ const dir=path.join(f.root,'checkout-z');f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
+ const other=f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']);f.receipt(other,200);
+ const batches=[];const invoke=()=>workspaceTesting.bindNativeOwnersCommand(f.db,f.args([['root',f.root],['execute',true],['max-records',512]]),f.state,{authenticate:pairs=>{batches.push(pairs.length);return f.authenticated(pairs);}});
+ assert.equal(invoke().examined,1);assert.equal(invoke().examined,1);assert.deepEqual(batches,[400,200]);
+}));
+test('release action pages prefer positively ended owners over live owners',()=>fixture(f=>{
+ const live='11111111-1111-4111-8111-111111111111';
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(live,f.record.id);
+ const dir=path.join(f.root,'checkout-z');f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
+ const ended=f.run(['register','--path',dir,'--root',f.root,'--owner',AGENT,'--json']);
+ f.observe('stopped');const observation=JSON.parse(fs.readFileSync(path.join(f.root,'native.json')));observation.agents.push({id:live,channel:'beta',role:'worker',state:'running',archived:false});fs.writeFileSync(path.join(f.root,'native.json'),JSON.stringify(observation));
+ const result=f.run(['release-ended-owners','--root',f.root,'--execute','--max-records','1','--json']);
+ assert.equal(result.results[0].record.id,ended.id,JSON.stringify(result));assert.equal(fs.existsSync(dir),false);assert.equal(fs.existsSync(f.source),true);
+}));
+
+test('ended retained source cannot monopolize later timer action pages',()=>fixture(f=>{
+ const records=[f.record];f.bind();fs.writeFileSync(path.join(f.source,'valuable'),'dirty');
+ for(let i=0;i<3;i++){
+  const dir=path.join(f.root,'checkout-'+i);f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');fs.writeFileSync(path.join(dir,'valuable'),'dirty');
+  records.push(f.run(['register','--path',dir,'--root',f.root,'--owner',AGENT,'--json']));
+ }
+ f.observe('stopped');const examined=[];
+ for(let i=0;i<4;i++){
+  const result=f.run(['release-ended-owners','--root',f.root,'--execute','--max-records','1','--json']);examined.push(result.results[0].record.id);
+ }
+ assert.equal(new Set(examined).size,records.length,'persisted attempts fairly cover all retained ended owners');
+ for(const record of records)assert.equal(fs.existsSync(path.join(record.path,'valuable')),true);
+}));
+test('reaper total budget accepts the host invocation but validates both phases before mutation',()=>fixture(f=>{
+ f.receipt(f.record);f.observe('running');
+ assert.equal(f.reaper({'budget-ms':90000,'max-records':64}).ok,true);
+ assert.throws(()=>f.reaper({'budget-ms':1500}),/total budget/);
+ assert.throws(()=>f.reaper({'budget-ms':90000,'max-records':65}),/release/);
 }));

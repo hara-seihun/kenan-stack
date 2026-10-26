@@ -169,3 +169,12 @@ test('actual PostgreSQL: only a tool call that exists in that agent\'s own conve
   assert.throws(()=>psql('kenan_beta',toolCallAuthenticationSql([pair('c1')]).replace('SELECT','DELETE FROM message; SELECT')),/read-only|READ ONLY/i);
  }finally{if(started)try{pg('pg_ctl',['-D',data,'-m','immediate','stop']);}catch{}fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('receipt migration refuses oversized pair sets and expired traversal deadlines',()=>{
+ const spec=Object.fromEntries(Array.from({length:513},(_,i)=>['job-'+i,good(A,'call_'+i)]));
+ const state=jobs(spec);
+ try{
+  assert.equal(admissionReceipts(state,WS,REQUEST).code,'receipt-pair-limit');
+  assert.equal(admissionReceipts(state,WS,REQUEST,{deadline:Date.now()-1}).code,'receipt-deadline');
+ }finally{fs.rmSync(path.dirname(state),{recursive:true,force:true});}
+});

@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind authenticated workspace owners and release ended owners safely
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-workspace reap-ended-owners --execute --bind-budget-ms 15000 --bind-max-records 128 --budget-ms 90000 --max-records 64 --json
+TimeoutStartSec=120
+TimeoutStopSec=5
+KillMode=control-group
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=100%
