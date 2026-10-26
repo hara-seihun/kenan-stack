@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {main,workspaceTesting} from './workspace.mjs';
-import {bindNativeOwner,nativeOwnerBinding} from './native-owner.mjs';
+import {bindNativeOwner,unbindNativeOwner,nativeOwnerBinding} from './native-owner.mjs';
 const AGENT='22222222-2222-4222-8222-222222222222';
 function fixture(action){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'native-owner-integration-')),source=path.join(root,'checkout'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3'),native=path.join(root,'native.json');
@@ -16,7 +16,7 @@ function fixture(action){
  const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');git('-C',source,'commit','--allow-empty','-m','initial');git('-C',source,'push','origin','main');
-  const record=run(['register','--path',source,'--root',root,'--owner','task-label','--json']);db=workspaceTesting.openRegistry(state);
+  const record=run(['register','--path',source,'--root',root,'--owner','task-label','--json']);db=workspaceTesting.openRegistry(state);unbindNativeOwner(db,record.id);
   const bind=()=>bindNativeOwner(db,record.id,{agentId:AGENT,channel:'beta',callId:'call_123'},'caller-scope',{fixture:true});
   const observe=(agentState,wakes=[])=>fs.writeFileSync(native,JSON.stringify({errors:[],agents:[{id:AGENT,channel:'beta',role:'worker',state:agentState,archived:agentState==='stopped',goalId:null,updatedAt:1}],wakes,observations:[],observedAt:Date.now()}));
   const release=(execute=false)=>run(['release-ended-owners','--id',record.id,...(execute?['--execute']:[]),'--json']);
@@ -65,7 +65,7 @@ for(const guard of ['live','dirty','unpushed','wake'])test('periodic reaper reta
 test('bounded binding pages persist fair progress, wrap past unbindable records, and explicit cursors finish',()=>fixture(f=>{
  const records=[f.record];for(let i=0;i<4;i++){
   const dir=path.join(f.root,'checkout-'+i);f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
-  records.push(f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']));
+  records.push(f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']));unbindNativeOwner(f.db,records.at(-1).id);
  }
  const seen=[];const invoke=(extra=[])=>workspaceTesting.bindNativeOwnersCommand(f.db,f.args([['root',f.root],['execute',true],['max-records',2],...extra]),f.state,{authenticate:f.authenticated});
  for(let n=0;n<3;n++){const page=invoke();assert.ok(page.examined<=2);seen.push(...page.results.map(x=>x.record.id));}
@@ -80,7 +80,7 @@ test('bounded binding pages persist fair progress, wrap past unbindable records,
 test('binding caps the entire authentication pass at 512 pairs and continues the deferred record next pass',()=>fixture(f=>{
  f.receipt(f.record,400);
  const dir=path.join(f.root,'checkout-z');f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
- const other=f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']);f.receipt(other,200);
+ const other=f.run(['register','--path',dir,'--root',f.root,'--owner','task-label','--json']);unbindNativeOwner(f.db,other.id);f.receipt(other,200);
  const batches=[];const invoke=()=>workspaceTesting.bindNativeOwnersCommand(f.db,f.args([['root',f.root],['execute',true],['max-records',512]]),f.state,{authenticate:pairs=>{batches.push(pairs.length);return f.authenticated(pairs);}});
  assert.equal(invoke().examined,1);assert.equal(invoke().examined,1);assert.deepEqual(batches,[400,200]);
 }));
@@ -121,4 +121,23 @@ test('an archived original owner cannot release publisher-adopted native plan he
  process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=data;
  try{f.bind();f.observe('stopped');const result=f.release(true);assert.equal(fs.existsSync(f.source),true,JSON.stringify(result));assert.equal(result.results[0].inspection.classification,'referenced');assert.equal(result.results[0].inspection.currentStackReferences[0].kind,'native_root_plan');}
  finally{if(old===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=old;}
+}));
+for(const parent of ['77777777-7777-4777-8777-777777777777','manager:converge'])test('ended child transfers exact checkout to live native parent '+parent,()=>fixture(f=>{
+ f.bind();f.observe('stopped');
+ const value=JSON.parse(fs.readFileSync(path.join(f.root,'native.json')));
+ value.agents[0].parentAgentId=parent;value.agents.push({id:parent,channel:'beta',role:'worker',state:'running',archived:false});
+ fs.writeFileSync(path.join(f.root,'native.json'),JSON.stringify(value));
+ const before=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id);
+ const result=f.release(true);assert.equal(result.results[0].action,'transferred-to-parent',JSON.stringify(result));
+ const after=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id);
+ for(const key of ['id','path','source_commit','lease_expires_at','state','creation_request'])assert.equal(after[key],before[key],key);
+ assert.equal(after.owner,parent);assert.equal(fs.existsSync(f.source),true);
+ assert.equal(f.db.prepare('SELECT count(*) AS n FROM workspace_parent_custody WHERE workspace_id=?').get(f.record.id).n,1);
+ assert.equal(f.release(true).results[0]?.action==='released',false);
+ assert.equal(fs.existsSync(f.source),true);
+}));
+test('a native child with an unobservable parent is retained without forging ownership',()=>fixture(f=>{
+ f.bind();f.observe('stopped');const file=path.join(f.root,'native.json'),value=JSON.parse(fs.readFileSync(file));
+ value.agents[0].parentAgentId='77777777-7777-4777-8777-777777777777';fs.writeFileSync(file,JSON.stringify(value));
+ assert.equal(f.release(true).results[0].code,'parent-custody-unknown');assert.equal(fs.existsSync(f.source),true);
 }));

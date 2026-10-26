@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {nativeCaller, nativeOwnerBinding, admissionReceipts, authenticateToolCalls, receiptBinding} from './native-owner.mjs';
-import {OWNER_AGENT_ID} from './owner-liveness.mjs';
+import {OWNER_AGENT_ID,NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
 
 const refused = (code, detail) => ({ok:false, error:{code, detail}});
 const server = /^\/srv\/kenan\/[a-z][a-z0-9-]{0,23}\/dist\/server\/main\.js$/;
@@ -28,7 +28,7 @@ export function releaseCaller({caller=nativeCaller, pid=process.pid,
 }
 
 function ownerOf(database,record,statePath,deadline,authenticate) {
-  if(OWNER_AGENT_ID.test(record.owner))return {ok:true,agentId:record.owner,channel:null};
+  if(NATIVE_CUSTODIAN_ID.test(record.owner))return {ok:true,agentId:record.owner,channel:null};
   const binding=nativeOwnerBinding(database,record.id);
   if(binding.state==='set')return {ok:true,agentId:binding.agentId,channel:binding.channel};
   const request=database.prepare('SELECT creation_request FROM workspace WHERE id=?').get(record.id)?.creation_request;
@@ -47,7 +47,7 @@ export function authorizeWorkspaceRelease(database,records,statePath,{caller=rel
   const self=caller();
   if(!self.ok)return self;
   if(self.kind==='operator')return {ok:true,kind:'operator'};
-  if(self.kind!=='native'||!OWNER_AGENT_ID.test(self.binding?.agentId??''))
+  if(self.kind!=='native'||!NATIVE_CUSTODIAN_ID.test(self.binding?.agentId??''))
     return refused('release-caller-unverified','An authenticated native caller is required.');
   const binding=self.binding;
   const authentication=authenticate([binding],{deadline});

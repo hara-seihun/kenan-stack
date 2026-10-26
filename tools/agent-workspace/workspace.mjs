@@ -59,7 +59,7 @@ import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
-import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences } from "./owner-liveness.mjs";
+import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
@@ -1028,39 +1028,6 @@ function stripCaches(record, statePath, invalidateCapacity, observeLink) {
   return removed;
 }
 
-function killProcessReferences(references) {
-  for (const reference of references) {
-    try { process.kill(reference.pid, "SIGTERM"); } catch {}
-  }
-  const until = Date.now() + 2_000;
-  const pause = new Int32Array(new SharedArrayBuffer(4));
-  while (Date.now() < until) {
-    if (references.every((reference) => {
-      try { process.kill(reference.pid, 0); return false; } catch { return true; }
-    })) return;
-    Atomics.wait(pause, 0, 0, 50);
-  }
-  for (const reference of references) {
-    try { process.kill(reference.pid, "SIGKILL"); } catch {}
-  }
-}
-
-function removeDockerReferences(references) {
-  if (references.length === 0) return;
-  run("docker", ["rm", "--force", ...references.map((reference) => reference.id)], { timeout: 30_000 });
-}
-
-function stopSystemdReferences(references) {
-  const systemUnits = references.filter((reference) => reference.manager === "system");
-  if (systemUnits.length > 0) {
-    fail(`system units require their owning service lifecycle: ${systemUnits.map((unit) => unit.id).join(", ")}`);
-  }
-  const userUnits = references.filter((reference) => reference.manager === "user");
-  if (userUnits.length > 0) {
-    run("systemctl", ["--user", "stop", ...userUnits.map((unit) => unit.id)], { timeout: 30_000 });
-  }
-}
-
 function removeWorkspace(record, statePath) {
   if (record.checkoutType === "worktree") {
     assertUnfrozenCustody(record.path);
@@ -1182,16 +1149,6 @@ function reconcileRecord(database, record, options) {
     }
     return { record, inspection, action: options.execute ? "forgot-missing" : "would-forget-missing" };
   }
-  if (inspection.classification === "referenced" && options.execute && options.reapExpired && !options.preserveRuntime) {
-    const current = recordBy(database, { id: record.id });
-    if (current.leaseExpiresAt > Date.now()) return { record: current, inspection: inspectRecord(current), action: "lease-renewed" };
-    updateState(database, current, "reclaiming", "expired lease is fencing live references");
-    stopSystemdReferences(inspection.systemdUnits);
-    removeDockerReferences(inspection.containers);
-    killProcessReferences(inspection.processes);
-    safety = safetySnapshot(database);
-    inspection = inspectRecord({ ...current, state: "reclaiming" }, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
-  }
   if (inspection.classification === "referenced" || inspection.classification === "blocked") {
     if (options.execute) updateState(database, record, inspection.classification, inspection.reason);
     return { record, inspection, action: "none" };
@@ -1263,19 +1220,6 @@ function groupReconciliation(database, records, options) {
   let inspections = records.map((record) => inspectRecord(record,
     groupInspectionOptions(record, records, { ignoreLease: true, safety, deadline: options.deadline,terminalSourceTransfer:options.terminalSourceTransfer===true })));
   if(inspections.some(inspection=>inspection.currentStackQueueProtected)) return records.map((record,index)=>({record,inspection:inspections[index],action:"none"}));
-  if (options.execute && options.reapExpired && !options.preserveRuntime && inspections.some((inspection) => inspection.classification === "referenced")) {
-    const current = records.map((record) => recordBy(database, { id: record.id }));
-    if (!options.ignoreLease && current.some((record) => record.leaseExpiresAt > Date.now())) {
-      return groupReconciliation(database, current, { ...options, execute: false });
-    }
-    const systemUnits = inspections.flatMap((inspection) => inspection.systemdUnits);
-    stopSystemdReferences(systemUnits);
-    removeDockerReferences(inspections.flatMap((inspection) => inspection.containers));
-    killProcessReferences(inspections.flatMap((inspection) => inspection.processes));
-    safety = safetySnapshot(database);
-    inspections = records.map((record) => inspectRecord(record,
-      groupInspectionOptions(record, records, { ignoreLease: true, safety, deadline: options.deadline,terminalSourceTransfer:options.terminalSourceTransfer===true })));
-  }
 
   const preserveKnownSource = inspections.some((inspection)=>inspection.sourceRetention===true);
   const removedCaches = new Map();
@@ -3603,9 +3547,9 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
           processes:safety.references, containers:[], systemdUnits:[]};
       }
       const snapshot = safetySnapshot(database);
-      const protection = stackQueueInspection(stackQueueSafety([record.path], snapshot, "physical-checkout", deadline));
+      const protection = stackQueueInspection(stackQueueSafety([record.path], snapshot, automatic ? "source" : "physical-checkout", deadline));
       if (protection) return protection;
-      return inspectRecord(record, {ignoreLease:true, safety:snapshot, deadline,terminalSourceTransfer:true});
+      return inspectRecord(record, {ignoreLease:true, safety:snapshot, deadline,terminalSourceTransfer:!automatic});
     };
     return withGrowthBorrowerLocks(database, record, () => {
       let inspection = observe();
@@ -3798,7 +3742,7 @@ function releaseCommand(database, args, statePath, authorityDependencies) {
 // The ordinary release transition shared by an owner's explicit release and by the
 // owner-liveness release of an authentically ended native owner. Only the future-growth
 // settlement (and its owner evidence) differs; every safety observation is identical.
-function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity) {
+function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
   const deadline=Math.min(Date.now()+35_000, outerDeadline);
@@ -3814,7 +3758,7 @@ function ordinaryRelease(database, records, args, statePath, settle, outerDeadli
       ignoreLease: true,
       statePath,
       safety: safetySnapshot(database),
-      terminalSourceTransfer:true,
+      terminalSourceTransfer:!protectSourceIntent,
     })).map(leaseReleaseDisposition);
   } catch (error) {
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
@@ -3952,6 +3896,28 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
     const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline);
     if (freshRefusal) return { refused: locked.current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: locked.verdicts[index], action: "none", ...freshRefusal })) };
     const byId = new Map(locked.current.map((record, index) => [record.id, locked.verdicts[index]]));
+    const parents=locked.current.map(record=>parentCustody(canonicalNativeOwner(database,record),locked.fresh));
+    if(parents.some(p=>p.kind==='unknown'))return {refused:locked.current.map(record=>({record:endedOwnerSummary(record),action:'none',code:'parent-custody-unknown'}))};
+    if(parents.some(p=>p.kind==='transfer')){
+      // Group custody cannot be split by cleanup. Transfer only a complete proved group.
+      if(parents.some(p=>p.kind!=='transfer'))return {refused:locked.current.map(record=>({record:endedOwnerSummary(record),action:'none',code:'parent-custody-group-incomplete'}))};
+      database.exec(`CREATE TABLE IF NOT EXISTS workspace_parent_custody(workspace_id TEXT PRIMARY KEY,child_owner TEXT NOT NULL,parent_owner TEXT NOT NULL,evidence_json TEXT NOT NULL,occurred_at INTEGER NOT NULL)`);
+      database.exec('BEGIN IMMEDIATE');
+      try{
+        const results=locked.current.map((record,index)=>{
+          const parent=parents[index],now=Date.now();
+          const authorization=JSON.stringify({kind:'native-ended-child-parent-custody',...parent});
+          if(record.sourceCommit!==null)database.prepare(`INSERT INTO workspace_reassignment(workspace_id,path,old_owner,old_source_commit,new_owner,new_source_commit,authorization,occurred_at) VALUES(?,?,?,?,?,?,?,?)`)
+            .run(record.id,record.path,record.owner,record.sourceCommit,parent.parent,record.sourceCommit,authorization,now);
+          database.prepare(`INSERT INTO workspace_parent_custody(workspace_id,child_owner,parent_owner,evidence_json,occurred_at) VALUES(?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET child_owner=excluded.child_owner,parent_owner=excluded.parent_owner,evidence_json=excluded.evidence_json,occurred_at=excluded.occurred_at`).run(record.id,record.owner,parent.parent,authorization,now);
+          database.prepare('UPDATE workspace SET owner=?,updated_at=? WHERE id=?').run(parent.parent,now,record.id);
+          // The parent relationship is native evidence, never a fabricated parent tool call.
+          reassignNativeOwner(database,record.id,null,null);
+          return {record:endedOwnerSummary(recordBy(database,{id:record.id})),action:'transferred-to-parent',custody:parent,sourceDeleted:false};
+        });
+        database.exec('COMMIT');return {refused:results};
+      }catch(error){database.exec('ROLLBACK');throw error;}
+    }
     // Ending a reservation does not require admitting new growth. The same terminal
     // release checks source reachability and strict runtime cessation before deletion.
     // Missing paths have no bytes to delete, even when their historical owner is unknown.
@@ -3964,7 +3930,7 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
       }
     }
     const releaseArgs = { positional: [], named: new Map([["preserve-runtime", ["true"]]]) };
-    return { byId, fresh: locked.fresh, settled: ordinaryRelease(database, locked.current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId), options.deadline) };
+    return { byId, fresh: locked.fresh, settled: ordinaryRelease(database, locked.current, releaseArgs, options.statePath, settleEndedOwnerFutureGrowth(byId), options.deadline, true) };
   }, group[0].groupId, options.deadline);
   if (released.refused) return released.refused;
   // A retained tree whose sample was stale is measured outside every lifecycle lock, then the

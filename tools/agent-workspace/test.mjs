@@ -3545,7 +3545,7 @@ test("unknown ignored output requires repair", () => {
   }
 });
 
-for (const grouped of [false, true]) test(`expired live references require an explicit reap; preserve-runtime retains ${grouped ? "groups" : "individuals"}`, async () => {
+for (const grouped of [false, true]) test(`expired live references survive every cleanup flag until actual cessation for ${grouped ? "groups" : "individuals"}`, async () => {
   const f = fixture();
   let sleeper;
   try {
@@ -3582,9 +3582,14 @@ exec ${systemctl} "$@"
     assert.equal((grouped ? released.find(result => result.record.id === created.id) : released).inspection.classification, "referenced");
     assert.equal(sleeper.exitCode, null);
     const reaped = JSON.parse(await runAsync(["release", "--id", created.id, "--reap-expired", "--json"], liveSafety));
-    assert.equal((grouped ? reaped[0] : reaped).action, grouped ? "released-group" : "released",JSON.stringify(reaped));
-    assert.equal(existsSync(created.path), false);
+    assert.equal((grouped ? reaped.find(result => result.record.id === created.id) : reaped).inspection.classification, "referenced",JSON.stringify(reaped));
+    assert.equal(existsSync(created.path), true);
+    assert.equal(sleeper.exitCode, null);
+    sleeper.kill("SIGTERM");
     await exited;
+    const settled = JSON.parse(await runAsync(["release", "--id", created.id, "--json"], liveSafety));
+    assert.equal((grouped ? settled[0] : settled).action, grouped ? "released-group" : "released", JSON.stringify(settled));
+    assert.equal(existsSync(created.path), false);
   } finally {
     sleeper?.kill("SIGKILL");
     f.close();

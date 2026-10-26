@@ -1,3 +1,5 @@
+import {qualificationReferences} from './qualification-references.mjs';
+import {unbindNativeOwner} from './native-owner.mjs';
 import './scratch-env.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -6,8 +8,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
-const {ownerLivenessSql,observeOwnerLiveness,classifyOwner,pendingWakeReferences,OWNER_AGENT_ID}=await import(process.env.WORKSPACE_OWNER_LIVENESS_MODULE||'./owner-liveness.mjs');
-const {main}=await import(process.env.WORKSPACE_RELEASE_MODULE||'./workspace.mjs');
+const {ownerLivenessSql,observeOwnerLiveness,classifyOwner,pendingWakeReferences,OWNER_AGENT_ID,parentCustody}=await import(process.env.WORKSPACE_OWNER_LIVENESS_MODULE||'./owner-liveness.mjs');
+const {main,workspaceTesting}=await import(process.env.WORKSPACE_RELEASE_MODULE||'./workspace.mjs');
 
 const LIVE='11111111-1111-4111-8111-111111111111',STOPPED='22222222-2222-4222-8222-222222222222',ARCHIVED='33333333-3333-4333-8333-333333333333';
 const WAKING='44444444-4444-4444-8444-444444444444',ABSENT='55555555-5555-4555-8555-555555555555',HELDGOAL='66666666-6666-4666-8666-666666666666';
@@ -29,6 +31,7 @@ test('actual PostgreSQL owner observation: only positive stopped/archived rows e
   let sql=schema;
   for(const [id,state,archived,goal] of [[LIVE,'idle',false,GOAL],[STOPPED,'stopped',false,GOAL],[ARCHIVED,'running',true,null],[WAKING,'stopped',false,null],[HELDGOAL,'stopped',true,OTHERGOAL]])
    sql+=`INSERT INTO agent VALUES(${literal(id)},'worker',${literal(state)},${archived},${literal(goal)},1);\n`;
+  sql+=`ALTER TABLE agent ADD COLUMN parent_agent_id text; UPDATE agent SET parent_agent_id=${literal(LIVE)} WHERE id=${literal(STOPPED)};`;
   let n=0;const wake=(agent,status,message,{goal=null,held=null,handoff=null,event=null}={})=>{sql+=`INSERT INTO wake VALUES('00000000-0000-4000-8000-${String(++n).padStart(12,'0')}',${literal(agent)},${literal(message)},${event===null?'NULL':literal(JSON.stringify(event))+'::jsonb'},${literal(status)},${n},${literal(goal)},${literal(held)},${literal(handoff)});\n`;};
   wake(WAKING,'pending','resume the build');
   wake('manager:converge','pending','check later',{goal:GOAL,handoff:"Consume work/clones/held-ws-7ed and report"});
@@ -40,6 +43,7 @@ test('actual PostgreSQL owner observation: only positive stopped/archived rows e
   const owners=[LIVE,STOPPED,ARCHIVED,WAKING,ABSENT,HELDGOAL,'task-name-owner'];
   const observation=observeOwnerLiveness(owners,{deadline:Date.now()+20000,channels:()=>['beta'],execute,user:()=>'fixture'});
   assert.deepEqual(observation.errors,[]);
+  assert.equal(parentCustody(STOPPED,observation).parent,LIVE);
   assert.equal(observation.wakes.length,4,'settled wakes are history, every pending wake is read');
   const kinds=Object.fromEntries(owners.map(owner=>[owner,classifyOwner(owner,observation)]));
   assert.equal(kinds[LIVE].kind,'live');
@@ -89,7 +93,7 @@ function fixture(owner,action){
   fs.writeFileSync(path.join(source,'.gitignore'),'node_modules/\n');fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');
   const initial=git('-C',source,'rev-parse','HEAD');
   let out='';const write=process.stdout.write;process.stdout.write=x=>{out+=x;return true;};try{main(['register','--path',source,'--root',root,'--owner',owner,'--source-commit',initial,'--lease-seconds','86400','--json'],state);}finally{process.stdout.write=write;}
-  const record=JSON.parse(out);db=new DatabaseSync(state);
+  const record=JSON.parse(out);db=new DatabaseSync(state);unbindNativeOwner(db,record.id);
   const priced=()=>{const st=fs.statSync(source),now=Date.now(),plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096};
    db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify(plan));
    db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));return plan;};
@@ -236,4 +240,28 @@ test('retained frozen handoff returns typed refusal without terminal effects',()
 test('previously interrupted terminal reclamation is observed and safely resumed',()=>fixture(ARCHIVED,f=>{
  f.priced();f.observe(ended(ARCHIVED));f.db.prepare("UPDATE workspace SET state='reclaiming',lease_expires_at=0 WHERE id=?").run(f.record.id);
  const result=f.release('--execute');assert.equal(result.results[0].action,'released');assert.equal(f.row().state,'released');assert.equal(fs.existsSync(f.source),false);
+}));
+test('owner cleanup must retain a live publisher source intent even between physical test units',()=>fixture(STOPPED,f=>{
+ f.observe(ended(STOPPED));
+ // Inject the same native observation returned by the queue census into the shared safety snapshot.
+ const original=f.db.prepare('SELECT lease_expires_at FROM workspace WHERE id=?').get(f.record.id);
+ const safety={currentStackQueue:{errors:[],references:[{kind:'agent',id:LIVE,state:'running',resourceClass:'source-intent'}]}};
+ // The direct inspection exercises the exact resource-kind switch used by automatic cleanup.
+ const inspection=workspaceTesting.inspectRecord(f.record,{ignoreLease:true,safety,terminalSourceTransfer:false,deadline:Date.now()+10000});
+ assert.equal(inspection.currentStackQueueProtected,true);assert.equal(inspection.classification,'referenced');
+ assert.equal(fs.existsSync(f.source),true);assert.equal(f.row().lease_expires_at,original.lease_expires_at);
+}));
+
+test('publisher plan custody survives owner termination and ends only with exact dependency settlement',()=>fixture(STOPPED,f=>{
+ f.observe(ended(STOPPED));const previous=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;
+ const dataRoot=path.join(f.root,'data'),directory=path.join(dataRoot,'root-plans');fs.mkdirSync(directory,{recursive:true});
+ process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=dataRoot;
+ try{
+   const plan={commit:f.record.sourceCommit,checkout:f.source,stages:{tests:{argv:['/bin/true',f.source]}}};
+   const file=path.join(directory,'publisher-source.plan.json');fs.writeFileSync(file,JSON.stringify(plan));
+   const held=f.release('--execute');assert.equal(fs.existsSync(f.source),true);assert.notEqual(held.results[0].action,'released');
+   const {references}=qualificationReferences(null,{dataRoot});const ref=references.find(r=>r.evidence===file);
+   fs.writeFileSync(file+'.custody-released.json',JSON.stringify({state:'released',planSha256:ref.planSha256,owner:'publisher',reason:'Activation consumed the exact proof and rollback custody was adopted.',paths:ref.paths}));
+   const finished=f.release('--execute');assert.equal(finished.results[0].action,'released',JSON.stringify(finished));assert.equal(fs.existsSync(f.source),false);
+ }finally{if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=previous;}
 }));

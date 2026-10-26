@@ -22,6 +22,7 @@ import {kenanChannels,channelDatabase,KENAN_PG_SOCKET_DIR} from './cache-queue.m
 // Pending wakes (held triggers and ordinary wakes) that name the workspace path or its basename,
 // or held triggers for the ended owner's goal, keep the checkout for the worker that will resume.
 
+export const NATIVE_CUSTODIAN_ID=/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|manager:[a-z][a-z0-9-]{0,63})$/;
 export const OWNER_AGENT_ID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CHANNEL=/^[a-z][a-z0-9-]{0,23}$/;
 const MAX_OWNERS=512,MAX_WAKES=5000;
@@ -31,7 +32,7 @@ export function ownerLivenessSql(owners){
  const list=owners.length?`ARRAY[${owners.map(owner=>`'${owner}'`).join(',')}]::text[]`:`ARRAY[]::text[]`;
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='4000ms';
  SELECT json_build_object(
-  'agents',coalesce((SELECT json_agg(json_build_object('id',a.id,'role',a.role,'state',a.state,'archived',a.archived,'goalId',a.goal_id,'updatedAt',a.updated_at)) FROM agent a WHERE a.id=ANY(${list})),'[]'::json),
+  'agents',coalesce((SELECT json_agg(json_build_object('id',a.id,'role',a.role,'state',a.state,'archived',a.archived,'goalId',a.goal_id,'updatedAt',a.updated_at,'parentAgentId',to_jsonb(a)->>'parent_agent_id')) FROM agent a WHERE a.id=ANY(${list}) OR a.id IN (SELECT to_jsonb(child)->>'parent_agent_id' FROM agent child WHERE child.id=ANY(${list}))),'[]'::json),
   'wakeCount',(SELECT count(*) FROM wake w WHERE w.status='pending'),
   'wakes',coalesce((SELECT json_agg(json_build_object('id',w.id,'agentId',w.agent_id,'goalId',w.goal_id,'heldFor',w.held_for,'held',w.handoff IS NOT NULL,'text',concat_ws(E'\\n',w.message,w.handoff,w.event::text))) FROM (SELECT * FROM wake WHERE status='pending' ORDER BY created_at LIMIT ${MAX_WAKES}) w),'[]'::json)); ROLLBACK;`;
 }
@@ -71,7 +72,7 @@ export function classifyOwner(owner,observation){
  const wakes=observation.wakes.filter(w=>w.agentId===owner||w.heldFor===owner);
  if(wakes.length)return {kind:'live',code:'owner-pending-wake',owner,wakes:wakes.map(w=>({id:w.id,channel:w.channel}))};
  return {kind:'ended',code:rows.every(a=>a.archived===true)?'owner-archived':'owner-stopped',owner,
-  agents:rows.map(a=>({id:a.id,channel:a.channel,role:a.role,state:a.state,archived:a.archived,goalId:a.goalId??null,updatedAt:a.updatedAt??null}))};
+  agents:rows.map(a=>({id:a.id,channel:a.channel,role:a.role,state:a.state,archived:a.archived,goalId:a.goalId??null,updatedAt:a.updatedAt??null,parentAgentId:a.parentAgentId??null}))};
 }
 
 const boundary=/[A-Za-z0-9_.-]/;
@@ -89,4 +90,19 @@ export function pendingWakeReferences(workspacePath,observation,ownerVerdict){
  return (observation?.wakes??[]).filter(w=>w.text.includes(workspacePath)||namesToken(w.text,base)||(w.held&&w.goalId&&goals.has(w.goalId)))
   .map(w=>({kind:'pending-wake',id:w.id,channel:w.channel,agentId:w.agentId,goalId:w.goalId??null,held:w.held===true,
    match:w.text.includes(workspacePath)?'path':namesToken(w.text,base)?'basename':'owner-goal-held-trigger'}));
+}
+
+// Only native store lineage transfers custody. A missing parent is uncertainty, not disposal authority.
+export function parentCustody(owner,observation){
+ const verdict=classifyOwner(owner,observation);
+ if(verdict.kind!=='ended')return {kind:'none'};
+ const children=observation.agents.filter(a=>a.id===owner);
+ if(children.every(a=>a.parentAgentId==null))return {kind:'none'};
+ const identities=new Set(children.map(a=>a.channel+'\0'+a.parentAgentId));
+ if(identities.size!==1)return {kind:'unknown',code:'parent-custody-ambiguous'};
+ const child=children[0],parent=child.parentAgentId;
+ if(!NATIVE_CUSTODIAN_ID.test(parent??'')||parent===owner)return {kind:'unknown',code:'parent-custody-invalid'};
+ const rows=observation.agents.filter(a=>a.id===parent);
+ if(rows.length!==1||rows[0].channel!==child.channel)return {kind:'unknown',code:'parent-custody-unavailable'};
+ return {kind:'transfer',parent,channel:child.channel,child:owner,observedAt:observation.observedAt};
 }

@@ -3,7 +3,7 @@ import path from 'node:path';
 import {userInfo} from 'node:os';
 import {boundedCommand} from './bounded-command.mjs';
 import {callerToolCall,channelDatabase,kenanChannels,KENAN_PG_SOCKET_DIR} from './cache-queue.mjs';
-import {OWNER_AGENT_ID} from './owner-liveness.mjs';
+import {OWNER_AGENT_ID,NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
 
 // Canonical native owner binding.
 //
@@ -33,7 +33,7 @@ export function ensureNativeOwnerTable(database){
 }
 
 function validBinding(value){
- return value!==null&&typeof value==='object'&&OWNER_AGENT_ID.test(value.agentId??'')&&CHANNEL.test(value.channel??'')&&CALL_ID.test(value.callId??'');
+ return value!==null&&typeof value==='object'&&NATIVE_CUSTODIAN_ID.test(value.agentId??'')&&CHANNEL.test(value.channel??'')&&CALL_ID.test(value.callId??'');
 }
 
 // The authenticated caller of this process, or null when it is not a native worker tool call.
@@ -118,7 +118,7 @@ export function admissionReceipts(statePath,workspaceId,creationRequest,{deadlin
 
 const literal=value=>"'"+value.replaceAll("'","''")+"'";
 export function toolCallAuthenticationSql(pairs){
- if(!Array.isArray(pairs)||!pairs.length||pairs.length>MAX_PAIRS||pairs.some(pair=>!OWNER_AGENT_ID.test(pair.agentId)||!CALL_ID.test(pair.callId)))throw new Error('bounded exact (agent, tool call) pairs required');
+ if(!Array.isArray(pairs)||!pairs.length||pairs.length>MAX_PAIRS||pairs.some(pair=>!NATIVE_CUSTODIAN_ID.test(pair.agentId)||!CALL_ID.test(pair.callId)))throw new Error('bounded exact (agent, tool call) pairs required');
  const values=pairs.map(pair=>`(${literal(pair.agentId)},${literal(pair.callId)})`).join(',');
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='8000ms';
  WITH requested(agent_id,call_id) AS (VALUES ${values}),
