@@ -974,3 +974,8 @@ and shared headroom, and can journal consumption only once. A fleet sampling
 command can finish successfully with explicitly reported deferred rows; admission
 continues sampling the rows it needs within its own deadline rather than assuming
 that an exit status of zero made the entire fleet fresh.
+
+Successful sample publication waits for its actual remaining bounded budget, up
+to 30 seconds, at the device fence. It does not use the 100 ms traversal lock
+probe as an activation deadline: forty concurrent creators may serialize their
+atomic journal commits without losing their completed measurements.

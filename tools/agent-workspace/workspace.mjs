@@ -4698,7 +4698,8 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
   database.prepare("INSERT OR REPLACE INTO workspace_capacity_attempt VALUES(?,?)").run(row.id,Date.now());
   const store = sample => sample.ok
     ? withResourceLock(statePath, `capacity:${row.device_id}`,
-        () => persistAllocationSample(database, row, sample), deadline)
+        () => persistAllocationSample(database, row, sample), undefined,
+        {waitMs: Math.max(0, Math.min(30_000, deadline - Date.now()))})
     : persistAllocationSample(database, row, sample);
 
   try {
