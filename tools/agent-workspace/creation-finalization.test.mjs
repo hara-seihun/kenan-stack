@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import {main,workspaceTesting} from './workspace.mjs';
 import {withContentObservation,observeInodeContent} from './inode-content.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
@@ -42,7 +43,7 @@ test('admitted construction finalizes after unrelated samples become stale, pres
 });
 test('actual link-count change during hashing leaves valid allocation but incomplete idleness proof, never an activation failure',t=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'hash-race-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));const file=path.join(root,'payload'),link=path.join(root,'new-link');fs.writeFileSync(file,'payload bytes');
- const db=workspaceTesting.openRegistry(':memory:');t.after(()=>db.close());const read=fs.readSync;let changed=false;
+ const db=new DatabaseSync(':memory:');t.after(()=>db.close());const read=fs.readSync;let changed=false;
  fs.readSync=(...a)=>{const n=read(...a);if(!changed&&n){changed=true;fs.linkSync(file,link);}return n;};
  let proof;try{proof=observeInodeContent(file);}finally{fs.readSync=read;}
  assert.equal(proof.complete,false);assert.equal(proof.record,undefined);assert.ok(fs.statSync(file).nlink>1);
