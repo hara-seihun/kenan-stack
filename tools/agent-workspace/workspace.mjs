@@ -2592,7 +2592,7 @@ function sourceTree(repository, commit, sparsePatterns) {
   return { entries, selected };
 }
 
-function hasObjectClosure(mirror, commit, sparsePatterns = []) {
+function hasObjectClosure(mirror, commit, sparsePatterns = [], refresh = false) {
   if (!existsSync(mirror) || existsSync(path.join(mirror, "objects", "info", "alternates"))) return false;
   const before = objectStoreStamp(mirror);
   if (before === null) return false;
@@ -2601,7 +2601,7 @@ function hasObjectClosure(mirror, commit, sparsePatterns = []) {
   const file = path.join(directory, `${key}.json`);
   if (existsSync(file)) {
     const cached = JSON.parse(readFileSync(file, "utf8"));
-    if (cached.version === 1 && cached.stamp === before && cached.commit === commit) return true;
+    if (!refresh && cached.version === 1 && cached.stamp === before && cached.commit === commit) return true;
   }
   let verified;
   if (sparsePatterns.length === 0) {
@@ -2931,21 +2931,24 @@ function revalidatePreparedSource(value, input, sourceCommit) {
   try { return revalidatePreparedSourceWithinBudget(value, input, sourceCommit); }
   finally { sourcePreparationMode = priorMode; sourcePreparationDeadline = priorDeadline; }
 }
-function revalidatePreparedSourceWithinBudget(value, input, sourceCommit) {
+function revalidatePreparedSourceWithinBudget(value, input, sourceCommit, fenced = false) {
   if (value?.sourceCommit !== sourceCommit || value.plan?.sourceCommit !== sourceCommit) return null;
   const stamp = objectStoreStamp(input.mirror);
   if (stamp === null) return null;
   assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
   assertSourceCheckoutFilters(input.mirror);
-  if (!hasObjectClosure(input.mirror, sourceCommit, input.sparsePatterns)) return null;
-  if (objectStoreStamp(input.mirror) !== stamp) throw new SourcePreparationRequired();
-  return { ...value, stamp };
+  if (!hasObjectClosure(input.mirror, sourceCommit, input.sparsePatterns, fenced)) return null;
+  if (!fenced && objectStoreStamp(input.mirror) !== stamp) throw new SourcePreparationRequired();
+  assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
+  assertSourceCheckoutFilters(input.mirror);
+  if (existsSync(path.join(input.mirror, "objects", "info", "alternates"))) return null;
+  return { ...value, stamp: objectStoreStamp(input.mirror) };
 }
 
 // A foreground deadline is not failed closure evidence. Continue the read-only
 // proof in a durable child of the completed request, leaving its pointer, result,
 // import identity and capacity accounting untouched.
-function refreshCompletedSource(value, input, sourceCommit, receipt, key, originalJobId = null) {
+function refreshCompletedSource(value, input, sourceCommit, receipt, key, originalJobId = null, args = null) {
   try {
     const refreshed = revalidatePreparedSource(value, input, sourceCommit);
     return refreshed === null ? null : { state: "ready", value: refreshed };
@@ -2958,7 +2961,7 @@ function refreshCompletedSource(value, input, sourceCommit, receipt, key, origin
   if (request !== null && existsSync(path.join(jobs, sourceJobId(`${key}:revalidation`, request), "result.json"))) request = null;
   if (request === null) {
     request = { kind: "completed-source-revalidation", input, sourceCommit, value,
-      receipt, originalJobId, observedStamp: objectStoreStamp(input.mirror) };
+      receipt, originalJobId, args: args?.named.has("root") && args.named.has("name") ? [...args.named] : null, observedStamp: objectStoreStamp(input.mirror) };
     writePreparationReceipt(continuationPath, request);
   }
   const job = runSourceJob({ directory: jobs,
@@ -2984,25 +2987,30 @@ function sourceRevalidationWorker() {
   const directory = process.env.PI_WORKSPACE_SOURCE_JOB_DIR;
   const loaded = readSourceJobRequest(directory);
   if (!loaded.ok) fail(loaded.error.message);
-  const { input, value, sourceCommit, receipt } = loaded.value;
+  const { input, value, sourceCommit, receipt, args: named } = loaded.value;
   sourcePreparationMode = "worker";
+  const database = openRegistry(input.statePath);
   try {
-    // Standard imports hold this same mirror fence shared. Revalidation is
-    // read-only and takes it exclusive so unrelated imports cannot starve proof.
-    const refreshed = withResourceLock(input.statePath, `mirror:${input.mirror}`, () => {
-      for (let attempt = 0; attempt < 8; attempt++) {
-        try { return revalidatePreparedSourceWithinBudget(value, input, sourceCommit); }
-        catch (error) { if (!(error instanceof SourcePreparationRequired)) throw error; }
-      }
-      fail("shared mirror kept changing during completed source revalidation; original request retained");
-    });
+    // Complete validation and the original admission in one mirror transaction.
+    // A later foreground observer sees the admitted row, not an obsolete global
+    // stamp. Imports cannot starve this proof and no new import is performed.
+    const refreshed = withWorkspaceLock(database, input.destination, () =>
+      withResourceLock(input.statePath, `source-preparation:${input.destination}`, () =>
+        withResourceLock(input.statePath, `mirror:${input.mirror}`, () => {
+          const proof = revalidatePreparedSourceWithinBudget(value, input, sourceCommit, true);
+          if (proof !== null && named !== null && named !== undefined) {
+            const args = { named: new Map(named), positional: [] };
+            reservePreparedCreation(database, args, input.statePath, input, proof);
+          }
+          return proof;
+        })), named ? one({ named: new Map(named) }, "group") : undefined);
     if (refreshed !== null) writePreparationReceipt(receipt, refreshed);
     const result = finishSourceJob(directory, { state: "ready", value: refreshed });
     if (!result.ok) fail(result.error.message);
   } catch (error) {
     finishSourceJob(directory, { state: "failed", error: { code: "source-revalidation-failed", message: error.message } });
     throw error;
-  }
+  } finally { database.close(); }
 }
 
 function prepareCreationSource(database, args, input) {
@@ -3024,7 +3032,7 @@ function prepareCreationSource(database, args, input) {
       assertSourceCheckoutFilters(input.mirror);
       return { state: "ready", value };
     }
-    const refreshed = refreshCompletedSource(value, input, sourceCommit, receipt, key);
+    const refreshed = refreshCompletedSource(value, input, sourceCommit, receipt, key, null, args);
     if (refreshed !== null) {
       if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
       return refreshed;
@@ -3074,7 +3082,7 @@ function prepareCreationSource(database, args, input) {
       writePreparationReceipt(pointerPath, pointer);
     }
     if (terminal.state === "ready") {
-      const refreshed = refreshCompletedSource(terminal.value, input, sourceCommit, receipt, key, pointer.jobId);
+      const refreshed = refreshCompletedSource(terminal.value, input, sourceCommit, receipt, key, pointer.jobId, args);
       if (refreshed !== null) {
         if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
         return refreshed;
@@ -3109,7 +3117,7 @@ function prepareCreationSource(database, args, input) {
   const job = accepted(observeJob());
   if (job.state !== "ready" || job.value.stamp === objectStoreStamp(input.mirror)) return job;
   // Concurrent imports of other commits move the shared stamp; re-prove this source instead of failing.
-  const refreshed = refreshCompletedSource(job.value, input, sourceCommit, receipt, key, pointer.jobId);
+  const refreshed = refreshCompletedSource(job.value, input, sourceCommit, receipt, key, pointer.jobId, args);
   if (refreshed === null) fail("source changed during preparation; repeat the original request");
   if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
   return refreshed;
@@ -3181,6 +3189,58 @@ function createCommand(database, args, statePath) {
   return withWorkspaceLock(database, destination, () => createWorkspace(database, args, statePath), one(args, "group"));
 }
 
+function reservePreparedCreation(database, args, statePath, source, prepared) {
+  const { root, destination, repository, ref, intent, sparsePatterns } = source;
+  if (path.join(path.resolve(required(args, "root")), safeName(required(args, "name"))) !== destination
+    || repositoryLocation(required(args, "repo"), currentDirectory()) !== repository
+    || one(args, "ref", "HEAD") !== ref
+    || ["intent", "growthBytes", "headroomBytes"].some(key => capacityIntent(args)?.[key] !== intent?.[key])
+    || JSON.stringify(many(args, "sparse-pattern")) !== JSON.stringify(sparsePatterns))
+    fail("completed source admission arguments differ from the original request");
+  if (!prepared.sourceCommit.startsWith(resolveRequestedSource(repository, ref)))
+    fail("completed source admission no longer names the original commit");
+  const request = creationRequest(args, repository), input = JSON.parse(request);
+  const mode = input.mode, strategy = input.strategy;
+  const existing = database.prepare("SELECT * FROM workspace WHERE path=?").get(destination);
+  if (existing && existing.state !== "released") {
+    if (existing.creation_request !== request || existing.source_commit !== prepared.sourceCommit)
+      fail("completed source admission conflicts with an existing creation");
+    return;
+  }
+  if (existsSync(destination)) fail(`workspace already exists: ${destination}`);
+  const { sourceCommit, plan } = prepared;
+  const device = String(statSync(root).dev);
+  const caller = nativeCaller();
+  withCapacityAdmission(database, statePath, device, () => {
+    plan.admission = assertCapacity(root, args, database, destination, plan);
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      const now = Date.now();
+      database.prepare(`INSERT INTO workspace
+        (id,path,root,kind,mode,owner,repository,source_commit,checkout_type,cache_paths,
+         created_at,updated_at,lease_expires_at,state,detail,group_id,creation_request)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'creating','creation reserved',?,?)
+        ON CONFLICT(path) DO UPDATE SET id=excluded.id, kind=excluded.kind, mode=excluded.mode,
+        owner=excluded.owner, repository=excluded.repository, source_commit=excluded.source_commit,
+        checkout_type=excluded.checkout_type, cache_paths=excluded.cache_paths,
+        created_at=excluded.created_at, updated_at=excluded.updated_at, lease_expires_at=excluded.lease_expires_at,
+        state=excluded.state, detail=excluded.detail, group_id=excluded.group_id, creation_request=excluded.creation_request
+        WHERE workspace.state='released'`).run(randomUUID(), destination, root, input.kind, mode,
+        input.owner, repository, sourceCommit, strategy, JSON.stringify(input.cachePaths), now, now,
+        now + input.leaseSeconds * 1000, input.groupId, request);
+      const reserved = database.prepare("SELECT id, creation_request FROM workspace WHERE path=?").get(destination);
+      if (reserved.creation_request !== request) fail(`workspace creation was claimed by another request: ${destination}`);
+      database.prepare("INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)")
+        .run(reserved.id, device, JSON.stringify(plan));
+      if (caller) bindNativeOwner(database, reserved.id, caller, "caller-scope", { command: "create" });
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  });
+}
+
 function createWorkspace(database, args, statePath) {
   const intent = capacityIntent(args);
   const checkoutTimeout = creationTimeout(args);
@@ -3225,37 +3285,8 @@ function createWorkspace(database, args, statePath) {
       process.exitCode = 75;
       return;
     }
-    const { sourceCommit, plan } = preparation.value;
-    const device = String(statSync(root).dev);
-    const caller = nativeCaller();
-    withCapacityAdmission(database, statePath, device, () => {
-      plan.admission = assertCapacity(root, args, database, destination, plan);
-      database.exec("BEGIN IMMEDIATE");
-      try {
-        const now = Date.now();
-        database.prepare(`INSERT INTO workspace
-          (id,path,root,kind,mode,owner,repository,source_commit,checkout_type,cache_paths,
-           created_at,updated_at,lease_expires_at,state,detail,group_id,creation_request)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'creating','creation reserved',?,?)
-          ON CONFLICT(path) DO UPDATE SET id=excluded.id, kind=excluded.kind, mode=excluded.mode,
-          owner=excluded.owner, repository=excluded.repository, source_commit=excluded.source_commit,
-          checkout_type=excluded.checkout_type, cache_paths=excluded.cache_paths,
-          created_at=excluded.created_at, updated_at=excluded.updated_at, lease_expires_at=excluded.lease_expires_at,
-          state=excluded.state, detail=excluded.detail, group_id=excluded.group_id, creation_request=excluded.creation_request
-          WHERE workspace.state='released'`).run(randomUUID(), destination, root, input.kind, mode,
-          input.owner, repository, sourceCommit, strategy, JSON.stringify(input.cachePaths), now, now,
-          now + input.leaseSeconds * 1000, input.groupId, request);
-        const reserved = database.prepare("SELECT id, creation_request FROM workspace WHERE path=?").get(destination);
-        if (reserved.creation_request !== request) fail(`workspace creation was claimed by another request: ${destination}`);
-        database.prepare("INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)")
-          .run(reserved.id, device, JSON.stringify(plan));
-        if (caller) bindNativeOwner(database, reserved.id, caller, "caller-scope", { command: "create" });
-        database.exec("COMMIT");
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
-      }
-    });
+    reservePreparedCreation(database, args, statePath,
+      { root, destination, repository, mirror, ref, intent, sparsePatterns }, preparation.value);
     row = database.prepare("SELECT * FROM workspace WHERE path = ?").get(destination);
     if (row.creation_request !== request) fail(`workspace creation was claimed by another request: ${destination}`);
   }
