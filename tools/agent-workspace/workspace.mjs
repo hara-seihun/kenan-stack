@@ -785,6 +785,7 @@ function ownReleaseUnit(unit, workspacePath, context) {
   if (!authenticatedBatch && (unit.execStart.split(workspacePath).length !== 2 || !unit.execStart.includes(`--path ${workspacePath} `))) return false;
   try {
     if (authenticatedBatch && context.read(`/proc/${unit.mainPid}/cgroup`).trim()!==`0::${wrapper.group}`) return false;
+    if (authenticatedBatch && context.files(unit.mainPid).some(file=>within(workspacePath,file))) return false;
     const status = context.read(`/proc/${unit.mainPid}/status`);
     if (Number(status.match(/^Uid:\s+(\d+)/mu)?.[1]) !== context.uid) return false;
     const cwd = context.link(`/proc/${unit.mainPid}/cwd`);
@@ -806,7 +807,11 @@ function releaseInspectionContext(authority=currentReleaseAuthority) {
     } catch { /* Unknown scope identity never permits a batch exemption. */ }
   }
   return { wrapper, command: "release", target: path.resolve(target), uid: process.getuid?.(),
-    ancestors: processAncestry(), read: file => readFileSync(file, "utf8"), link: readLink };
+    ancestors: processAncestry(), read: file => readFileSync(file, "utf8"), link: readLink,
+    files: pid=>readdirSync(`/proc/${pid}/fd`).flatMap(fd=>{
+      try { const file=readlinkSync(`/proc/${pid}/fd/${fd}`).replace(/ \(deleted\)$/u,''); return path.isAbsolute(file)?[file]:[]; }
+      catch(error) { if(error.code==='ENOENT')return []; throw error; }
+    }) };
 }
 function systemdReferences(workspacePath, snapshot = systemdSnapshot(), context = releaseInspectionContext()) {
   if (snapshot.error !== undefined) return { references: [], available: snapshot.available, error: snapshot.error };

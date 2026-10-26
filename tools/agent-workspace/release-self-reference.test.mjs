@@ -21,7 +21,7 @@ test('systemd MainPID parsed for authenticated ancestry, missing pid cannot bypa
 const binding={agentId:'22222222-2222-4222-8222-222222222222',callId:'call_batch',channel:'beta'};
 const batch={...unit,id:'kenan-bg-'+binding.agentId+'-release-many.service',manager:'system',execStart:`/usr/local/bin/kenan-bg --run release-many /var/tmp/batch.log /bin/bash -c 'for p in ${root} /fixture/other /fixture/third; do agent-workspace release --path "$p" --json; done'`};
 const group='/user.slice/user-agents.slice/'+batch.id;
-const batchContext=()=>({...context(),wrapper:{...binding,binding,background:true,unit:batch.id,group},read:p=>p.endsWith('/cgroup')?'0::'+group+'\n':'Uid:\t1002 1002 1002 1002\n'});
+const batchContext=()=>({...context(),files:()=>[],wrapper:{...binding,binding,background:true,unit:batch.id,group},read:p=>p.endsWith('/cgroup')?'0::'+group+'\n':'Uid:\t1002 1002 1002 1002\n'});
 test('only the actual authenticated multi-target cleanup wrapper is not its own consumer',()=>assert.equal(refs(batch,batchContext()).length,0));
 test('foreign and unknown wrappers remain protected even with matching path arguments',()=>{
  for(const patch of [{wrapper:null},{wrapper:{...batchContext().wrapper,binding:{...binding,agentId:'foreign'}}},{wrapper:{...batchContext().wrapper,unit:'foreign.service'}},{read:p=>p.endsWith('/cgroup')?'0::/unknown\n':'Uid:\t1002\n'}])
@@ -42,4 +42,9 @@ test('a real child in the target checkout remains a process consumer',async()=>{
   const references=processSnapshot(false,dir).filter(p=>p.cwd===dir);
   assert.ok(references.some(p=>p.pid===child.pid),'the cleanup wrapper exemption must not alter process census');
  }finally{child.kill('SIGKILL');await new Promise(resolve=>child.once('exit',resolve));fs.rmSync(dir,{recursive:true});}
+});
+
+test('an authenticated batch ancestor holding checkout resources remains protected',()=>{
+ assert.equal(refs(batch,{...batchContext(),files:()=>[root+'/node_modules/cache']} ).length,1);
+ assert.equal(refs(batch,{...batchContext(),files:()=>{throw Error('unknown descriptors');}}).length,1);
 });
