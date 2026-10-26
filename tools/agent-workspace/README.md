@@ -1078,3 +1078,9 @@ mirror creates no shallow metadata. Closure qualification and import accounting
 are unchanged. The native regression creates a real shallow donor, advances its
 upstream, performs an ordinary fetch in the admitted clone and admits that clone
 as a subsequent source.
+
+### Allocation measurement and native background identity
+
+Ordinary `measure-capacity` walks allocated blocks only, with the requested deadline and resumable fleet slices. It does not read or hash payloads, and it skips the unrelated terminal-plan census for a targeted request. Its samples explicitly carry `writeObservationComplete: false`: allocation credit is not retirement or payload-idleness proof. `--content-proof` opts into the separate complete payload observation; the idle-growth retirement path continues to request that proof itself. Switching measurement modes resets incomplete traversal state. Failed or unfinished walks retain previous successful allocation samples.
+
+The current Kenan `kenan-bg` uses `background-launch.mjs` for native UUID workers. It authenticates the actual root-created native tool scope before launching a root-created system-manager service as the original Unix user. That service's root-owned description binds the exact worker, channel and original call; its current control group, UID, transient status, active state and invocation are checked on read. Raw inherited tool IDs remain stripped. User-manager services, wrong workers, stale units and mismatched control groups cannot impersonate this route. Legacy non-native callers retain their existing user-manager behavior.

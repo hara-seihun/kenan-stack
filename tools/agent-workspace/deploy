@@ -33,7 +33,7 @@ trap 'rm -rf "$stage"' EXIT
 rsync -a "$(readlink -f "$dest")/" "$stage/"
 rm -rf "$stage/agent-workspace"
 rsync -a --chmod=D755,F644 --exclude=deploy "$root/tools/agent-workspace/" "$stage/agent-workspace/"
-chmod 755 "$stage/agent-workspace/workspace.mjs"
+chmod 755 "$stage/agent-workspace/workspace.mjs" "$stage/agent-workspace/background-launch.mjs"
 node "$stage/agent-workspace/main" --help >/dev/null
 printf '%s\n' "$commit" > "$stage/.pi-stack-commit"
 node - "$stage/agent-workspace/.component-release.json" "$baseline" "$commit" <<'NODE'

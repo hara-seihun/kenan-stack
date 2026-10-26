@@ -28,7 +28,7 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
   }
  }
  const after=fs.lstatSync(root);if(String(after.ino)!==inode||String(after.dev)!==device)throw Error('workspace root changed during measurement');
- state.writeObservationComplete=state.writeObservationComplete!==false&&observeContent?.complete!==false;
+ state.writeObservationComplete=state.writeObservationComplete!==false&&typeof observeContent==='function'&&observeContent.complete!==false;
  state.seen=[...seen];
  if(state.pending.length)return {partial:true,state,visited};
  return {ok:true,writeObservationComplete:state.writeObservationComplete,lastWriteAt:state.lastWriteAt,bytes:state.bytes,allocatedBytes:state.allocatedBytes,device,inode,startedAt:state.startedAt,completedAt:Date.now(),visited};

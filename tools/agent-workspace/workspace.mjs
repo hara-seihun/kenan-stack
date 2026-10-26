@@ -4886,9 +4886,12 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
       database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
       const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
+      if(prior && prior.contentProof!==contentProof)prior=null;
       const until=Math.min(deadline,Date.now()+1000);
-      const slice=withContentObservation(database,{deadline:until},observeContent=>allocationSlice(row.path,row.device_id,prior,{deadline:until,excludedPaths,observeContent}));
+      const walk=observeContent=>allocationSlice(row.path,row.device_id,prior,{deadline:until,excludedPaths,observeContent});
+      const slice=contentProof?withContentObservation(database,{deadline:until},walk):walk(undefined);
       if(slice.partial){
+        slice.state.contentProof=contentProof;
         database.prepare("INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)").run(row.id,JSON.stringify(slice.state));
         return {partial:true,visited:slice.visited,entries:slice.state.entries,startedAt:slice.state.startedAt};
       }
@@ -4911,7 +4914,7 @@ function capacityStatusCommand(database,args) {
 }
 
 function measureCapacityCommand(database, args, statePath) {
-  assertOnly(args, ["root", "path", "id", "budget-ms", "incremental", "json"]);
+  assertOnly(args, ["root", "path", "id", "budget-ms", "incremental", "content-proof", "json"]);
   const budgetMs = numberFlag(args, "budget-ms", 40_000);
   if (!Number.isSafeInteger(budgetMs) || budgetMs < 1 || budgetMs > 300_000) fail("--budget-ms must be between 1 and 300000");
   const started = Date.now(), deadline = started + budgetMs;
@@ -4925,7 +4928,7 @@ function measureCapacityCommand(database, args, statePath) {
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
   const skipped = { "retired-future-growth": 0, "zero-liability": 0 };
   database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
-  const settled=terminalQualificationPaths(rows);
+  const settled=selected===null?terminalQualificationPaths(rows):new Map();
   const queue = [];
   for (const row of rows) {
     const plan = JSON.parse(row.plan_json);
@@ -4955,7 +4958,7 @@ function measureCapacityCommand(database, args, statePath) {
       // A targeted walk owns the requested bounded budget. Fleet sampling keeps
       // its short per-row lock window and resumable traversal slices.
       const sampleDeadline = selected === null ? Math.min(deadline, Date.now() + 2000) : deadline;
-      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null||bool(args,'incremental'));
+      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null||bool(args,'incremental'),bool(args,'content-proof'));
       counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
       results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
       if(sample.partial)next.push({row,budget,cached});
@@ -5191,7 +5194,7 @@ function help() {
                             [--budget-ms 30000] [--max-records 16] [--after ID|start] [--json]
   agent-workspace bind-native-owners [--root PATH | --id ID | --path PATH] [--execute] [--budget-ms 30000] [--max-records 128] [--after ID|start] [--json]
   agent-workspace reap-ended-owners [--root PATH] [--execute] [--bind-budget-ms 15000] [--bind-max-records 128] [--budget-ms 90000] [--max-records 64] [--json]
-  agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--incremental] [--json]
+  agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--incremental] [--content-proof] [--json]
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
                             [--budget-ms 25000]
