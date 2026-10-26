@@ -785,7 +785,16 @@ function ownReleaseUnit(unit, workspacePath, context) {
   if (!authenticatedBatch && (unit.execStart.split(workspacePath).length !== 2 || !unit.execStart.includes(`--path ${workspacePath} `))) return false;
   try {
     if (authenticatedBatch && context.read(`/proc/${unit.mainPid}/cgroup`).trim()!==`0::${wrapper.group}`) return false;
-    if (authenticatedBatch && context.files(unit.mainPid).some(file=>within(workspacePath,file))) return false;
+    if (authenticatedBatch) {
+      // Admission shells are ancestors too. A bare argv mention is harmless, but
+      // an actual resource held by any member of this wrapper ancestry is not.
+      for (const pid of context.ancestors) {
+        if (context.read(`/proc/${pid}/cgroup`).trim()!==`0::${wrapper.group}`) continue;
+        if (context.files(pid).some(file=>within(workspacePath,file))) return false;
+        const cwd=context.link(`/proc/${pid}/cwd`),exe=context.link(`/proc/${pid}/exe`);
+        if(cwd===null||exe===null||within(workspacePath,cwd)||within(workspacePath,exe))return false;
+      }
+    }
     const status = context.read(`/proc/${unit.mainPid}/status`);
     if (Number(status.match(/^Uid:\s+(\d+)/mu)?.[1]) !== context.uid) return false;
     const cwd = context.link(`/proc/${unit.mainPid}/cwd`);

@@ -48,3 +48,9 @@ test('an authenticated batch ancestor holding checkout resources remains protect
  assert.equal(refs(batch,{...batchContext(),files:()=>[root+'/node_modules/cache']} ).length,1);
  assert.equal(refs(batch,{...batchContext(),files:()=>{throw Error('unknown descriptors');}}).length,1);
 });
+
+test('intermediate ancestor shell resources are not hidden by the batch main process',()=>{
+ const c={...batchContext(),ancestors:new Set([42,41]),files:pid=>pid===41?[root+'/held-resource']:[]};
+ assert.equal(refs(batch,c).length,1);
+ assert.equal(refs(batch,{...c,files:()=>[],link:p=>p.includes('/41/')?root:'/fixture'}).length,1);
+});
