@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+uid=$(id -u)
+gid=$(id -g)
+[[ $uid != 0 && -f $HOME/.local/state/pi-workspaces/registry.sqlite3 ]] || exit 64
+exec sudo -n /usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups \
+  --bounding-set=-all,+dac_read_search --inh-caps=+dac_read_search --ambient-caps=+dac_read_search \
+  /usr/bin/env HOME="$HOME" PI_WORKSPACE_STATE="$HOME/.local/state/pi-workspaces/registry.sqlite3" \
+  /usr/local/bin/agent-workspace retire-idle-growth "$@"

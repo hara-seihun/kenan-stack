@@ -5,6 +5,7 @@ import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
+import {assertIdleGrowth,assertIdleObservation} from './idle-growth.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {prepareFrozenObjectCustody} from './frozen-object-custody.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
@@ -1909,6 +1910,7 @@ function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() 
   let entries = 0;
   let bytes = 0;
   let allocatedBytes = 0;
+  let lastWriteAt = 0;
   function walk(file) {
     if (excluded.has(file)) return;
     if (++entries > maxEntries || Date.now() >= deadline) throw new Error("allocated-block measurement budget exhausted");
@@ -1920,6 +1922,7 @@ function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() 
     const inode = `${stats.dev}:${stats.ino}`;
     if (seen.has(inode)) return;
     seen.add(inode);
+    lastWriteAt=Math.max(lastWriteAt,Math.ceil(stats.mtimeMs),Math.ceil(stats.ctimeMs));
     const blocks = stats.blocks * 512;
     if (!Number.isSafeInteger(blocks) || blocks < 0) throw new Error("invalid allocated-block count");
     allocatedBytes += blocks;
@@ -1935,7 +1938,7 @@ function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() 
   }
   try {
     walk(workspacePath);
-    return { ok: true, bytes, allocatedBytes };
+    return { ok: true, bytes, allocatedBytes, lastWriteAt };
   } catch (error) {
     return { ok: false, error: `${error.code ?? "measurement-unavailable"}: ${error.message}` };
   }
@@ -4637,9 +4640,9 @@ function retireGrowthCommand(database, args, statePath) {
 
 // Shared locked transition: explicit release and explicit retire use identical CAS,
 // fresh process/unit/native/borrower observations and durable journal semantics.
-function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
+function retireGrowthEvidence(database, selected, owner, evidence, statePath, automatic = false, budgetDeadline) {
   const evidenceSha256 = digest(evidence), disposition = JSON.parse(evidence);
-  const deadline = Date.now()+25_000;
+  const deadline = Math.min(Date.now()+25_000,budgetDeadline??Infinity);
   return duringInspection(deadline,()=>withWorkspaceLock(database, selected.path, () => {
     const record = recordBy(database, {id:selected.id});
     if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) growthError("invalid-growth-state", `cannot retire growth from ${record.state}`);
@@ -4651,8 +4654,8 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
       if (retainedGrowth(plan)) growthError("growth-already-retired", "growth is already retired; no replay");
       const cached = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!cached.ok) growthError("growth-sample-required", cached.error);
-      const safety = terminalSafety(database, record, deadline);
-      if(safety.references.length && !safety.errors.length){
+      let safety = terminalSafety(database, record, deadline);
+      if(!automatic && safety.references.length && !safety.errors.length){
         const pids=[...new Set(safety.references.map(r=>r.pid).filter(pid=>Number.isSafeInteger(pid)&&pid>0))];
         const units=[...new Set(safety.references.map(r=>r.id).filter(id=>typeof id==="string"&&id.endsWith(".service")))];
         const observer=new URL("./growth-writer-observation.mjs",import.meta.url).href;
@@ -4663,12 +4666,22 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
         catch{safety.growthWriters={complete:false,references:[],errors:["growth writer observation invalid"]};}
       }
       if (Date.now() >= deadline) growthError("growth-observation-timeout", "retirement observation budget exhausted");
+      if(automatic) {
+        validateIdleGrowth(database,record,plan,measurement.measurement_json,safety);
+        const expected=JSON.parse(measurement.measurement_json);
+        const exclusions=database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(r=>r.path).filter(p=>p.startsWith(record.path+path.sep));
+        const verify=workspaceAllocationSample(record.path,row.device_id,{deadline:deadline-1000,maxEntries:2_000_000,excludedPaths:exclusions});
+        assertIdleObservation(expected,verify);
+        safety=terminalSafety(database,record,deadline);
+        validateIdleGrowth(database,record,plan,measurement.measurement_json,safety);
+      }
       validateRetirement(disposition, binding, safety);
       const next = {...plan, growthLifecycle:{kind:"retired-future-growth", remainingGrowthBytes:0,
         retainedUse:disposition.retainedUse, dispositionSha256:evidenceSha256, retiredAt:Date.now()}};
       database.exec("BEGIN IMMEDIATE");
       try {
         const current = growthBinding(database, recordBy(database, {id:record.id}));
+        if(automatic) validateIdleGrowth(database,recordBy(database,{id:record.id}),plan,current.measurement.measurement_json,safety);
         validateRetirement(disposition, current.binding, safety);
         const fresh = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
         if (!fresh.ok) growthError("growth-sample-required", fresh.error);
@@ -4690,6 +4703,54 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath) {
       } catch (error) { database.exec("ROLLBACK"); throw error; }
     },deadline),deadline);
   }, selected.groupId,deadline));
+}
+
+// Durable round-robin progress prevents busy early rows from starving later work.
+function validateIdleGrowth(database,record,plan,text,safety) {
+  const saved=database.prepare("SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?").get(record.id);
+  return assertIdleGrowth({record,plan,sample:JSON.parse(text),history:JSON.parse(saved?.state_json??"null"),safety,
+    planSha256:digest(database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id).plan_json)});
+}
+function retireIdleGrowthCommand(database,args,statePath) {
+  assertOnly(args,["root","budget-ms","max-records","json"]);
+  const budget=numberFlag(args,"budget-ms",90000),limit=numberFlag(args,"max-records",128);
+  if(!Number.isSafeInteger(budget)||budget<1||budget>300000||!Number.isSafeInteger(limit)||limit<1||limit>4096)fail("invalid idle growth sweep bounds");
+  const deadline=Date.now()+budget,scope=one(args,"root")?path.resolve(one(args,"root")):"*";
+  database.exec("CREATE TABLE IF NOT EXISTS workspace_idle_growth_cursor(scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
+  const after=database.prepare("SELECT after_id FROM workspace_idle_growth_cursor WHERE scope=?").get(scope)?.after_id??"";
+  const rows=database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json FROM workspace w
+    JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.state!='released' AND w.state!='creating' AND (?='*' OR w.root=?) ORDER BY w.id`).all(scope,scope)
+    .filter(row=>{try{const p=JSON.parse(row.plan_json);return ['source-only','budgeted'].includes(p.intent)&&p.growthBytes>0&&!p.growthLifecycle;}catch{return false;}});
+  const ordered=[...rows.filter(r=>r.id>after),...rows.filter(r=>r.id<=after)];
+  const paths=database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(r=>r.path);
+  const results=[];let retiredBytes=0;
+  for(const row of ordered) {
+    if(Date.now()>=deadline||results.length>=limit)break;
+    // Advance before expensive work, including failures and partial resumable walks.
+    database.prepare("INSERT OR REPLACE INTO workspace_idle_growth_cursor VALUES(?,?)").run(scope,row.id);
+    try {
+      const record=recordBy(database,{id:row.id});
+      if(Date.now()-record.createdAt<=3600000)growthError('idle-growth-recent-write','New workspace retains its admitted promise.');
+      const sampled=measureWorkspaceRow(database,row,paths,Math.min(deadline,Date.now()+2000),statePath,true);
+      if(sampled.partial){results.push({id:row.id,path:row.path,status:'partial',visited:sampled.visited});continue;}
+      if(!sampled.ok)growthError('idle-growth-sample-required',sampled.error);
+      const result=duringInspection(deadline,()=>withWorkspaceLock(database,record.path,()=>{
+        const current=recordBy(database,{id:record.id});
+        const {binding,plan,measurement}=growthBinding(database,current);
+        // Cheap data-only check before the expensive exact execution observation.
+        validateIdleGrowth(database,current,plan,measurement.measurement_json,{references:[],errors:[]});
+        const disposition={kind:'retire-future-growth',retainedUse:'source',remainingGrowthBytes:0,growthWriters:'none',writingLease:'retire',
+          reason:'Automatic retirement of an idle future promise; all actual bytes and source remain.',ownerEvidence:'Sara authorized idle-growth policy: exact quiescence, two stable samples and one hour since actual write.',
+          observedAt:Date.now(),binding};
+        const retired=retireGrowthEvidence(database,current,current.owner,JSON.stringify(disposition),statePath,true,deadline);
+        return {retired,oldPromiseBytes:plan.growthBytes};
+      },record.groupId,deadline));
+      retiredBytes+=result.oldPromiseBytes;
+      results.push({id:row.id,path:row.path,status:'retired',retiredPromiseBytes:result.oldPromiseBytes,sequence:result.retired.sequence});
+    }catch(error){results.push({id:row.id,path:row.path,status:'retained',code:error.code??'idle-growth-unknown',detail:error.message});}
+  }
+  return {kind:'idle-growth-retirement',scope,retiredPromiseBytes:retiredBytes,retiredCount:results.filter(r=>r.status==='retired').length,
+    examined:results.length,eligible:rows.length,remaining:Math.max(0,rows.length-results.length),cursor:results.at(-1)?.id??after,results};
 }
 
 function reduceRetainedHeadroomCommand(database, args, statePath) {
@@ -4853,7 +4914,8 @@ function measureCapacityCommand(database, args, statePath) {
     if (!cached.ok) { chargedAfter += budget; after[cached.code] = (after[cached.code] ?? 0) + 1; }
     else if (oldestCurrentStartedAt === null || cached.startedAt < oldestCurrentStartedAt) oldestCurrentStartedAt = cached.startedAt;
   }
-  print({ kind: "capacity-measurement", budgetMs, elapsedMs: now - started,
+  const idleGrowth = retireIdleGrowthCommand(database, parseArgs(["--budget-ms",String(Math.max(1,Math.min(10000,deadline-Date.now()))),"--max-records","16",...(root?["--root",root]:[])]),statePath);
+  print({ kind: "capacity-measurement", idleGrowth, budgetMs, elapsedMs: Date.now() - started,
     progress: { pricedRows: rows.length, eligible: queue.length, skipped, ...counts,
       fullyChargedBytesBefore: chargedBefore, fullyChargedBytesAfter: chargedAfter, uncreditedAfter: after,
       oldestCurrentSampleAgeMs: oldestCurrentStartedAt === null ? null : now - oldestCurrentStartedAt,
@@ -5056,6 +5118,7 @@ function help() {
   agent-workspace thaw-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA [--json]
   agent-workspace source-handoff --id ID --path PATH --owner OWNER --expected-head SHA --recipient OWNER --remote origin --branch BRANCH --json
   agent-workspace freeze-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA --recipient OWNER --authorization EVIDENCE [--json]
+  agent-workspace retire-idle-growth [--root PATH] [--budget-ms 90000] [--max-records 128] [--json]
   agent-workspace writer-run --id ID --path PATH --owner OWNER --expected-head SHA --command-json '["executable","arg"]' --timeout-ms N [--json]
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
                            --owner ID --source-commit HEAD_SHA --authorization RECEIPT [--json]
@@ -5243,7 +5306,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -5261,6 +5324,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
           try{return JSON.parse(result.stdout);}catch{growthError("execution-cessation-unknown","invalid observer output");}
         }}),true);
     }
+    else if (commandName === "retire-idle-growth") print(retireIdleGrowthCommand(database,args,statePath),bool(args,"json"));
     else if (commandName === "create") createCommand(database, args, statePath);
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);

@@ -1,0 +1,10 @@
+[Unit]
+Description=Continuously retire completed workspace future-growth promises
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+Unit=agent-workspace-idle-growth.service
+
+[Install]
+WantedBy=timers.target

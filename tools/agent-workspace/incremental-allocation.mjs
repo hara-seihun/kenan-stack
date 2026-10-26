@@ -7,7 +7,7 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
  const stat=fs.lstatSync(root),inode=String(stat.ino);
  if(!stat.isDirectory()||String(stat.dev)!==device)throw Error('workspace root changed filesystem or type');
  let state=prior;
- if(!state||state.version!==1||state.root!==root||state.inode!==inode||state.device!==device||JSON.stringify(state.excludedPaths)!==JSON.stringify(excludedPaths))state={version:1,root,device,inode,excludedPaths,startedAt:Date.now(),pending:[root],seen:[],bytes:0,allocatedBytes:0,entries:0};
+ if(!state||state.version!==2||state.root!==root||state.inode!==inode||state.device!==device||JSON.stringify(state.excludedPaths)!==JSON.stringify(excludedPaths))state={version:2,lastWriteAt:0,root,device,inode,excludedPaths,startedAt:Date.now(),pending:[root],seen:[],bytes:0,allocatedBytes:0,entries:0};
  const seen=new Set(state.seen),excluded=new Set(excludedPaths);let visited=0;
  while(state.pending.length && visited<maxEntries && Date.now()<deadline){
   const file=state.pending.pop();visited++;
@@ -16,6 +16,7 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
   if(String(s.dev)!==device)continue;
   const key=`${s.dev}:${s.ino}`;if(seen.has(key))continue;seen.add(key);state.entries++;
   if(state.entries>2000000)throw Error('allocated-block traversal entry bound exceeded');
+  state.lastWriteAt=Math.max(state.lastWriteAt,Math.ceil(s.mtimeMs),Math.ceil(s.ctimeMs));
   const bytes=s.blocks*512;if(!Number.isSafeInteger(bytes)||bytes<0)throw Error('invalid allocated blocks');
   state.allocatedBytes+=bytes;if(s.isDirectory()||s.nlink===1)state.bytes+=bytes;
   if(!Number.isSafeInteger(state.allocatedBytes))throw Error('allocation total exceeds supported range');
@@ -26,5 +27,5 @@ export function allocationSlice(root,device,prior,{deadline=Date.now()+1000,maxE
  const after=fs.lstatSync(root);if(String(after.ino)!==inode||String(after.dev)!==device)throw Error('workspace root changed during measurement');
  state.seen=[...seen];
  if(state.pending.length)return {partial:true,state,visited};
- return {ok:true,bytes:state.bytes,allocatedBytes:state.allocatedBytes,device,inode,startedAt:state.startedAt,completedAt:Date.now(),visited};
+ return {ok:true,lastWriteAt:state.lastWriteAt,bytes:state.bytes,allocatedBytes:state.allocatedBytes,device,inode,startedAt:state.startedAt,completedAt:Date.now(),visited};
 }

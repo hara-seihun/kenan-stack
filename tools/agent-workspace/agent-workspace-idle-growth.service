@@ -1,0 +1,11 @@
+[Unit]
+Description=Retire idle future workspace promises while retaining all physical state
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/agent-workspace-idle-growth --budget-ms 90000 --max-records 128 --json
+TimeoutStartSec=100
+KillMode=control-group
+MemoryMax=1G
+MemorySwapMax=0
+CPUQuota=100%
