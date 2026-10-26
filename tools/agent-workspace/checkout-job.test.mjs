@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { liveGroupMembers } from "./checkout-cessation.mjs";
 
 const entry = new URL("./workspace.mjs", import.meta.url).pathname;
 const realGit = execFileSync("which", ["git"], { encoding: "utf8", timeout: 2000 }).trim();
@@ -22,6 +23,18 @@ async function until(read, description, timeout = 8000) {
     await delay(25);
   } while (Date.now() < deadline);
   assert.fail(`timed out waiting for ${description}`);
+}
+
+async function assertRetiredCheckout(held, terminal) {
+  const detail = JSON.stringify({ terminal, held });
+  // A terminal receipt must never excuse a surviving materializer. Check the
+  // entire original detached group immediately, not just the Git wrapper PID.
+  assert.deepEqual(liveGroupMembers(held.parent), [], `live checkout group at terminal: ${detail}`);
+  await until(() => !existsSync(`/proc/${held.pid}`), `Git wrapper cgroup retirement: ${detail}`);
+  // systemd owns ExecStopPost separately from the immutable job result. Its
+  // removal can finish after that result is visible. Observe that retirement
+  // before any retry can reuse staging; do not require both writes to be atomic.
+  await until(() => !existsSync(held.staging), `original checkout staging retirement: ${detail}`);
 }
 
 function jsonFile(filename) {
@@ -211,6 +224,35 @@ test("unexpected creator death ceases surviving Git before terminal staging clea
  }finally{f.close();}
 });
 
+test("terminal checkout assertion rejects live writers but observes delayed stop-post removal", { timeout: 5000 }, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "checkout-retirement-assertion-"));
+  const staging = path.join(root, "staging");
+  mkdirSync(staging);
+  const child = spawn(process.execPath, ["-e", "process.stdout.write('ready');setInterval(()=>{},1000)"],
+    { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  const held = { parent: child.pid, pid: child.pid, staging };
+  const terminal = { state: "failed", error: { code: "checkout-materialization-failed", message: "interrupted" } };
+  let removal;
+  try {
+    await new Promise(resolve => child.stdout.once("data", resolve));
+    await assert.rejects(assertRetiredCheckout(held, terminal), /live checkout group at terminal/);
+    assert.equal(existsSync(staging), true);
+    process.kill(-child.pid, "SIGKILL");
+    await exited;
+    // Deterministically expose a terminal result while the original group is
+    // gone but stop-post removal is still pending, without starting a retry.
+    removal = setTimeout(() => rmSync(staging, { recursive: true }), 100);
+    await assertRetiredCheckout(held, terminal);
+    assert.equal(existsSync(staging), false);
+  } finally {
+    clearTimeout(removal);
+    if (child.exitCode === null && child.signalCode === null) process.kill(-child.pid, "SIGKILL");
+    await exited;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const scope of ["main", "all"]) test(`systemd ${scope}-process SIGKILL automatically resumes clean staging and preserves the reservation`, options, async () => {
   const f = fixture();
   try {
@@ -223,8 +265,7 @@ for (const scope of ["main", "all"]) test(`systemd ${scope}-process SIGKILL auto
       { encoding: "utf8", timeout: 3000 });
     assert.equal(killed.status, 0, killed.stderr);
     const terminal = await f.terminal(reserved);
-    await until(() => !existsSync(`/proc/${held.pid}`), "Git wrapper cgroup retirement");
-    assert.equal(existsSync(held.staging), false);
+    await assertRetiredCheckout(held, terminal);
     assert.equal(jsonFile(path.join(jobDirectory, "attempt.json")).number, before.number);
     if (terminal.state === "failed") {
       assert.equal(scope, "main");
