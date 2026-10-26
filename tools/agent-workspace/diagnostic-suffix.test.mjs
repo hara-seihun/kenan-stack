@@ -17,3 +17,18 @@ test('unrelated or malformed appended diagnostics never authorize recovery',()=>
   assert.equal(capacityRecovery(terminal(line+suffix),'a'.repeat(64),observation).state,'terminal');
  }
 });
+test('owned fair-refresh diagnostic preserves original refusal recovery without granting admission',()=>{
+ for(const refresh of [{observations:[],budgetMs:30000},{observations:[{path:'native-terminal-projection',kind:'terminal-projection',settled:0},{path:'/workspace/old',kind:'measured',route:'unprivileged'},{path:'/workspace/large',kind:'partial',route:'unprivileged'}],budgetMs:30000}]){
+  const old=terminal(`${line}\ncapacity-detail: ${JSON.stringify(diagnostic)}\ncapacity-refresh: ${JSON.stringify(refresh)}`);
+  const result=capacityRecovery(old,'a'.repeat(64),observation);
+  assert.equal(result.state,'retry');assert.deepEqual(result.value.originalRefusal,old.error);
+  assert.equal(result.value.previousJobId,'a'.repeat(64));assert.deepEqual(result.value.observation,observation);
+ }
+});
+test('refresh suffix must be the exact owned finite shape after valid capacity detail',()=>{
+ const prefix=`${line}\ncapacity-detail: ${JSON.stringify(diagnostic)}`;
+ for(const value of [null,[],{}, {observations:[],budgetMs:-1},{observations:'bad',budgetMs:30000},{observations:[{path:'/x',kind:'fictional'}],budgetMs:30000},{observations:[],budgetMs:30000,unknown:true}])
+  assert.equal(capacityRecovery(terminal(`${prefix}\ncapacity-refresh: ${JSON.stringify(value)}`),'a'.repeat(64),observation).state,'terminal');
+ for(const message of [`${prefix}\ncapacity-refresh: nope`,`${prefix}\ncapacity-refresh: {"observations":[],"budgetMs":30000}\nother error`,`${line}\ncapacity-refresh: {"observations":[],"budgetMs":30000}`])
+  assert.equal(capacityRecovery(terminal(message),'a'.repeat(64),observation).state,'terminal');
+});

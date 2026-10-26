@@ -1,5 +1,19 @@
 import { randomUUID } from "node:crypto";
 
+const nonnegative = value => Number.isSafeInteger(value) && value >= 0;
+function ownedRefresh(value) {
+  if (!value || Array.isArray(value) || typeof value !== 'object' ||
+      Object.keys(value).sort().join(',') !== 'budgetMs,observations' ||
+      !nonnegative(value.budgetMs) || !Array.isArray(value.observations)) return false;
+  const kinds = new Set(['terminal-projection','not-eligible','unpriced','not-needed','fresh','deferred','measured','partial','failed']);
+  return value.observations.every(item => item && !Array.isArray(item) && typeof item === 'object' &&
+    Object.keys(item).every(key => ['path','kind','route','detail','settled'].includes(key)) &&
+    typeof item.path === 'string' && kinds.has(item.kind) &&
+    (item.route === undefined || typeof item.route === 'string') &&
+    (item.detail === undefined || typeof item.detail === 'string') &&
+    (item.settled === undefined || nonnegative(item.settled)));
+}
+
 // The pre-typed deployed receipt is immutable; decode only its exact disk-refusal grammar.
 export function capacityRecovery(terminal, previousJobId, observation, expectedMirror) {
   if (terminal?.state !== "failed" || !["workspace-capacity-refused", "source-preparation-failed", "workspace-capacity-lock-busy", "workspace-mirror-lock-busy"].includes(terminal.error?.code)) {
@@ -18,7 +32,7 @@ export function capacityRecovery(terminal, previousJobId, observation, expectedM
   if (terminal.error.code === "workspace-capacity-lock-busy" && !lockRecovery) return { state: "terminal" };
   const [message, ...suffix] = terminal.error.message.split("\n");
   if (suffix.length > 0) {
-    if (suffix.length !== 1 || !suffix[0].startsWith("capacity-detail: ")) return { state: "terminal" };
+    if (suffix.length > 2 || !suffix[0].startsWith("capacity-detail: ")) return { state: "terminal" };
     let detail;
     try { detail = JSON.parse(suffix[0].slice("capacity-detail: ".length)); }
     catch { return { state: "terminal" }; }
@@ -27,6 +41,13 @@ export function capacityRecovery(terminal, previousJobId, observation, expectedM
       || !Number.isSafeInteger(detail.requiredBytes) || detail.requiredBytes < 0
       || typeof detail.device !== "string" || !Number.isSafeInteger(detail.observedAt)
       || !detail.breakdown || detail.breakdown.requiredBytes !== detail.requiredBytes) return { state: "terminal" };
+    // Fair on-demand sampling appends this owned diagnostic to the same refusal.
+    // Decode it only; recovery still reruns complete current admission under its fence.
+    if (suffix.length === 2) {
+      if (!suffix[1].startsWith('capacity-refresh: ')) return {state:'terminal'};
+      try { if (!ownedRefresh(JSON.parse(suffix[1].slice('capacity-refresh: '.length)))) return {state:'terminal'}; }
+      catch { return {state:'terminal'}; }
+    }
   }
   const refusal = /^(\d+\.\d{2}) GiB is free; (\d+\.\d{2}) GiB is required \((?:source forecast \+ declared growth \+ operating headroom \+ other reservations|unestimated full work \+ other reservations)\)$/u.exec(message);
   if (refusal === null && !lockRecovery && !mirrorRecovery) return { state: "terminal" };
