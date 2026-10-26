@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {userInfo} from 'node:os';
 import {boundedCommand} from './bounded-command.mjs';
+import {queryNativeScope} from './native-scope-query.mjs';
 
 // Kenan Stack (the October 17 minimal rewrite) keeps one PostgreSQL database per installed channel
 // (`/srv/kenan/CHANNEL`, database `kenan_CHANNEL`) on the `kenan-postgres` cluster's socket directory.
@@ -26,7 +27,7 @@ function procArgv(pid){return fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').spl
 function procParent(pid){const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');return Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);}
 // Identity lives in a root-created system-manager scope, never in shell argv/env.
 // The observed cgroup and unit ControlGroup must agree with the actual caller.
-export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),onError=()=>{},query=(unit)=>boundedCommand('/usr/bin/systemctl',['--system','show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState,User,InvocationID'],{encoding:'utf8',timeout:2000,maxBuffer:8192,env:{PATH:'/usr/sbin:/usr/bin:/sbin:/bin',LC_ALL:'C',SYSTEMD_COLORS:'0'}})}={}){
+export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),onError=()=>{},query=queryNativeScope}={}){
  const rows=read(pid).trim().split('\n');
  const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
  const nativeScope=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??'');

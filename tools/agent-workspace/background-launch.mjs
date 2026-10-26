@@ -15,7 +15,9 @@ export function backgroundSpec(input,binding,uid,gid){
 }
 export function main(){
  if(process.getuid()!==0)throw Error('background_root_required');
- const binding=callerToolCall({background:false});
+ let diagnostic;
+ const binding=callerToolCall({background:false,onError:value=>{diagnostic=value;}});
+ if(!binding&&diagnostic)throw Error(`background_native_caller_required: ${diagnostic.code}: ${diagnostic.detail}`);
  const uid=Number(process.env.SUDO_UID),gid=Number(process.env.SUDO_GID);
  const input=JSON.parse(fs.readFileSync(0,'utf8'));
  const spec=backgroundSpec(input,binding,uid,gid);
