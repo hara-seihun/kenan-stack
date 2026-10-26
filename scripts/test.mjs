@@ -43,6 +43,7 @@ const jobs = [
   ["prompt availability", "python3", ["-B", "scripts/prompt-availability.test.py"]],
   ["Meet recognition protocol", "python3", ["-B", "-m", "unittest", "discover", "-s", "apps/meet-recognition", "-p", "test_protocol.py"]],
   ["action journal publication", "bun", ["test", "deploy/action-journal.test.ts"]],
+  ["host retention", "python3", ["-B", "-m", "unittest", "discover", "-s", "tools/host-retention", "-p", "test_*.py"]],
   ["mail send boundary", "python3", ["-B", "tools/mail-send/test_send.py"]],
   ["raw outbound boundary", "python3", ["-B", "tools/raw-outbound-guard/test_guard.py"]],
   ["provider rollback boundary", "node", ["--test", "scripts/remote-rollback-compatible.test.mjs"]],

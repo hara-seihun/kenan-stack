@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Install only committed, tested host-retention source. Never invoke an apply pass."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+import uuid
+
+BASE = Path("/usr/local/lib/kenan-host-retention")
+STATE = Path("/var/lib/kenan-host-retention")
+UNIT_DIRECTORY = Path("/etc/systemd/system")
+ROOT_UID = 0
+UNITS = ("kenan-host-retention.service", "kenan-host-retention.timer")
+FILES = ("retention.py", "test_retention.py", "test_installer.py", "README.md") + UNITS
+
+
+def command(args, **kwargs):
+    return subprocess.run(args, check=True, timeout=45, **kwargs)
+
+
+def systemctl(*args):
+    return command(["systemctl", *args], stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def safe_dir(path):
+    """Require root-owned, non-writable, non-symlink ancestors and leaf."""
+    current = Path("/")
+    for part in path.parts[1:]:
+        current /= part
+        s = current.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != ROOT_UID or s.st_mode & 0o022:
+            raise RuntimeError("Unsafe installation directory: " + str(current))
+
+
+def mkdir(path):
+    if not path.exists():
+        safe_dir(path.parent)
+        path.mkdir(mode=0o700)
+    safe_dir(path)
+
+
+def atomic(path, body, mode=0o644):
+    safe_dir(path.parent)
+    temporary = path.parent / (".install-" + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def select(target):
+    temporary = BASE / (".select-" + uuid.uuid4().hex)
+    temporary.symlink_to(target)
+    os.replace(temporary, BASE / "current")
+    sync_directory(BASE)
+
+
+def read_pointer():
+    pointer = BASE / "current"
+    if not pointer.is_symlink():
+        if pointer.exists():
+            raise RuntimeError("Current release is not a symlink")
+        return None
+    target = os.readlink(pointer)
+    if not re.fullmatch(r"releases/[0-9a-f]{40}", target):
+        raise RuntimeError("Current release is outside immutable custody")
+    safe_dir(BASE / target)
+    return target
+
+
+def timer_state():
+    enabled = subprocess.run(["systemctl", "is-enabled", UNITS[1]], timeout=10,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+    active = subprocess.run(["systemctl", "is-active", UNITS[1]], timeout=10,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout.strip()
+    if enabled not in {"enabled", "disabled", "not-found"} or active not in {"active", "inactive", "unknown"}:
+        raise RuntimeError("Timer is in an unsupported lifecycle state: " + enabled + "/" + active)
+    return enabled, active
+
+
+def backup():
+    enabled, active = timer_state()
+    record = {"schema": 1, "previous_pointer": read_pointer(), "timer_enabled": enabled,
+              "timer_active": active, "units": {}}
+    for name in UNITS:
+        path = UNIT_DIRECTORY / name
+        try:
+            s = path.lstat()
+            if not stat.S_ISREG(s.st_mode) or s.st_uid != ROOT_UID or s.st_mode & 0o022:
+                raise RuntimeError("Refusing non-owned unit: " + str(path))
+            record["units"][name] = {"body": path.read_text(), "mode": stat.S_IMODE(s.st_mode)}
+        except FileNotFoundError:
+            record["units"][name] = None
+    return record
+
+
+def stop_timer_if_present():
+    if systemctl("show", UNITS[1], "--property=LoadState", "--value") != "not-found":
+        systemctl("stop", UNITS[1])
+
+
+def restore(record):
+    if record.get("schema") != 1 or set(record.get("units", {})) != set(UNITS):
+        raise RuntimeError("Malformed installation rollback custody")
+    target = record["previous_pointer"]
+    if target is not None and not re.fullmatch(r"releases/[0-9a-f]{40}", target):
+        raise RuntimeError("Unsafe rollback release")
+    stop_timer_if_present()
+    # Remove any new enablement symlink while the current unit still exists.
+    if systemctl("show", UNITS[1], "--property=LoadState", "--value") != "not-found":
+        systemctl("disable", UNITS[1])
+    for name in UNITS:
+        path = UNIT_DIRECTORY / name
+        previous = record["units"][name]
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic(path, previous["body"].encode(), previous["mode"])
+    if target is None:
+        (BASE / "current").unlink(missing_ok=True)
+    else:
+        safe_dir(BASE / target)
+        select(target)
+    systemctl("daemon-reload")
+    if record["timer_enabled"] == "enabled":
+        systemctl("enable", UNITS[1])
+    elif record["timer_enabled"] == "disabled":
+        systemctl("disable", UNITS[1])
+    if record["timer_active"] == "active":
+        systemctl("start", UNITS[1])
+
+
+def test_source(path):
+    # All tests operate in temporary fixtures. This does not inspect real caches.
+    command(["/usr/bin/python3", "-I", "-B", "-m", "unittest", "discover", "-s", str(path),
+             "-p", "test_*.py", "-v"])
+    command(["systemd-analyze", "verify", str(path / UNITS[0]), str(path / UNITS[1])])
+
+
+def ensure_idle():
+    state = systemctl("show", UNITS[0], "--property=ActiveState", "--value")
+    if state not in {"inactive", "failed", ""}:
+        raise RuntimeError("Retention is executing; preserve that pass and retry installation after its bounded completion")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--enable-timer", action="store_true", help="Explicitly enable/start the hourly timer, not the service")
+    parser.add_argument("--rollback", help="Restore a saved installation ID printed by this installer")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        raise RuntimeError("Run this dedicated installer with sudo")
+    root = Path(__file__).resolve().parent.parent
+    sha = command(["git", "-C", str(root), "rev-parse", "HEAD"], stdout=subprocess.PIPE, text=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise RuntimeError("A committed Git source is required")
+    paths = ["tools/host-retention/" + name for name in FILES] + ["deploy/host-retention"]
+    for path in paths:
+        actual = (root / path).read_bytes()
+        committed = command(["git", "-C", str(root), "show", sha + ":" + path], stdout=subprocess.PIPE).stdout
+        if actual != committed:
+            raise RuntimeError("Uncommitted installer/source is not installable: " + path)
+    # Tests first, before creating or changing installation or state directories.
+    with tempfile.TemporaryDirectory(prefix="kenan-retention-tests-") as temp:
+        staging = Path(temp)
+        installer_source = command(["git", "-C", str(root), "show", sha + ":deploy/host-retention"], stdout=subprocess.PIPE).stdout
+        (staging / "installer.py").write_bytes(installer_source)
+        for name in FILES:
+            data = command(["git", "-C", str(root), "show", sha + ":tools/host-retention/" + name], stdout=subprocess.PIPE).stdout
+            (staging / name).write_bytes(data)
+        test_source(staging)
+        mkdir(BASE)
+        mkdir(BASE / "releases")
+        mkdir(STATE)
+        os.chmod(STATE, 0o700)
+        mkdir(STATE / "retirements")
+        os.chmod(STATE / "retirements", 0o700)
+        lockfd = os.open(STATE / "install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(lockfd).st_mode) or os.fstat(lockfd).st_uid != ROOT_UID or os.fstat(lockfd).st_nlink != 1:
+                raise RuntimeError("Unsafe installation lock")
+            fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ensure_idle()
+            if args.rollback:
+                if args.enable_timer or not re.fullmatch(r"[0-9]{10}-[0-9a-f]{32}", args.rollback):
+                    raise RuntimeError("Invalid rollback ID or conflicting enable request")
+                path = STATE / ("install-" + args.rollback + ".json")
+                s = path.lstat()
+                if not stat.S_ISREG(s.st_mode) or s.st_uid != ROOT_UID or stat.S_IMODE(s.st_mode) != 0o600:
+                    raise RuntimeError("Unsafe rollback record")
+                record = json.loads(path.read_text())
+                previous = record["previous_pointer"]
+                if previous is not None:
+                    if not re.fullmatch(r"releases/[0-9a-f]{40}", previous):
+                        raise RuntimeError("Unsafe rollback pointer")
+                    test_source(BASE / previous)
+                restore(record)
+                print(json.dumps({"rolled_back": args.rollback, "apply_pass_invoked": False}))
+                return
+            release = BASE / "releases" / sha
+            if release.exists():
+                safe_dir(release)
+                for name in FILES + ("installer.py",):
+                    s = (release / name).lstat()
+                    if not stat.S_ISREG(s.st_mode) or s.st_uid != ROOT_UID or s.st_mode & 0o222 or (release / name).read_bytes() != (staging / name).read_bytes():
+                        raise RuntimeError("Existing immutable release differs: " + str(release / name))
+            else:
+                pending = BASE / "releases" / (".pending-" + uuid.uuid4().hex)
+                pending.mkdir(mode=0o700)
+                try:
+                    for name in FILES + ("installer.py",):
+                        atomic(pending / name, (staging / name).read_bytes(), 0o444)
+                    pending.chmod(0o555)
+                    os.rename(pending, release)
+                    sync_directory(release.parent)
+                except BaseException:
+                    if pending.exists():
+                        pending.chmod(0o700)
+                        shutil.rmtree(pending)
+                    raise
+            record = backup()
+            record.update(installed_commit=sha, installation_id=str(int(time.time())) + "-" + uuid.uuid4().hex)
+            receipt = STATE / ("install-" + record["installation_id"] + ".json")
+            atomic(receipt, (json.dumps(record, indent=2) + "\n").encode(), 0o600)
+            try:
+                stop_timer_if_present()
+                ensure_idle()  # Close a timer firing between the first check and stop.
+                select("releases/" + sha)
+                for name in UNITS:
+                    atomic(UNIT_DIRECTORY / name, (release / name).read_bytes())
+                systemctl("daemon-reload")
+                if args.enable_timer:
+                    systemctl("enable", "--now", UNITS[1])
+                else:
+                    systemctl("disable", UNITS[1])
+            except BaseException:
+                restore(record)
+                raise
+            print(json.dumps({"installed_commit": sha, "timer_enabled": args.enable_timer,
+                              "apply_pass_invoked": False, "rollback_receipt": str(receipt),
+                              "rollback_command": "sudo deploy/host-retention --rollback " + record["installation_id"]}))
+        finally:
+            os.close(lockfd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise SystemExit("Host retention installation failed: " + str(error))
