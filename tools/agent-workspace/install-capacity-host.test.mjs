@@ -1,7 +1,7 @@
 import './scratch-env.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -15,4 +15,11 @@ for(const status of [75,124])test(`installer reports exact ${status} without rep
   assert.equal(report.error.code,status===75?'host-tool-install-lock-busy':'host-tool-install-failed');
   if(status===124)assert.equal(report.error.exitCode,status);
  }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test('installation allows the existing 240-second sampler to finish without killing or replaying it',()=>{
+ const source=readFileSync(new URL('./install-capacity-host',import.meta.url),'utf8');
+ const [,outer,wait]=source.match(/timeout (\d+) flock --exclusive --wait (\d+)/);
+ assert.ok(Number(wait)>240);assert.ok(Number(outer)>=Number(wait)+80);
+ assert.match(source,/no PID or systemd unit is killed/);
 });
