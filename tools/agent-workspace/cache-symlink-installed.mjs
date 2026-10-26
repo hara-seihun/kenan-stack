@@ -1,0 +1,15 @@
+// Native release proof with a disposable checkout and external dependency tree. No test safety overrides.
+import fs from 'node:fs';import path from 'node:path';import {tmpdir} from 'node:os';import {execFileSync,spawn} from 'node:child_process';import {once} from 'node:events';import assert from 'node:assert/strict';
+const entry=new URL('./workspace.mjs',import.meta.url).pathname;
+const base=fs.mkdtempSync(path.join(tmpdir(),'cache-link-native-release-'));const root=path.join(base,'source'),outside=path.join(base,'canonical/node_modules'),remote=path.join(base,'durable.git');
+const git=(...a)=>execFileSync('git',a,{encoding:'utf8',timeout:10000,stdio:['ignore','pipe','pipe']}).trim();
+const env={...process.env,PI_WORKSPACE_STATE:path.join(base,'registry.sqlite3')};delete env.NODE_TEST_CONTEXT;delete env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
+const run=a=>JSON.parse(execFileSync(process.execPath,[entry,...a],{env,encoding:'utf8',timeout:55000}));
+let held;
+try{fs.mkdirSync(root);fs.mkdirSync(outside,{recursive:true});fs.mkdirSync(path.join(root,'products/kenan'),{recursive:true});fs.writeFileSync(path.join(outside,'payload'),'external durable payload');
+git('init','--bare',remote);git('-C',root,'init','-b','main');git('-C',root,'config','user.email','fixture@example.invalid');git('-C',root,'config','user.name','Fixture');fs.writeFileSync(path.join(root,'.gitignore'),'node_modules\n');fs.writeFileSync(path.join(root,'source'),'durable');git('-C',root,'add','.');git('-C',root,'commit','-m','durable');git('-C',root,'remote','add','origin',remote);git('-C',root,'push','origin','main');fs.symlinkSync(outside,path.join(root,'products/kenan/node_modules'));
+const record=run(['register','--path',root,'--root',base,'--owner','native-disposable-fixture','--source-commit',git('-C',root,'rev-parse','HEAD'),'--json']);held=spawn(process.execPath,['-e',`const f=require('node:fs');process.stdin.once('data',p=>{f.openSync(p.toString(),'r');console.log('ready');});setInterval(()=>{},1000)`],{stdio:['pipe','pipe','pipe']});held.stdin.end(path.join(root,'products/kenan/node_modules/payload'));await once(held.stdout,'data');
+const retained=run(['release','--id',record.id,'--json']);assert.equal(retained.action,'none',JSON.stringify(retained));assert.equal(fs.lstatSync(path.join(root,'products/kenan/node_modules')).isSymbolicLink(),true);assert.equal(retained.inspection.classification,'repair-required');
+held.kill('SIGKILL');await once(held,'exit');held=null;
+const result=run(['release','--id',record.id,'--json']);assert.equal(result.action,'released');assert.ok(result.removedCaches.includes('products/kenan/node_modules'));assert.equal(fs.readFileSync(path.join(outside,'payload'),'utf8'),'external durable payload');console.log(JSON.stringify({ok:true,kind:'native-ordinary-release-cache-symlink',testOverrides:false,readOnlyRealTargetReferenceProtected:true,externalTargetPreserved:true}));}
+finally{if(held){held.kill('SIGKILL');await once(held,'exit');}fs.rmSync(base,{recursive:true,force:true});}

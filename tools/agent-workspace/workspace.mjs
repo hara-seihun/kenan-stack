@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {unlinkDeclaredCacheSymlink} from './cache-symlink.mjs';
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
@@ -844,7 +845,7 @@ function gitDisposition(record, nestedWorkspaces = []) {
     .filter((line) => !nestedRelativePaths.includes(line.slice(3).replace(/\/$/u, "")))
     .filter((line) => {
       const candidate = path.resolve(record.path, line.slice(3).replace(/\/$/u, ""));
-      try { return existsSync(candidate) && directoryHasEntries(candidate); } catch { return true; }
+      try { return lstatSync(candidate).isSymbolicLink() || directoryHasEntries(candidate); } catch (error) { return error.code !== "ENOENT"; }
     });
   const head = git(record.path, ["rev-parse", "HEAD"]);
   // Snapshot names and object IDs together; do not walk the graph per branch.
@@ -948,13 +949,13 @@ function* cacheTargets(workspacePath, cachePaths, readDirectory = readdirSync) {
       continue;
     }
     for (const entry of entries) {
-      if (entry.isSymbolicLink() || entry.name === ".git") continue;
+      if (entry.name === ".git") continue;
       const candidate = path.join(current, entry.name);
       // A **/name declaration names generated output wherever it appears: a
       // directory such as node_modules or a single file such as
       // client.generated.ts. Tracked files are protected by the consumer.
       if (directoryNames.has(entry.name)) yield candidate;
-      if (!entry.isDirectory()) continue;
+      if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
       // The consumer removes generated trees before traversal resumes. Tracked
       // directories stay in place and may contain other generated caches.
       if (existsSync(candidate)) pending.push(candidate);
@@ -1002,12 +1003,20 @@ function effectiveCachePaths(record) {
   return [...new Set([...DEFAULT_CACHE_PATHS, ...record.cachePaths, ...repositoryManifestCachePaths(record.path)])];
 }
 
-function stripCaches(record, statePath, invalidateCapacity) {
+function stripCaches(record, statePath, invalidateCapacity, observeLink) {
   const removed = [];
   const seen = new Set();
   for (const target of cacheTargets(record.path, effectiveCachePaths(record))) {
     if (seen.has(target) || !within(record.path, target) || target === record.path || !existsSync(target)) continue;
     seen.add(target);
+    // Explicit declarations must not reach through an aliased parent either.
+    if (realpathSync(record.path) !== record.path || realpathSync(path.dirname(target)) !== path.dirname(target)) continue;
+    if (lstatSync(target).isSymbolicLink()) {
+      if (unlinkDeclaredCacheSymlink({root:record.path, target, declarations:effectiveCachePaths(record),
+        tracked:holdsTrackedFiles, ignored:relative => command("git",["-C",record.path,"check-ignore","--quiet","--",relative]).status === 0,
+        observe:observeLink, invalidateCapacity})) removed.push(path.relative(record.path, target));
+      continue;
+    }
     if (holdsTrackedFiles(target)) continue;
     const cacheKey = createHash("sha256").update(path.relative(record.path, target)).digest("hex").slice(0, 12);
     const destination = gcDestination(statePath, record, `${path.basename(target)}-${cacheKey}`);
@@ -1195,7 +1204,7 @@ function reconcileRecord(database, record, options) {
       return { record, inspection, action: "none" };
     }
     if(inspection.sourceRetention===true){updateState(database,record,"repair-required",inspection.reason);return {record,inspection,action:"none",removedCaches:[]};}
-    removedCaches = stripCaches(record, options.statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id));
+    removedCaches = stripCaches(record, options.statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id), roots => cacheSymlinkSafety(database, record, roots));
     inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
   }
   if (inspection.classification === "repair-required") {
@@ -1277,7 +1286,7 @@ function groupReconciliation(database, records, options) {
   if (options.execute && !preserveKnownSource && !inspections.some((inspection) => ["referenced", "blocked"].includes(inspection.classification)||inspection.sourceRetention===true)) {
     records.forEach((record, index) => {
       if (inspections[index].classification !== "missing") {
-        removedCaches.set(record.id, stripCaches(record, options.statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id)));
+        removedCaches.set(record.id, stripCaches(record, options.statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id), roots => cacheSymlinkSafety(database, record, roots)));
       }
     });
     inspections = records.map((record) => inspectRecord(record,
@@ -3597,7 +3606,7 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
       if (frozen) return protect({classification:"blocked",...frozen,processes:[],containers:[],systemdUnits:[]});
       let removedCaches = [];
       if (inspection.classification === "repair-required") {
-        removedCaches = stripCaches(record, statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id));
+        removedCaches = stripCaches(record, statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id), roots => cacheSymlinkSafety(database, record, roots));
       }
       inspection = observe();
       if (!["reclaimable", "missing"].includes(inspection.classification)) return {...protect(inspection), removedCaches};
@@ -4399,6 +4408,16 @@ function materializationSafety(database, parent, roots, resourceKind, cacheRoots
       ...threads.filter(thread => typeof thread.cwd !== "string" || roots.some(root => within(root, thread.cwd)))],
     retainedBorrowers, observedAt: Date.now()};
 }
+function cacheSymlinkSafety(database, record, roots) {
+  if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty")
+    return {errors:[], references:[], retainedBorrowers:[], observedAt:Date.now()};
+  const safety = materializationSafety(database, record, roots, "generated-cache", roots);
+  const installed = installedReferenceSnapshot(census.INSTALL_ROOTS);
+  const qualifications = qualificationReferences(roots);
+  return {...safety, errors:[...safety.errors, ...qualifications.errors],
+    references:[...safety.references, ...roots.flatMap(root => installedReferences(root, installed)), ...qualifications.references], observedAt:Date.now()};
+}
+
 function cacheBinding(database, id) {
   const record=recordBy(database,{id});
   if (!["active","referenced","blocked","repair-required"].includes(record.state)) throw new CacheRetirementError("cache-lifecycle-protected", "workspace lifecycle is not retained/ended");
@@ -5048,7 +5067,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { openRegistry, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { openRegistry, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
