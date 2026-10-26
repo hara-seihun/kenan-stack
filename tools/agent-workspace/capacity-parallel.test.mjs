@@ -60,3 +60,12 @@ test('source liability has no timed waiver, excludes only its exact destination 
   assert.equal(workspaceTesting.capacityRequirement({...plan,constructionBytes:25},held.priced,held.headroomBytes),8417);
  }finally{db.close();}
 });
+
+// Protect the CPU admission of the real forty-client historical checks.
+import {workspaceChecks} from './check.mjs';
+test('the historical forty-client checks are isolated from ordinary checks', () => {
+  const stress=['agent workspace 104/128','agent workspace 105/128'];
+  const ordinary=workspaceChecks.map(([name])=>name).filter(name=>!stress.includes(name));
+  assert.deepEqual(workspaceChecks.find(job=>job[0]===stress[0])[3].dependsOn, ordinary);
+  assert.deepEqual(workspaceChecks.find(job=>job[0]===stress[1])[3].dependsOn, [stress[0]]);
+});

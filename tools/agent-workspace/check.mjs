@@ -15,6 +15,15 @@ export const workspaceChecks = [["agent workspace frozen source", "sudo", ["-n",
   { timeoutMs: index===103||index===104?240_000:index===81?120_000:55_000, env: { AGENT_WORKSPACE_TEST_SHARD: `${index}/${shardCount}` } },
 ])];
 
+// These historical stress checks each launch forty clients. Run their full
+// internal concurrency after ordinary checks rather than oversubscribing the
+// same CPU budget with other test processes and timing out their real clients.
+const stressNames = ["agent workspace 104/128", "agent workspace 105/128"];
+const ordinaryNames = workspaceChecks.map(([name]) => name).filter(name => !stressNames.includes(name));
+for (const [index, name] of stressNames.entries()) {
+  workspaceChecks.find(job => job[0] === name)[3].dependsOn = index ? [stressNames[index - 1]] : ordinaryNames;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await runJobs(workspaceChecks, { concurrency: 1 });
 }
