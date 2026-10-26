@@ -2104,8 +2104,10 @@ test("forty concurrent create and heartbeat clients share registry writes", asyn
       for (let attempt = 0; ; attempt++) {
         try { return JSON.parse(await runAsync(args, f.env)); }
         catch (error) {
-          if (attempt >= 2 || error.code !== 75 ||
-              !/workspace resource busy: capacity:[0-9]+: 30000ms lock budget exhausted/u.test(error.stderr ?? "")) throw error;
+          const detail = String(error.message ?? "");
+          const lockOnly = error.code === 75 && /agent-workspace: (?:agent-workspace: )?workspace resource busy: capacity:[0-9]+: 30000ms lock budget exhausted/u.test(detail);
+          const ceasedCheckout = error.code === 2 && /checkout failed \(checkout-materialization-failed\): agent-workspace: workspace resource busy: capacity:[0-9]+: 30000ms lock budget exhausted[\s\S]*private staging removed; destination not partially published/u.test(detail);
+          if (attempt >= 2 || (!lockOnly && !ceasedCheckout)) throw error;
         }
       }
     }));
