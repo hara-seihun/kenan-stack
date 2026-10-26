@@ -18,3 +18,9 @@ test('a pending publisher prevents a stream of new readers from starving its exc
   assert.equal(result.status,0,result.stderr);assert.equal(fs.readFileSync(order,'utf8'),'publisher\nreader\n');
  }finally{for(const child of [old,publisher].filter(Boolean))await new Promise(resolve=>child.exitCode===null?child.once('exit',resolve):resolve());fs.rmSync(root,{recursive:true,force:true});}
 });
+test('an admission timeout returns a typed machine refusal and never starts the requested command',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'workspace-busy-'));
+ try{const bin=path.join(root,'bin'),selected=path.join(root,'selected');fs.mkdirSync(bin);fs.mkdirSync(selected);fs.writeFileSync(path.join(bin,'flock'),'#!/bin/sh\nexit 75\n',{mode:0o755});fs.writeFileSync(path.join(selected,'main'),'#!/bin/sh\necho should-not-run\n',{mode:0o755});
+ const result=spawnSync(new URL('./admission-launcher',import.meta.url).pathname,['create','--json'],{env:{...process.env,PATH:bin+':/usr/bin:/bin',AGENT_WORKSPACE_ADMISSION_LOCK:path.join(root,'lock'),AGENT_WORKSPACE_SELECTED_ROOT:selected},encoding:'utf8',timeout:3000});assert.equal(result.status,75);assert.equal(JSON.parse(result.stdout).error.code,'workspace-admission-lock-busy');assert.doesNotMatch(result.stdout,/should-not-run/);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

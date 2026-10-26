@@ -17,3 +17,10 @@ test('public ordinary reprice single selectors reach capacity and every refusal 
   for(const selector of [[],['--id',record.id,'--path',repo]]){const r=run(['reprice-capacity',...selector,...options]);assert.equal(r.status,2,r.stderr);assert.equal(JSON.parse(r.stdout).error.code,'invalid-workspace-selector');}
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('the public Actions adoption command validates its bound selector before any GitHub effect',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'adopt-public-'));
+ try{const result=spawnSync(process.execPath,[script,'adopt-ended-actions','--id','missing','--path',root,'--repository','owi-link/converge','--run','1','--attempt','1','--source-commit','a'.repeat(40),'--json'],{env:{...process.env,PI_WORKSPACE_STATE:path.join(root,'registry.sqlite3')},encoding:'utf8',timeout:10000});
+ assert.equal(result.status,2);assert.doesNotMatch(result.stderr,/invalid-selector-contract|adopt-ended-actions$/);assert.match(result.stderr,/unknown workspace|workspace not found|workspace not registered/);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
