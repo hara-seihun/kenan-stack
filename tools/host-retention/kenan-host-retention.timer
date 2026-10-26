@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly bounded retention of Kenan work caches and explicitly retired logs
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+AccuracySec=1m
+Persistent=false
+Unit=kenan-host-retention.service
+
+[Install]
+WantedBy=timers.target

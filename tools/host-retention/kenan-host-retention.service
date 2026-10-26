@@ -1,0 +1,36 @@
+[Unit]
+Description=Bounded Kenan work cache and explicitly retired background log retention
+Documentation=file:/usr/local/lib/kenan-host-retention/current/README.md
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/kenan-host-retention/current/retention.py --apply --max-seconds 90 --max-files 64 --max-bytes 536870912 --max-inspected-nodes 2000000
+TimeoutStartSec=110s
+TimeoutStopSec=5s
+KillMode=control-group
+MemoryMax=256M
+CPUQuota=25%
+TasksMax=16
+Nice=19
+IOSchedulingClass=idle
+OOMScoreAdjust=500
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=false
+ReadWritePaths=/var/lib/kenan-host-retention
+ReadWritePaths=-/home/kenan/.bun/install/cache
+ReadWritePaths=-/home/kenan/.npm/_cacache/tmp
+ReadWritePaths=-/var/tmp/kenan-bg/kenan
+# A complete host /proc census requires the host PID namespace and ptrace
+# inspection capability. Do not add PrivateUsers, ProtectProc or ProcSubset.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
