@@ -185,3 +185,52 @@ test('legacy explicitly tagged content progress migrates without becoming alloca
   assert.equal(f.db.prepare('SELECT 1 FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id),undefined);
  },50);
 }));
+
+test('fleet finishes a bounded row quantum instead of spreading all observation starts across the fleet',()=>fixture(f=>{
+ f.db.prepare('DELETE FROM workspace_capacity WHERE workspace_id=?').run(f.rows.current.id);
+ const directories=['large','small'].map(name=>path.join(f.rows[name].path,'slow-completion'));
+ for(const dir of directories){fs.mkdirSync(dir);for(let i=0;i<8;i++)fs.writeFileSync(path.join(dir,String(i)),'payload');}
+ const now=Date.now,lstat=fs.lstatSync;let elapsed=0;
+ Date.now=()=>now()+elapsed;
+ fs.lstatSync=(file,...args)=>{const result=lstat(file,...args);if(directories.includes(path.dirname(String(file))))elapsed+=600;return result;};
+ syncBuiltinESMExports();let pass;
+ try{pass=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--budget-ms','7500','--json']);}
+ finally{Date.now=now;fs.lstatSync=lstat;syncBuiltinESMExports();}
+ assert.ok(pass.results.some(r=>r.path===f.rows.large.path&&r.status==='measured'),'one complete observation must finish before starting every other expensive walk');
+ const sample=JSON.parse(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json);
+ assert.equal(sample.ok,true);assert.equal(sample.writeObservationComplete,false);
+ const exact=workspaceTesting.workspaceAllocationSample(f.rows.large.path,f.device,{deadline:Date.now()+5000,maxEntries:2000000});
+ assert.equal(sample.bytes,exact.bytes);assert.equal(sample.allocatedBytes,exact.allocatedBytes);
+ assert.ok(pass.elapsedMs<9000,'the fleet aggregate budget remains bounded');
+ assert.equal(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.small.id),undefined,'unfinished sibling cannot receive partial credit');
+}));
+
+test('one huge tree yields its completion quantum without starving a smaller row',()=>fixture(f=>{
+ f.db.prepare('DELETE FROM workspace_capacity WHERE workspace_id=?').run(f.rows.current.id);
+ const directory=path.join(f.rows.large.path,'huge-quantum');fs.mkdirSync(directory);
+ for(let i=0;i<40;i++)fs.writeFileSync(path.join(directory,String(i)),'data');
+ const now=Date.now,lstat=fs.lstatSync;let elapsed=0;
+ Date.now=()=>now()+elapsed;
+ fs.lstatSync=(file,...args)=>{const result=lstat(file,...args);if(path.dirname(String(file))===directory)elapsed+=1000;return result;};
+ syncBuiltinESMExports();let pass;
+ try{pass=f.run(['measure-capacity','--root',path.join(f.root,'pool'),'--budget-ms','32000','--json']);}
+ finally{Date.now=now;fs.lstatSync=lstat;syncBuiltinESMExports();}
+ assert.ok(pass.results.some(r=>r.path===f.rows.small.path&&r.status==='measured'));
+ assert.equal(f.db.prepare('SELECT 1 FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id),undefined);
+ assert.ok(pass.elapsedMs<34000);
+}));
+
+test('expired incomplete allocation progress restarts without erasing the complete sample',()=>fixture(f=>{
+ f.run(['measure-capacity','--id',f.rows.large.id,'--json']);
+ const original=f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json;
+ withSlowWalk(f,()=>{
+  f.run(['measure-capacity','--id',f.rows.large.id,'--incremental','--budget-ms','400','--json']);
+  const state=JSON.parse(f.db.prepare('SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?').get(f.rows.large.id).state_json);
+  state.startedAt=Date.now()-16*60000;
+  f.db.prepare('UPDATE workspace_capacity_walk SET state_json=? WHERE workspace_id=?').run(JSON.stringify(state),f.rows.large.id);
+  const pass=f.run(['measure-capacity','--id',f.rows.large.id,'--incremental','--budget-ms','400','--json']);
+  assert.ok(pass.results[0].startedAt>state.startedAt);
+  assert.equal(pass.progress.measured,0);
+  assert.equal(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json,original);
+ },500);
+}));

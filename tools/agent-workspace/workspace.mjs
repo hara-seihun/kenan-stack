@@ -4963,6 +4963,10 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
       const saved=database.prepare(`SELECT state_json FROM ${walkTable} WHERE workspace_id=?`).get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
       if(prior && prior.contentProof!==contentProof)prior=null;
+      // An allocation walk that already exceeds the unchanged freshness window
+      // cannot finish as a fresh physical observation. Restart traversal only;
+      // never erase the last complete sample or publish a partial allocation.
+      if(prior && !contentProof && Date.now()-prior.startedAt>CAPACITY_MEASUREMENT_MAX_AGE_MS)prior=null;
       const until=Math.min(deadline,Date.now()+1000);
       const walk=observeContent=>allocationSlice(row.path,row.device_id,prior,{deadline:until,excludedPaths,observeContent});
       const slice=contentProof?withContentObservation(database,{deadline:until},walk):walk(undefined);
@@ -5031,12 +5035,18 @@ function measureCapacityCommand(database, args, statePath) {
         results.push({ path: row.path, status: "deferred", budgetBytes: budget, cache: cached.ok ? "current" : cached.code });
         continue;
       }
-      // A targeted walk owns the requested bounded budget. Fleet sampling keeps
-      // its short per-row lock window and resumable traversal slices.
-      const sampleDeadline = selected === null ? Math.min(deadline, Date.now() + 2000) : deadline;
-      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null||bool(args,'incremental'),bool(args,'content-proof'));
-      counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
-      results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
+      // Finish a bounded row quantum before spreading observation starts across
+      // the entire fleet. Each individual checkout lock remains at most two
+      // seconds; a huge tree cannot monopolize the aggregate fleet budget.
+      // Oldest-attempt ordering rotates unfinished rows on the next activation.
+      const quantumDeadline=selected===null?Math.min(deadline,Date.now()+30000):deadline;
+      let sample;
+      do {
+        const sampleDeadline = selected === null ? Math.min(quantumDeadline, Date.now() + 2000) : deadline;
+        sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null||bool(args,'incremental'),bool(args,'content-proof'));
+        counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
+        results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
+      } while(selected===null && sample.partial && Date.now()<quantumDeadline);
       if(sample.partial)next.push({row,budget,cached});
     }
     pending=next;
