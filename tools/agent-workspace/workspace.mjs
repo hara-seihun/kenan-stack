@@ -3,6 +3,7 @@ import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
+import {ownerFutureWrites,observeCapacityChildren,capacityOwnerProjection} from './capacity-owner-forecast.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {assertIdleGrowth,assertIdleObservation} from './idle-growth.mjs';
@@ -2085,7 +2086,7 @@ function terminalQualificationPaths(rows, database) {
   return settled;
 }
 
-function capacityReservations(database, device, reservedPath, measure) {
+function capacityReservations(database, device, reservedPath, measure, observationOptions = {}) {
   if (database === undefined) return { priced: [], headroomBytes: 0, unpricedDormant: 0 };
   const unknown = database.prepare(`SELECT w.path, w.root FROM workspace w LEFT JOIN workspace_capacity c ON c.workspace_id=w.id
     WHERE w.state='creating' AND c.workspace_id IS NULL AND w.path!=?`).all(reservedPath ?? "");
@@ -2099,10 +2100,20 @@ function capacityReservations(database, device, reservedPath, measure) {
   }
   let headroomBytes = 0;
   const measurementFailures = [], growthRepricing=[], staleAllocationForecasts=[];
-  const rows = database.prepare(`SELECT c.plan_json, w.id, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
+  const rows = database.prepare(`SELECT c.plan_json, w.id, w.owner, w.state, w.path, w.created_at FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
     WHERE c.device_id=? AND w.path!=? AND w.state!='released' ORDER BY w.created_at DESC, w.id`)
     .all(device, reservedPath ?? "");
   const settled = terminalQualificationPaths(rows, database);
+  const now = Date.now(), deadline = now + 3000;
+  const owners = new Map(rows.map(row => [row.id, canonicalNativeOwner(database, row)]));
+  const nativeOwners = [...new Set([...owners.values()].filter(owner => OWNER_AGENT_ID.test(owner)))];
+  let ownerObservation = null;
+  if (nativeOwners.length) {
+    try { ownerObservation = observationOptions.owners ?? ownerLivenessObservation(nativeOwners, deadline); }
+    catch (error) { ownerObservation = {errors:[String(error.message)],owners:nativeOwners,agents:[],wakes:[]}; }
+  }
+  const inactiveRows = rows.filter(row => row.state !== 'creating' && ownerFutureWrites(owners.get(row.id), ownerObservation, now).kind === 'inactive');
+  const children = inactiveRows.length ? (observationOptions.children ?? observeCapacityChildren(inactiveRows.map(row => row.path), {deadline})) : null;
   const priced = rows.map(row => {
       const plan = JSON.parse(row.plan_json);
       if (!["source-only", "budgeted", "unestimated"].includes(plan.intent) ||
@@ -2111,7 +2122,8 @@ function capacityReservations(database, device, reservedPath, measure) {
       let restored=false;
       try{restored=(JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json??'{}').restoreAt??0)>settled.get(row.path);}catch{restored=true;}
       const terminal = row.state!=='creating' && settled.has(row.path) && !restored;
-      const budget = terminal ? 0 : measuredBudgetBytes(plan, row.state);
+      const ownerForecast = capacityOwnerProjection(row, owners.get(row.id), ownerObservation, children, now);
+      const budget = terminal || ownerForecast.zero ? 0 : measuredBudgetBytes(plan, row.state);
       const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
@@ -2134,7 +2146,7 @@ function capacityReservations(database, device, reservedPath, measure) {
       const liability = ledgerLiability(plan, row.state, forecast ? {ok:true,bytes:forecast.bytes} : measurement);
       const trustworthy = measurement.ok || measurement.code === 'allocated-block-cache-stale' && forecast !== null;
       const policyEligible = row.state !== 'creating' && ['source-only','budgeted'].includes(plan.intent) && plan.growthBytes > 0 && !plan.growthLifecycle;
-      const policy = terminal ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : !policyEligible ? null : trustworthy
+      const policy = ownerForecast.zero ? {effectiveRemainingBytes:0,fullReservation:false,reason:ownerForecast.code} : terminal ? {effectiveRemainingBytes:0,fullReservation:false,reason:'terminal-qualification'} : !policyEligible ? null : trustworthy
         ? projectGrowthPolicy(database,row,plan,measurement.ok ? {...measurement,bytes:measurement.rawBytes??measurement.bytes} : measurement.lastObservation)
         : {effectiveRemainingBytes:plan.growthBytes,fullReservation:true,reason:'measurement-unavailable'};
       if (policy!==null) {

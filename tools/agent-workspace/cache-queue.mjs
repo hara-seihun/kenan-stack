@@ -71,14 +71,16 @@ export function queueReferenceSql(root,selfArgs,resourceKind){
  const textMatch=body=>roots.map(root=>`strpos(${body},${literal(root)})>0`).join(' OR ');
  const selfCall=selfArgs===null?'FALSE':`EXISTS (SELECT 1 FROM agent a WHERE a.id=${literal(selfArgs.agentId)} AND a.conversation_id=m.conversation_id) AND EXISTS (SELECT 1 FROM jsonb_array_elements(m.parts) p WHERE p->>'type'='tool' AND p->>'callId'=${literal(selfArgs.callId)})`;
 
+ const matchedRoots=body=>`to_json(array_remove(ARRAY[${roots.map(root=>`CASE WHEN (${serializedMatchForRoot(body,root)}) THEN ${literal(root)} ELSE NULL END`).join(',')}],NULL))`;
+ const serializedMatchForRoot=(body,root)=>`strpos((${body})::text,${literal(JSON.stringify(root).slice(1,-1))})>0 AND jsonb_path_exists(${body},${literal('strict $.** ? (@.type() == "string" && @ like_regex '+JSON.stringify(root)+' flag "q")')}::jsonpath)`;
  const source=resourceKind==='source';
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='4000ms';
  WITH running AS MATERIALIZED (SELECT m.id,m.conversation_id,m.parts,(${selfCall}) AS self FROM message m WHERE m.role='tool' AND m.state='streaming'),
  unique_self AS MATERIALIZED (SELECT id FROM running WHERE self AND (SELECT count(*) FROM running WHERE self)=1),
  self AS MATERIALIZED (SELECT DISTINCT conversation_id FROM running WHERE id IN (SELECT id FROM unique_self)),
- tools AS (SELECT 'tool_call' AS kind,r.id::text AS id,'running' AS state,'reserved-tool-call' AS "resourceClass",p->>'name' AS "toolName",p->'args'->>'path' AS "targetPath"
+ tools AS (SELECT 'tool_call' AS kind,r.id::text AS id,'running' AS state,'reserved-tool-call' AS "resourceClass",p->>'name' AS "toolName",p->'args'->>'path' AS "targetPath",${matchedRoots("p->'args'")} AS "matchedRoots"
   FROM running r CROSS JOIN LATERAL jsonb_array_elements(r.parts) p WHERE r.id NOT IN (SELECT id FROM unique_self) AND p->>'type'='tool' AND (${serializedMatch("p->'args'")}) AND (${jsonMatch("p->'args'")})),
- workers AS (SELECT 'agent' AS kind,a.id,a.state,'source-intent' AS "resourceClass",NULL::text AS "toolName",NULL::text AS "targetPath"
+ workers AS (SELECT 'agent' AS kind,a.id,a.state,'source-intent' AS "resourceClass",NULL::text AS "toolName",NULL::text AS "targetPath",NULL::json AS "matchedRoots"
   FROM agent a WHERE ${source?'TRUE':'FALSE'} AND a.role='worker' AND NOT a.archived AND a.state<>'stopped' AND a.conversation_id NOT IN (SELECT conversation_id FROM self)
   AND EXISTS (SELECT 1 FROM message m WHERE m.conversation_id=a.conversation_id AND ((${textMatch('m.text')}) OR ((${serializedMatch('m.parts')}) AND (${jsonMatch('m.parts')}))))),
  matching AS (SELECT * FROM tools UNION ALL SELECT * FROM workers)

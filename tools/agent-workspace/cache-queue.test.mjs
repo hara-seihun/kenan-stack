@@ -59,6 +59,8 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   assert.deepEqual(keys(sourceScope),[...keys(physical),'agent:idle','agent:live'].sort());
   assert.equal(physical.references.find(r=>r.id===ids['running-read']).targetPath,source+'/README.md');
   assert.equal(physical.references.find(r=>r.id===ids['running-read']).resourceClass,'reserved-tool-call');
+  const batch=JSON.parse(query(queueReferenceSql([source,'/fixture/unrelated'],self,'physical-checkout')));
+  assert.deepEqual(batch.references.find(r=>r.id===ids['running-read']).matchedRoots,[source], 'a batch preserves exact tool-to-root matching instead of keeping every inactive root live');
   assert.equal(sourceScope.references.find(r=>r.id==='live').resourceClass,'source-intent');
   // A different invocation that merely mentions agent-workspace is not the caller.
   assert.equal(observe('physical-checkout',{...self,agentId:'live'}).self,0);
