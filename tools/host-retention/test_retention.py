@@ -59,6 +59,17 @@ class RetentionTests(unittest.TestCase):
         destination.chmod(0o600)
         return destination
 
+    def test_empty_quarantine_is_not_unresolved_custody(self):
+        quarantine = self.cache / r.QUARANTINE
+        quarantine.mkdir(mode=0o700)
+        report = self.run_pass()
+        self.assertIn("empty_quarantine_control_directory", report["retained_reasons"])
+        self.assertNotIn("quarantine_requires_reconciliation", report["retained_reasons"])
+        (quarantine / "interrupted-entry").write_text("preserve")
+        report = self.run_pass()
+        self.assertIn("quarantine_requires_reconciliation", report["retained_reasons"])
+        self.assertTrue((quarantine / "interrupted-entry").exists())
+
     def test_default_dry_run(self):
         path = self.file()
         report = self.run_pass()

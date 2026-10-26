@@ -480,8 +480,18 @@ def run(*, roots=ROOTS, state=STATE, owner=None, apply=False, seconds=90,
                                     report["entries"].append(record)
                                     try:
                                         if entry.name == QUARANTINE:
-                                            # Never guess that interrupted detachments are disposable.
-                                            raise Retain("quarantine_requires_reconciliation")
+                                            # An empty control directory is normal after success;
+                                            # only surviving entries need reconciliation.
+                                            qfd = os.open(entry.name, DIR_FLAGS, dir_fd=parent)
+                                            try:
+                                                qs = os.fstat(qfd)
+                                                if qs.st_uid != ROOT_UID or stat.S_IMODE(qs.st_mode) != 0o700:
+                                                    raise Retain("quarantine_unsafe")
+                                                with names(qfd) as pending:
+                                                    occupied = next(pending, None) is not None
+                                            finally:
+                                                os.close(qfd)
+                                            raise Retain("quarantine_requires_reconciliation" if occupied else "empty_quarantine_control_directory")
                                         tree = snapshot(parent, entry.name, owner, budget, clock())
                                         unused(tree, first_used)
                                         if kind == "logs":
