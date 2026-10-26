@@ -36,4 +36,4 @@ export function main(){
  if(result.status!==0||result.error)throw Error('background_launch_failed: '+(result.stderr||result.error));
  console.log(JSON.stringify({unit:spec.unit,identity:binding}));
 }
-if(process.argv[1]&&new URL(import.meta.url).pathname===process.argv[1]){try{main();}catch(error){console.error(error.message);process.exitCode=2;}}
+if(process.argv[1]&&new URL(import.meta.url).pathname===fs.realpathSync(process.argv[1])){try{main();}catch(error){console.error(error.message);process.exitCode=2;}}

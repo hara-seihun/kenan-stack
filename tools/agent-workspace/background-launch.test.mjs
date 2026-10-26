@@ -20,3 +20,12 @@ test('stale, forged, wrong worker and wrong launch metadata cannot authenticate 
  assert.throws(()=>backgroundSpec(input,null,1000,1000),/caller_required/);
  assert.throws(()=>backgroundSpec(input,binding,0,0),/caller_required/);
 });
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {spawnSync} from 'node:child_process';
+test('the installed symlink invokes the actual CLI rather than silently doing nothing',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-cli-'));
+ try{const file=path.join(root,'linked.mjs');fs.symlinkSync(new URL('./background-launch.mjs',import.meta.url).pathname,file);const r=spawnSync(process.execPath,[file,'launch'],{input:'{}',encoding:'utf8',timeout:5000});assert.equal(r.status,2);assert.match(r.stderr,/background_(root|native_caller)_required/);}finally{fs.rmSync(root,{recursive:true,force:true});}
+});
