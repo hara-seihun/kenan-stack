@@ -12,7 +12,8 @@ TimeoutStartSec=110s
 TimeoutStopSec=5s
 KillMode=control-group
 MemoryMax=256M
-CPUQuota=25%
+# A prompt census reduces descriptor churn; Nice/IO limits keep it optional.
+CPUQuota=100%
 TasksMax=16
 Nice=19
 IOSchedulingClass=idle
