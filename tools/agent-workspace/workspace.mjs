@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import {unlinkDeclaredCacheSymlink} from './cache-symlink.mjs';
+import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache-symlink.mjs';
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
@@ -4415,7 +4415,7 @@ function cacheSymlinkSafety(database, record, roots) {
   const installed = installedReferenceSnapshot(census.INSTALL_ROOTS);
   const qualifications = qualificationReferences(roots);
   return {...safety, errors:[...safety.errors, ...qualifications.errors],
-    references:[...safety.references, ...roots.flatMap(root => installedReferences(root, installed)), ...qualifications.references], observedAt:Date.now()};
+    references:[...safety.references, ...cacheAliasInstalledReferences(roots[0], installed), ...qualifications.references], observedAt:Date.now()};
 }
 
 function cacheBinding(database, id) {

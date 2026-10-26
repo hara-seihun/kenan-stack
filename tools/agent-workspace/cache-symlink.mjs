@@ -36,3 +36,12 @@ export function unlinkDeclaredCacheSymlink(context) {
   fs.unlinkSync(target);
   return true;
 }
+
+// Installed consumers of a canonical dependency tree do not borrow every other
+// symlink to it. Only an installed lexical alias reference depends on the entry
+// being unlinked. Process/queue/qualification target observations remain strict.
+export function cacheAliasInstalledReferences(alias, snapshot) {
+  if (!path.isAbsolute(alias) || !Array.isArray(snapshot)) throw new Error('exact cache alias and installed snapshot required');
+  return snapshot.filter(row => typeof row.path === 'string' &&
+    (row.path === alias || row.path.startsWith(alias + path.sep)));
+}

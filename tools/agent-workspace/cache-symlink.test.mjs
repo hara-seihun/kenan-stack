@@ -147,3 +147,21 @@ test('unclassified dangling or empty-target ignored symlinks cannot disappear in
     }
   } finally {if(old===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=old;}
 }));
+
+import {cacheAliasInstalledReferences} from './cache-symlink.mjs';
+test('canonical installed dependencies do not borrow an unused root alias, but lexical alias references do',()=>fixture(f=>{
+  const rootAlias=path.join(f.root,'node_modules');fs.symlinkSync(f.external,rootAlias);
+  const canonical=[{file:'/opt/sender/bundle.js',path:path.join(f.external,'payload')}];
+  const selected=cacheAliasInstalledReferences(rootAlias,canonical);
+  assert.deepEqual(selected,[]);
+  assert.equal(unlinkDeclaredCacheSymlink({root:f.root,target:rootAlias,declarations:['node_modules'],tracked:()=>false,ignored:()=>true,
+    observe:()=>({...f.clear(),references:selected}),invalidateCapacity:()=>{}}),true);
+  assert.equal(fs.readFileSync(path.join(f.external,'payload'),'utf8'),'external original bytes');
+  fs.symlinkSync(f.external,rootAlias);
+  const lexical={file:'/opt/sender/alias.js',path:path.join(rootAlias,'payload')};
+  const refs=cacheAliasInstalledReferences(rootAlias,[...canonical,lexical,{path:rootAlias+'-other/payload'}]);
+  assert.deepEqual(refs,[lexical]);
+  assert.equal(unlinkDeclaredCacheSymlink({root:f.root,target:rootAlias,declarations:['node_modules'],tracked:()=>false,ignored:()=>true,
+    observe:()=>({...f.clear(),references:refs}),invalidateCapacity:()=>assert.fail('borrowed alias')}),false);
+  assert.equal(fs.lstatSync(rootAlias).isSymbolicLink(),true);
+}));
