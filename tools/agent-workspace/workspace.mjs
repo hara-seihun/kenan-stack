@@ -65,6 +65,7 @@ import { qualificationReferences } from "./qualification-references.mjs";
 import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import {adoptEndedActions} from "./actions-adoption.mjs";
+import {submitRelease} from './release-submission.mjs';
 import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
@@ -383,15 +384,15 @@ function initializeRegistry(database) {
   }
 }
 
-function openRegistry(statePath = DEFAULT_STATE) {
+function openRegistry(statePath = DEFAULT_STATE, deadline) {
   mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
   const database = new DatabaseSync(statePath);
   registryPaths.set(database, statePath);
   try {
-    database.exec("PRAGMA busy_timeout = 5000");
+    database.exec(`PRAGMA busy_timeout = ${deadline===undefined?5000:Math.max(0,Math.min(1000,deadline-Date.now()))}`);
     if (registrySchemaVersion(database) !== REGISTRY_SCHEMA_VERSION || !hasPendingIndex(database) || !hasCapacityLedger(database) || !hasCapacityMeasurements(database) || !hasReassignmentLedger(database) || !database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_growth_policy'").get() ||
       database.prepare("PRAGMA journal_mode").get().journal_mode !== "wal") {
-      withResourceLock(statePath, "registry-schema", () => initializeRegistry(database));
+      withResourceLock(statePath, "registry-schema", () => initializeRegistry(database),deadline);
     }
     return database;
   } catch (error) {
@@ -3833,7 +3834,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
   const record = recordBy(database, selectorFrom(args, 'release'));
   const records = recordsInGroup(database, record);
-  const authority = authorizeWorkspaceRelease(database, records.length ? records : [record], statePath, authorityDependencies);
+  const authority = authorizeWorkspaceRelease(database, records.length ? records : [record], statePath, {deadline:inspectionDeadline??Date.now()+30000,...authorityDependencies});
   if (!authority.ok) {
     if (bool(args, "json")) print(authority, true);
     else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);
@@ -3887,7 +3888,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
 function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
-  const deadline=Math.min(Date.now()+35_000, outerDeadline);
+  const deadline=Math.min(inspectionDeadline??Date.now()+35_000, outerDeadline);
   // Snapshot failure is a completed *non-destructive* refusal, not an orphaned
   // release. Never substitute partial/empty reference observations.
   let result;
@@ -5208,7 +5209,9 @@ function statusCommand(database, args) {
   const records = rows.slice(0, limit).map(row => {
     const { cachePaths, ...record } = rowToRecord({ ...row, cache_paths: "[]", creation_request: "null" });
     delete record.creation;
-    return { ...record, releaseSettlement: releaseSettlement(database, row.id), capacity: recordedCapacity(database, row.id), cacheDeclarationBytes: row.cache_bytes, creationRequestBytes: row.creation_bytes };
+    const submitted=database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_release_submission'").get();
+    const submission=submitted?database.prepare('SELECT request_id,unit_name,state,launch_json,binding_json FROM workspace_release_submission WHERE workspace_id=?').get(row.id):null;
+    return { ...record, ...(submission?{releaseSubmission:{requestId:submission.request_id,unitName:submission.unit_name,state:submission.state,originalBinding:JSON.parse(submission.binding_json),launch:JSON.parse(submission.launch_json??'null')}}:{}), releaseSettlement: releaseSettlement(database, row.id), capacity: recordedCapacity(database, row.id), cacheDeclarationBytes: row.cache_bytes, creationRequestBytes: row.creation_bytes };
   });
   const last = rows[Math.min(rows.length, limit) - 1];
   const nextAfter = hasMore && last ? Buffer.from(JSON.stringify([last.root, last.path, last.id])).toString("base64url") : null;
@@ -5310,6 +5313,8 @@ Records outlive the directory, so status explains what became of a checkout that
 export const workspaceTesting = { inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
+  const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;
+  const releaseEntryDeadline=argv[0]==='release'?releaseStarted+(releaseScope?.background===true?150_000:20_000):undefined;
   if(argv[0]==='execution-cessation') {
     const args=parseArgs(argv.slice(1));assertOnly(args,['holder']);
     print(executionCessation(JSON.parse(required(args,'holder'))),true);return;
@@ -5439,7 +5444,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     if(result.error||result.signal){print({kind:'maintenance-worker-outcome-unknown',state:'unknown',operationId:one(args,'operation-id')??null,code:result.error?.code??'worker-signalled',next:'observe original journal; reconcile before resume; never replay as a new operation'},true);process.exitCode=75;return;}
     process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
   }
-  const database = openRegistry(statePath);
+  const database = openRegistry(statePath,releaseEntryDeadline);
   try {
     if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
@@ -5472,7 +5477,39 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "adopt-ended-actions") adoptEndedActionsCommand(database,args,statePath);
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
-    else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {
+    else if(commandName==='release') {
+      const deadline=releaseEntryDeadline, selected=recordBy(database,selectorFrom(args,'release'));
+      const group=recordsInGroup(database,selected),record=[...(group.length?group:[selected])].sort((a,b)=>a.id.localeCompare(b.id))[0];
+      database.exec('PRAGMA busy_timeout=1000');
+      try {
+        duringInspection(deadline,()=>{
+          const members=recordsInGroup(database,record);
+          const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline});
+          if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
+          const foreground=authority.kind==='native'&&releaseScope?.background!==true;
+          const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
+          lock(()=>{
+            if(!foreground)return releaseCommand(database,args,statePath,{deadline});
+            assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
+            const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
+              members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
+            const result=submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
+              launch:name=>{
+                const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
+                const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath)});
+                if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
+                try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
+              }});
+            print(result,true);process.exitCode=result.action==='already-released'?0:75;
+          });
+        });
+      }catch(error){
+        if(!(error instanceof ResourceBusyError))throw error;
+        print({ok:false,error:{code:'release-resource-busy',detail:error.message},completed:false,
+          releaseSettlement:releaseSettlement(database,record.id),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],retry:'Repeat the same request after the recorded lock holder finishes.'},lock:error.detail},true);process.exitCode=75;
+      }
+    }
+    else if (["heartbeat", "cancel-creation", "finalize-creation"].includes(commandName)) {
       const record = recordBy(database, selectorFrom(args, commandName));
       withWorkspaceLock(database, record.path, () => {
         if (commandName === "heartbeat") heartbeatCommand(database, args, statePath);

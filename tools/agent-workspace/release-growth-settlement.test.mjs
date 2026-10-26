@@ -1,5 +1,5 @@
 import './scratch-env.mjs';
-import{test}from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import os from'node:os';import path from'node:path';import{execFileSync}from'node:child_process';import{DatabaseSync}from'node:sqlite';
+import{test}from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import os from'node:os';import path from'node:path';import{execFileSync,spawn}from'node:child_process';import{DatabaseSync}from'node:sqlite';
 const{main,workspaceTesting}=await import(process.env.WORKSPACE_RELEASE_MODULE||'./workspace.mjs');
 function fixture(action){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'release-custody-')),source=path.join(root,'source'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3');const previous=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';let db;
@@ -107,4 +107,13 @@ test('ordinary retired-growth continuation does not override a separately retain
  f.db.exec('CREATE TABLE IF NOT EXISTS workspace_source_retention(workspace_id TEXT PRIMARY KEY,occurred_at INTEGER NOT NULL)');
  f.db.prepare('INSERT INTO workspace_source_retention VALUES(?,?)').run(f.record.id,Date.now());
  const result=f.release();assert.equal(result.action,'none');assert.equal(result.ordinaryReleaseContinuation,undefined);assert.equal(fs.existsSync(f.source),true);
+}));
+
+test('ordinary release refuses a measurement-held checkout lock promptly with an explicit continuation',()=>fixture(f=>{
+ const crypto=process.getBuiltinModule('node:crypto');const lock=path.join(f.root,'locks',crypto.createHash('sha256').update('checkout:'+f.source).digest('hex'));
+ fs.mkdirSync(path.dirname(lock),{recursive:true});const ready=path.join(f.root,'lock-ready');
+ const child=spawn('flock',['--exclusive',lock,process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(ready)},'held');setTimeout(()=>{},2500)`],{stdio:'ignore'});
+ try{const until=Date.now()+2000;while(!fs.existsSync(ready)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);assert.ok(fs.existsSync(ready));
+ const start=Date.now(),r=f.release();assert.ok(Date.now()-start<1800);assert.equal(r.error.code,'release-resource-busy');assert.equal(r.completed,false);assert.equal(r.nextAction.observe[0],'agent-workspace');assert.ok(fs.existsSync(f.source));
+ }finally{child.kill('SIGTERM');}
 }));

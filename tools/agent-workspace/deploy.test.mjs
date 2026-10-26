@@ -35,6 +35,7 @@ test('component deployment retains other tools and fences unrelated source and p
     mkdirSync(path.join(temporary, 'dependencies'));
     symlinkSync(path.join(temporary, 'dependencies'), path.join(selected, 'node_modules'));
     writeFileSync(path.join(selected, '.pi-stack-commit'), baseline + '\n');
+    writeFileSync(path.join(selected,'.agent-workspace-component.json'),JSON.stringify({source:'historical'}));
     const destination = path.join(temporary, 'tools');
     symlinkSync(selected, destination);
     const original = readFileSync(path.join(repository, 'tools/agent-workspace/README.md'), 'utf8');
@@ -48,6 +49,7 @@ test('component deployment retains other tools and fences unrelated source and p
     const deploy = () => execFileSync(path.join(repository, 'tools/agent-workspace/deploy'), [], {env: environment, encoding: 'utf8', timeout: 10000});
     assert.match(deploy(), /no services or workspace records changed/);
     assert.equal(readlinkSync(destination), path.join(releases, 'tools', commit));
+    assert.equal(existsSync(path.join(destination,'.agent-workspace-component.json')),false);
     assert.equal(readlinkSync(path.join(destination, 'node_modules')), path.join(temporary, 'dependencies'));
     assert.equal(readFileSync(path.join(destination, 'other/body'), 'utf8'), 'other tool unchanged\n');
     assert.equal(readFileSync(path.join(selected, 'agent-workspace/README.md'), 'utf8'), original);
@@ -59,6 +61,7 @@ test('component deployment retains other tools and fences unrelated source and p
     git(repository, 'commit', '-am', 'unrelated change');
     assert.throws(deploy, /refuses changes to other tools/);
     assert.equal(readlinkSync(destination), path.join(releases, 'tools', commit));
+    assert.equal(existsSync(path.join(destination,'.agent-workspace-component.json')),false);
     assert.equal(existsSync(path.join(releases, 'tools', git(repository, 'rev-parse', 'HEAD'))), false);
   } finally { rmSync(temporary, {recursive: true, force: true}); }
 });
