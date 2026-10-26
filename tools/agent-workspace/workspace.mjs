@@ -4451,8 +4451,8 @@ function growthBinding(database, record) {
 function growthSelected(database, args, commandName = 'retire-growth') {
   const selected=selectedArguments(commandName,{id:one(args,'id'),path:one(args,'path')});
   if(!selected.ok)throw Object.assign(new GrowthLifecycleError(selected.error.code,selected.error.detail),{nextAction:selected.error.nextAction});
-  const record = recordBy(database, { id: required(args, "id") });
-  if (record.path !== path.resolve(required(args, "path"))) growthError("growth-identity-changed", "id and path do not name the same workspace");
+  const record = recordBy(database, selected.value.id === undefined ? { path: selected.value.path } : { id: selected.value.id });
+  if (selected.value.path !== undefined && record.path !== path.resolve(selected.value.path)) growthError("growth-identity-changed", "id and path do not name the same workspace");
   return record;
 }
 
