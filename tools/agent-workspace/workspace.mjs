@@ -2929,7 +2929,6 @@ function revalidatePreparedSource(value, input, sourceCommit) {
   sourcePreparationMode = "foreground";
   sourcePreparationDeadline = Math.min(priorDeadline, Date.now() + 1500);
   try { return revalidatePreparedSourceWithinBudget(value, input, sourceCommit); }
-  catch (error) { if (error instanceof SourcePreparationRequired) return null; throw error; }
   finally { sourcePreparationMode = priorMode; sourcePreparationDeadline = priorDeadline; }
 }
 function revalidatePreparedSourceWithinBudget(value, input, sourceCommit) {
@@ -2939,8 +2938,71 @@ function revalidatePreparedSourceWithinBudget(value, input, sourceCommit) {
   assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
   assertSourceCheckoutFilters(input.mirror);
   if (!hasObjectClosure(input.mirror, sourceCommit, input.sparsePatterns)) return null;
-  if (objectStoreStamp(input.mirror) !== stamp) return null;
+  if (objectStoreStamp(input.mirror) !== stamp) throw new SourcePreparationRequired();
   return { ...value, stamp };
+}
+
+// A foreground deadline is not failed closure evidence. Continue the read-only
+// proof in a durable child of the completed request, leaving its pointer, result,
+// import identity and capacity accounting untouched.
+function refreshCompletedSource(value, input, sourceCommit, receipt, key, originalJobId = null) {
+  try {
+    const refreshed = revalidatePreparedSource(value, input, sourceCommit);
+    return refreshed === null ? null : { state: "ready", value: refreshed };
+  } catch (error) {
+    if (!(error instanceof SourcePreparationRequired)) throw error;
+  }
+  const continuationPath = `${receipt}.revalidation.json`;
+  let request = existsSync(continuationPath) ? JSON.parse(readFileSync(continuationPath, "utf8")) : null;
+  const jobs = path.join(path.dirname(receipt), "jobs");
+  if (request !== null && existsSync(path.join(jobs, sourceJobId(`${key}:revalidation`, request), "result.json"))) request = null;
+  if (request === null) {
+    request = { kind: "completed-source-revalidation", input, sourceCommit, value,
+      receipt, originalJobId, observedStamp: objectStoreStamp(input.mirror) };
+    writePreparationReceipt(continuationPath, request);
+  }
+  const job = runSourceJob({ directory: jobs,
+    key: `${key}:revalidation`, request,
+    command: [process.execPath, new URL(import.meta.url).pathname, "source-revalidate"],
+    waitMs: 2000, restartInterrupted: true });
+  if (job.state === "failed" || job.state === "interrupted" || job.state === "abandoned")
+    fail(`completed source revalidation ${job.state}: ${job.error?.message ?? "automatic retry prohibited"}`);
+  if (job.state !== "ready") return job;
+  if (job.value === null) return null;
+  if (job.value.stamp !== objectStoreStamp(input.mirror)) {
+    // The next observation starts only another read-only proof, never an import.
+    return { state: "pending", jobId: sourceJobId(`${key}:revalidation`, request),
+      progressPath: path.join(path.dirname(receipt), "jobs", sourceJobId(`${key}:revalidation`, request), "progress.json"),
+      resultPath: path.join(path.dirname(receipt), "jobs", sourceJobId(`${key}:revalidation`, request), "result.json") };
+  }
+  assertSourceCheckoutFilters(existsSync(input.repository) ? input.repository : input.mirror);
+  assertSourceCheckoutFilters(input.mirror);
+  return job;
+}
+
+function sourceRevalidationWorker() {
+  const directory = process.env.PI_WORKSPACE_SOURCE_JOB_DIR;
+  const loaded = readSourceJobRequest(directory);
+  if (!loaded.ok) fail(loaded.error.message);
+  const { input, value, sourceCommit, receipt } = loaded.value;
+  sourcePreparationMode = "worker";
+  try {
+    // Standard imports hold this same mirror fence shared. Revalidation is
+    // read-only and takes it exclusive so unrelated imports cannot starve proof.
+    const refreshed = withResourceLock(input.statePath, `mirror:${input.mirror}`, () => {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try { return revalidatePreparedSourceWithinBudget(value, input, sourceCommit); }
+        catch (error) { if (!(error instanceof SourcePreparationRequired)) throw error; }
+      }
+      fail("shared mirror kept changing during completed source revalidation; original request retained");
+    });
+    if (refreshed !== null) writePreparationReceipt(receipt, refreshed);
+    const result = finishSourceJob(directory, { state: "ready", value: refreshed });
+    if (!result.ok) fail(result.error.message);
+  } catch (error) {
+    finishSourceJob(directory, { state: "failed", error: { code: "source-revalidation-failed", message: error.message } });
+    throw error;
+  }
 }
 
 function prepareCreationSource(database, args, input) {
@@ -2962,10 +3024,10 @@ function prepareCreationSource(database, args, input) {
       assertSourceCheckoutFilters(input.mirror);
       return { state: "ready", value };
     }
-    const refreshed = revalidatePreparedSource(value, input, sourceCommit);
+    const refreshed = refreshCompletedSource(value, input, sourceCommit, receipt, key);
     if (refreshed !== null) {
-      writePreparationReceipt(receipt, refreshed);
-      return { state: "ready", value: refreshed };
+      if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
+      return refreshed;
     }
   }
   const pointerPath = path.join(directory, `${key}.job.json`);
@@ -3012,10 +3074,10 @@ function prepareCreationSource(database, args, input) {
       writePreparationReceipt(pointerPath, pointer);
     }
     if (terminal.state === "ready") {
-      const refreshed = revalidatePreparedSource(terminal.value, input, sourceCommit);
+      const refreshed = refreshCompletedSource(terminal.value, input, sourceCommit, receipt, key, pointer.jobId);
       if (refreshed !== null) {
-        writePreparationReceipt(receipt, refreshed);
-        return { state: "ready", value: refreshed };
+        if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
+        return refreshed;
       }
       if (terminal.value.stamp !== stamp) pointer = null;
     }
@@ -3047,10 +3109,10 @@ function prepareCreationSource(database, args, input) {
   const job = accepted(observeJob());
   if (job.state !== "ready" || job.value.stamp === objectStoreStamp(input.mirror)) return job;
   // Concurrent imports of other commits move the shared stamp; re-prove this source instead of failing.
-  const refreshed = revalidatePreparedSource(job.value, input, sourceCommit);
+  const refreshed = refreshCompletedSource(job.value, input, sourceCommit, receipt, key, pointer.jobId);
   if (refreshed === null) fail("source changed during preparation; repeat the original request");
-  writePreparationReceipt(receipt, refreshed);
-  return { ...job, value: refreshed };
+  if (refreshed.state === "ready") writePreparationReceipt(receipt, refreshed.value);
+  return refreshed;
 }
 
 function writePreparationReceipt(file, value) {
@@ -5385,6 +5447,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     return;
   }
   if (argv[0] === "source-prepare") return sourcePreparationWorker();
+  if (argv[0] === "source-revalidate") return sourceRevalidationWorker();
   const [commandName, ...rest] = argv;
   if (
     commandName === undefined ||
