@@ -29,3 +29,28 @@ export function rootPlanReferences(roots=null,{directory=DEFAULT_ROOT_PLANS,maxE
  }catch(e){errors.push(`${file}: ${e.message}`);}}
  return finish();
 }
+
+// Publisher-owned plan copies can add execution paths after a helper prepared the
+// canonical plan. Enumerate only plan filenames, not historical test/output JSON.
+export function publisherPlanReferences(roots=null,{directory='/home/kenan/data/converge-releases',maxEntries=16384,maxPlans=256,maxFileBytes=4<<20,maxTotalBytes=32<<20}={}){
+ const errors=[],references=[];let entries=0,total=0,plans=0,handle;
+ try{
+  try{handle=fs.opendirSync(directory);}catch(e){if(e.code!=='ENOENT')throw e;}
+  if(handle)for(let entry;(entry=handle.readSync())!==null;){
+   if(++entries>maxEntries)throw Error('publisher plan directory enumeration bound exceeded');
+   if(!/(?:^|-)PLAN\.json$/i.test(entry.name))continue;
+   if(++plans>maxPlans)throw Error('publisher plan count bound exceeded');
+   const file=path.join(directory,entry.name),stat=fs.lstatSync(file);
+   if(!stat.isFile()||stat.size>maxFileBytes)throw Error(file+': expected bounded regular publisher plan');
+   total+=stat.size;if(total>maxTotalBytes)throw Error('publisher plans total bytes bound exceeded');
+   const bytes=fs.readFileSync(file),value=JSON.parse(bytes);if(!value||typeof value!=='object')throw Error(file+': publisher plan is not an object');
+   const paths=new Set();let visited=0;
+   function walk(v,depth){if(++visited>16384||depth>32)throw Error('publisher plan structure bound exceeded');if(exactPath(v))paths.add(v);else if(Array.isArray(v))v.forEach(x=>walk(x,depth+1));else if(v&&typeof v==='object')Object.values(v).forEach(x=>walk(x,depth+1));}
+   walk(value,0);const digest=crypto.createHash('sha256').update(bytes).digest('hex');
+   let terminal;try{terminal=JSON.parse(fs.readFileSync(file+'.custody-released.json'));}catch(e){if(e.code!=='ENOENT')throw e;}
+   if(terminal!==undefined){if(terminal?.state!=='released'||terminal.planSha256!==digest||typeof terminal.owner!=='string'||!terminal.owner||typeof terminal.reason!=='string'||!terminal.reason||!Array.isArray(terminal.paths)||terminal.paths.length!==paths.size||new Set(terminal.paths).size!==paths.size||[...paths].some(p=>!terminal.paths.includes(p)))throw Error(file+': publisher plan custody release mismatches exact dependencies');continue;}
+   if(paths.size)references.push({kind:'publisher_native_plan',id:entry.name,state:'unreleased',resourceClass:'qualification-request',paths:[...paths],evidence:file,planSha256:digest});
+  }
+ }catch(e){errors.push(String(e.message));}finally{handle?.closeSync();}
+ return {errors,references:roots===null?references:references.filter(r=>r.paths.some(p=>roots.some(root=>overlap(p,root)))),released:[],complete:errors.length===0,observations:[{source:'publisher-native-plans',entries,plans,bytes:total}],observedAt:Date.now()};
+}

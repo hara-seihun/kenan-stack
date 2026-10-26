@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import {rootPlanReferences} from './root-plan-references.mjs';
+import {rootPlanReferences,publisherPlanReferences} from './root-plan-references.mjs';
 import {qualificationReferences,protects} from './qualification-references.mjs';
 import {workspaceTesting} from './workspace.mjs';
 const sha='a'.repeat(40);
@@ -31,4 +31,11 @@ test('malformed, symlinked and oversized plans retain custody conservatively',()
  f.write({...f.plan,stages:{tests:{argv:'not argv'}}});let r=rootPlanReferences([f.helper],{directory:f.directory});assert.equal(r.complete,false);assert.equal(protects(r,f.helper),true);
  f.write(f.plan);assert.equal(rootPlanReferences(null,{directory:f.directory,maxFileBytes:1}).complete,false);assert.equal(rootPlanReferences(null,{directory:f.directory,maxEntries:0}).complete,false);
  fs.renameSync(f.file,f.file+'.saved');fs.symlinkSync(f.file+'.saved',f.file);assert.equal(rootPlanReferences(null,{directory:f.directory}).complete,false);
+}));
+
+test('publisher plan copies retain independently added helper and adopted source paths among unrelated history',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.root,'P226-N161-PLAN.json'),JSON.stringify({...f.plan,donor:{path:f.helper+'/donor'}}));
+ for(let i=0;i<100;i++)fs.writeFileSync(path.join(f.root,'old-'+i+'.json'),'not a plan');
+ let r=publisherPlanReferences([f.helper],{directory:f.root});assert.equal(r.complete,true);assert.equal(r.references.length,1);assert.equal(r.references[0].kind,'publisher_native_plan');assert.ok(r.references[0].paths.includes(f.helper+'/donor'));
+ r=publisherPlanReferences([f.helper],{directory:f.root,maxEntries:16});assert.equal(r.complete,false);
 }));

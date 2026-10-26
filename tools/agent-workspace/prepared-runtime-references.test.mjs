@@ -86,9 +86,8 @@ test('actual explicit terminal retained release is stopped by the qualification 
   if(name==='workspace.mjs')fs.copyFileSync(path.join(component,name),path.join(shadow,name));
   else if(name!=='qualification-references.mjs')fs.symlinkSync(path.join(component,name),path.join(shadow,name));
  }
- // This isolated copy applies the exact public wrapper interface without editing the parent's file.
- const qualification=fs.readFileSync(path.join(component,'qualification-references.mjs'),'utf8').replace('export function qualificationReferences(','function baseQualificationReferences(');
- fs.writeFileSync(path.join(shadow,'qualification-references.mjs'),qualification+"\nimport {withPreparedRuntimeReferences} from './prepared-runtime-references.mjs';\nexport function qualificationReferences(roots=null,options={}){return withPreparedRuntimeReferences(baseQualificationReferences(roots,options),roots,options); }\n");
+ // Exercise the integrated public census rather than synthesizing an uninstalled splice.
+ fs.copyFileSync(path.join(component,'qualification-references.mjs'),path.join(shadow,'qualification-references.mjs'));
  const {main,workspaceTesting:shadowTesting}=await import('file://'+path.join(shadow,'workspace.mjs'));
  fixture(f=>{
  const prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';

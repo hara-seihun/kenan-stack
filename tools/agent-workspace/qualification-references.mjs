@@ -7,7 +7,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {rootPlanReferences,DEFAULT_ROOT_PLANS} from './root-plan-references.mjs';
+import {rootPlanReferences,publisherPlanReferences,DEFAULT_ROOT_PLANS} from './root-plan-references.mjs';
+import {withPreparedRuntimeReferences} from './prepared-runtime-references.mjs';
 
 export const DEFAULT_RELEASE_DATA = "/home/kenan/data/converge-releases";
 export const LIMITS = Object.freeze({ maxEntries: 4096, maxFileBytes: 4 << 20, maxTotalBytes: 128 << 20 });
@@ -80,9 +81,11 @@ function overlaps(left, right) {
 export function qualificationReferences(roots = null, options = {}) {
   const directories = { ...releaseDirectories(options.dataRoot), ...Object.fromEntries(Object.entries(options).filter(([key]) => key.endsWith("Dir") || key === "queueStateFile")) };
   const nativePlans=rootPlanReferences(roots, {directory: directories.rootPlansDir, ...(options.limits ?? {})});
+  const publisherPlans=publisherPlanReferences(roots,{directory:options.dataRoot ?? path.dirname(directories.requestsDir)});
+  nativePlans.errors.push(...publisherPlans.errors);nativePlans.references.push(...publisherPlans.references);nativePlans.complete=nativePlans.complete&&publisherPlans.complete;nativePlans.observations.push(...publisherPlans.observations);
   // Native root-plan custody is independent of qualification-authority installation.
   if (!fs.existsSync(directories.requestsDir) && !fs.existsSync(directories.queueStateFile))
-    return {...nativePlans, observations:[{source:"qualification-records",state:"not-installed"}, ...nativePlans.observations]};
+    return withPreparedRuntimeReferences({...nativePlans, observations:[{source:"qualification-records",state:"not-installed"}, ...nativePlans.observations]},roots,{...options,dataRoot:options.dataRoot ?? path.dirname(directories.requestsDir)});
   const limits = { ...LIMITS, ...(options.limits ?? {}) };
   const budget = new Budget(limits);
   const errors = [...nativePlans.errors], references = [...nativePlans.references], released = [...nativePlans.released], ignored = [];
@@ -107,7 +110,7 @@ export function qualificationReferences(roots = null, options = {}) {
   const listing = listDirectory(directories.requestsDir, limits);
   if (listing.error) {
     errors.push(listing.error);
-    return finish(roots, errors, references, released, ignored);
+    return withPreparedRuntimeReferences(finish(roots, errors, references, released, ignored),roots,{...options,dataRoot:options.dataRoot ?? path.dirname(directories.requestsDir)});
   }
   const requestPathsByTrain = new Map();
 
@@ -175,7 +178,7 @@ export function qualificationReferences(roots = null, options = {}) {
       leaves: train.leaves, owners: train.owners ?? [], after: train.after ?? null, requestFound: paths.length > 0,
     });
   }
-  return finish(roots, errors, references, released, ignored);
+  return withPreparedRuntimeReferences(finish(roots, errors, references, released, ignored),roots,{...options,dataRoot:options.dataRoot ?? path.dirname(directories.requestsDir)});
 
   function protectPrepared(id, root, state) {
     const prepared = preparedPaths(budget, directories, id, null, errors);
