@@ -5504,7 +5504,11 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
             const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
               members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
             const result=submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
-              launch:name=>{
+              observe:row=>{
+                const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`kenan-bg-${authority.binding.agentId}-${row.unit_name}.service`],{timeout:2000});
+                const fields=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>line.split('=')));
+                return {ceased:!observed.error&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
+              },launch:name=>{
                 const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
                 const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath)});
                 if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};

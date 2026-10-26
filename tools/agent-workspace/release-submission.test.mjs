@@ -16,3 +16,13 @@ test('a settled release is idempotent and changed requests cannot replace custod
  submitRelease(base);const changed=submitRelease({...base,request:{...base.request,owner:'foreign'}});assert.equal(changed.ok,false);assert.equal(count(),1);
  const settled=submitRelease({...base,record:{...base.record,state:'released'},settlement:{kind:'completed',requestId:'original-effect'}});assert.equal(settled.action,'already-released');assert.equal(count(),1);
 }));
+test('a known protected refusal continues the same request only after the original unit ceased',()=>fixture((base,count)=>{
+ const first=submitRelease(base);base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:2,finishedAt:1}));
+ const live=submitRelease({...base,observe:()=>({ceased:false})});assert.equal(count(),1);assert.equal(live.requestId,first.requestId);
+ const resumed=submitRelease({...base,binding:{...base.binding,callId:'authentic continuation'},observe:()=>({ceased:true})});assert.equal(count(),2);assert.equal(resumed.requestId,first.requestId);assert.equal(resumed.unitName,first.unitName);assert.deepEqual(resumed.originalBinding,base.binding);
+ const duplicate=submitRelease({...base,observe:()=>({ceased:true})});assert.equal(count(),2);assert.equal(duplicate.requestId,first.requestId);
+}));
+test('an unknown original effect is never relaunched even if its unit is gone',()=>fixture((base,count)=>{
+ const first=submitRelease({...base,launch:()=>({code:'response-lost'})});assert.equal(first.state,'launch-unknown');
+ submitRelease({...base,observe:()=>({ceased:true})});assert.equal(count(),0);
+}));
