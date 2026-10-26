@@ -20,10 +20,12 @@ export function main(){
  const input=JSON.parse(fs.readFileSync(0,'utf8'));
  const spec=backgroundSpec(input,binding,uid,gid);
  if(process.argv[2]==='status'||process.argv[2]==='stop'){
-  const observed=run('/usr/bin/systemctl',['--system','show',spec.unit,'--property=Description','--value']);
-  if(observed.status!==0||observed.stdout.trim()!==spec.description) {
+  const observed=run('/usr/bin/systemctl',['--system','show',spec.unit,'--property=Description,LoadState']);
+  const properties=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
+  if(properties.LoadState==='not-found'){if(process.argv[2]==='status'){console.log('inactive');process.exitCode=3;}return;}
+  if(observed.status!==0||properties.Description!==spec.description) {
    // A new native call by the same worker may manage its previous launch.
-   let prior;try{prior=JSON.parse(observed.stdout.trim().slice('kenan-tool-call:'.length));}catch{}
+   let prior;try{prior=JSON.parse((properties.Description??'').slice('kenan-tool-call:'.length));}catch{}
    if(!prior?.background||prior.agentId!==binding.agentId||prior.channel!==binding.channel||prior.uid!==uid)throw Error('background_owner_mismatch');
   }
   const result=run('/usr/bin/systemctl',['--system',process.argv[2]==='stop'?'stop':'is-active',spec.unit]);
