@@ -5,9 +5,15 @@ set -eu
 lock=${AGENT_WORKSPACE_ADMISSION_LOCK:-/run/lock/agent-workspace-admission.lock}
 selected=${AGENT_WORKSPACE_SELECTED_ROOT:-/srv/pi/tools/agent-workspace}
 exec 9>"$lock.turnstile"
-flock --shared --wait 30 --conflict-exit-code 75 9
+if ! flock --shared --wait 30 --conflict-exit-code 75 9; then
+ printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication is draining existing operations. No command ran; resume after publication finishes."}}'
+ exit 75
+fi
 exec 8>"$lock"
-flock --shared --wait 30 --conflict-exit-code 75 8
+if ! flock --shared --wait 30 --conflict-exit-code 75 8; then
+ printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication owns admission. No command ran; resume after publication finishes."}}'
+ exit 75
+fi
 flock --unlock 9
 exec 9>&-
 exec "$selected/main" "$@"
