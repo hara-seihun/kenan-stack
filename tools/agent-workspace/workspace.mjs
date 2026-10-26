@@ -63,6 +63,7 @@ import { currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
 import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
+import {adoptEndedActions} from "./actions-adoption.mjs";
 import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
@@ -1569,6 +1570,20 @@ function writerRunCommand(database, args) {
     const result = runWriter(input,[...heldResourceLocks.values()]);
     print(result,true); process.exitCode = result.ok ? 0 : result.exitCode || 1;
   });
+}
+
+function adoptEndedActionsCommand(database,args,statePath) {
+  assertOnly(args,["id","path","repository","run","attempt","source-commit","json"]);
+  const selected=growthSelected(database,args,"adopt-ended-actions");
+  const input={repository:required(args,"repository"),run:required(args,"run"),attempt:required(args,"attempt"),sourceCommit:required(args,"source-commit")};
+  const result=withWorkspaceLock(database,selected.path,()=>{
+    const record=recordBy(database,{id:selected.id});
+    const head=git(record.path,["rev-parse","HEAD"]),branch=git(record.path,["symbolic-ref","--short","HEAD"]);
+    database.exec("BEGIN IMMEDIATE");
+    try{const result=adoptEndedActions(database,record,statePath,input,{head,branch});database.exec(result.ok?"COMMIT":"ROLLBACK");return result;}
+    catch(error){database.exec("ROLLBACK");throw error;}
+  },selected.groupId);
+  print(result,true);if(!result.ok)process.exitCode=2;
 }
 
 function reassignCommand(database, args) {
@@ -5179,6 +5194,7 @@ function help() {
   agent-workspace freeze-source --id ID --path SOURCE_SNAPSHOT --owner OWNER --expected-head SHA --recipient OWNER --authorization EVIDENCE [--json]
   agent-workspace retire-idle-growth [--root PATH] [--budget-ms 90000] [--max-records 128] [--json]
   agent-workspace writer-run --id ID --path PATH --owner OWNER --expected-head SHA --command-json '["executable","arg"]' --timeout-ms N [--json]
+  agent-workspace adopt-ended-actions --id ID --path PATH --repository owi-link/converge --run RUN --attempt ATTEMPT --source-commit SHA --json
   agent-workspace reassign --id ID --path PATH --from-owner ID --from-source-commit SHA|unset --from-state STATE
                            --owner ID --source-commit HEAD_SHA --authorization RECEIPT [--json]
   agent-workspace adopt --root PATH [--mode writer|review] [--nested-groups] [--cache PATH,...] [--cache-owned OUTPUT=TRACKED_SOURCE] [--replace-cache] [--execute]
@@ -5365,7 +5381,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -5393,6 +5409,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
     else if (commandName === "source-handoff") sourceHandoffCommand(database,args);
     else if (commandName === "freeze-source") freezeSourceCommand(database,args);
     else if (commandName === "writer-run") writerRunCommand(database,args);
+    else if (commandName === "adopt-ended-actions") adoptEndedActionsCommand(database,args,statePath);
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
     else if (["heartbeat", "release", "cancel-creation", "finalize-creation"].includes(commandName)) {

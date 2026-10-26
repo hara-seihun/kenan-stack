@@ -87,9 +87,27 @@ export function writeSourceJobProgress(directory, value) {
   } catch (error) { return { ok: false, error: ioError(error) }; }
 }
 
+// Machine receipts have a 64 KiB consumer boundary. Keep the typed refusal small,
+// while preserving every original diagnostic byte in immutable local custody.
+export function boundedSourceJobResult(directory,result) {
+  const value=terminal(result),bytes=`${canonical(value)}\n`;
+  if(value.state!=="failed"||Buffer.byteLength(bytes)<=32768)return value;
+  const sha256=createHash("sha256").update(bytes).digest("hex");
+  const file=path.join(directory,`failure-diagnostic-${sha256}.json`);
+  try{atomicJson(file,value,true);}catch(error){
+    if(error.code!=="EEXIST"||readFileSync(file,"utf8")!==bytes)throw error;
+  }
+  const firstLine=value.error.message.split("\n",1)[0];
+  const message=Buffer.from(firstLine).subarray(0,2048).toString("utf8");
+  const compact={state:"failed",error:{code:value.error.code,message,
+    detail:{diagnosticPath:file,sha256,bytes:Buffer.byteLength(bytes),completeDiagnostic:true}}};
+  if(Buffer.byteLength(`${canonical(compact)}\n`)>32768)throw Object.assign(new Error("terminal failure code is too large"),{code:"invalid-result"});
+  return compact;
+}
+
 export function finishSourceJob(directory, result) {
   try {
-    const value = terminal(result);
+    const value = boundedSourceJobResult(directory,result);
     const filename = path.join(directory, "result.json");
     try { atomicJson(filename, value, true); }
     catch (error) {
