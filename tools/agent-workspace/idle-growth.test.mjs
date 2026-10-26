@@ -66,3 +66,9 @@ test('automatic sweep retires only future demand, preserves bytes, advances curs
  assert.equal(sweep().retiredCount,0);db.close();
  }finally{for(const k of Object.keys(process.env))if(!(k in prior))delete process.env[k];Object.assign(process.env,prior);fs.rmSync(root,{recursive:true,force:true});}
 });
+test('maintenance capability launcher preserves sudo observer elevation instead of truncating its bounding set',()=>{
+ const text=fs.readFileSync(new URL('./idle-growth-run',import.meta.url),'utf8');
+ assert.ok(text.includes('--reuid="$uid" --regid="$gid"'));
+ assert.ok(text.includes('--ambient-caps=+dac_read_search'));
+ assert.ok(!text.includes('--bounding-set=-all'));
+});
