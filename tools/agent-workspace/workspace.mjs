@@ -2148,6 +2148,40 @@ function capacityReservations(database, device, reservedPath, measure) {
   return { priced, headroomBytes, unpricedDormant, growthRepricing, ...(staleAllocationForecasts.length ? {staleAllocationForecasts} : {}), sourceImports: sources.map(({destination, receipt}) => ({destination, receipt})), ...(measurementFailures.length ? { measurementFailures } : {}) };
 }
 
+// Repricing does not need other checkouts' allocation histories or consumer
+// censuses. Full outstanding promises are a conservative upper bound on their
+// remaining reservation, NOT a claim about their current physical allocation.
+// Physical usage is independently reflected in statfs. Read only this ledger
+// under the device fence; never acquire another checkout lock or sample it.
+function repriceReservations(database, device, reservedPath) {
+  const priced = [], sourceImports = [];
+  let headroomBytes = 0;
+  const rows = database.prepare(`SELECT c.plan_json,w.state FROM workspace_capacity c JOIN workspace w ON w.id=c.workspace_id
+    WHERE c.device_id=? AND w.path!=? AND w.state!='released'`).all(device, reservedPath);
+  for (const row of rows) {
+    const plan = JSON.parse(row.plan_json);
+    capacityRequirement(plan, []);
+    const liability = ledgerLiability(plan, row.state, {ok:false});
+    priced.push(liability.reservedBytes);
+    headroomBytes = Math.max(headroomBytes, liability.headroomBytes);
+  }
+  for (const row of database.prepare("SELECT destination,receipt,plan_json FROM workspace_source_capacity WHERE device_id=? AND destination!=?").all(device,reservedPath)) {
+    const plan=JSON.parse(row.plan_json);
+    capacityRequirement(plan,[]);
+    priced.push(plan.growthBytes+(plan.intent==='unestimated'?0:plan.constructionBytes));
+    headroomBytes=Math.max(headroomBytes,plan.headroomBytes,plan.intent==='unestimated'?plan.constructionBytes:0);
+    sourceImports.push({destination:row.destination,receipt:row.receipt});
+  }
+  for (const plan of executionRows(database,device)) if(plan.state!=='released') {
+    priced.push(plan.growthBytes); headroomBytes=Math.max(headroomBytes,plan.headroomBytes);
+  }
+  // Unknown legacy promises are unchanged by a shrink. Increases retain the
+  // original nonblocking legacy-creation check, without walking any checkout.
+  const unknown=database.prepare(`SELECT w.path,w.root FROM workspace w LEFT JOIN workspace_capacity c ON c.workspace_id=w.id
+    WHERE w.state='creating' AND c.workspace_id IS NULL AND w.path!=?`).all(reservedPath);
+  return {priced,headroomBytes,unpricedDormant:0,unknown,sourceImports,observation:'conservative-ledger-promises'};
+}
+
 // Only a pre-effect admission refusal may retry. Acquire the device fence for
 // each decision/commit, but release it before acquiring another checkout's fence.
 function withCapacityAdmission(database, statePath, device, action) {
@@ -2203,6 +2237,7 @@ function capacityRefusalDetails(plan, reservations) {
     otherReservationsBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     otherReservationBytes: [...reservations.priced],
     sourceImports: reservations.sourceImports ?? [],
+    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:false} : {}),
     unpricedDormant: reservations.unpricedDormant,
     measurementFailures: reservations.measurementFailures === undefined ? [] : reservations.measurementFailures,
     automaticGrowthRepricing: reservations.growthRepricing??[],
@@ -2226,7 +2261,7 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
     if (count >= maxCount) fail(`workspace root has ${count} checkouts; limit is ${maxCount}. Reconcile it before creating another.`);
   }
   const device = String(statSync(root).dev);
-  const reservations = capacityReservations(database, device, reservedPath);
+  const reservations = prior?.reservations ?? capacityReservations(database, device, reservedPath);
   for (const failure of reservations.measurementFailures ?? []) {
     process.stderr.write(`capacity measurement unavailable at ${failure.path}; original budget ${(failure.reservedBytes / 1024 ** 3).toFixed(2)} GiB (current pricing is in capacity-detail): ${failure.error}\n`);
   }
@@ -2265,6 +2300,15 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
       previousRequiredBytes, incrementalBytes, deficitBytesBefore: Math.max(0, previousRequiredBytes - freeBytes),
       deficitBytesAfter: Math.max(0, requirement - freeBytes)};
   }
+  if (prior?.kind !== "reduction" && priorEvidence?.kind !== "reprice-within-reservation") {
+    for(const row of reservations.unknown??[]) {
+      let ancestor=row.root;
+      while(!existsSync(ancestor)&&ancestor!==path.dirname(ancestor))ancestor=path.dirname(ancestor);
+      if(String(statSync(ancestor).dev)!==device)continue;
+      if(creationFenceBusy(database,row.path))growthError('capacity-reservation-unknown','active legacy creation has no priced promise; reconcile its original admission');
+      reservations.unpricedDormant++;
+    }
+  }
   if (prior?.kind !== "reduction" && !(priorEvidence?.kind === "reprice-within-reservation") && freeBytes < requirement) {
     const capacity = { freeBytes, requiredBytes: requirement, device, observedAt: Date.now(),
       breakdown: capacityRefusalDetails(plan ?? { intent: "unestimated", constructionBytes: minimum, headroomBytes: 0, growthBytes: 0 }, reservations),
@@ -2280,6 +2324,7 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
   if (freeInodes < minFreeInodes) fail(`${freeInodes.toFixed(2)}% of inodes are free; ${minFreeInodes.toFixed(2)}% is required`);
   return { ...priorEvidence, freeBytes, requiredBytes: requirement, reservedBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     sharedHeadroomBytes: reservations.headroomBytes, unpricedDormant: reservations.unpricedDormant,
+    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:false} : {}),
     ...(reservations.measurementFailures ? { measurementFailures: reservations.measurementFailures } : {}) };
 }
 
@@ -4145,6 +4190,11 @@ function pruneReleased(database, now = Date.now(), root) {
   return pruned;
 }
 
+function assertRepriceSnapshot(before,current) {
+  if(JSON.stringify(current.record)!==JSON.stringify(before.record)||current.row?.device_id!==before.row.device_id||current.row?.plan_json!==before.row.plan_json||current.sampleText!==before.sampleText)
+    growthError('capacity-reprice-conflict','workspace identity, owner, sample or reservation changed before repricing commit');
+}
+
 function repriceCapacityCommand(database, args, statePath, resume = false) {
   const commandName=resume?"resume-growth":"reprice-capacity";
   assertOnly(args, ["id", "path", "intent", "headroom-gib", "growth-mib", "budget-ms", "json", ...(resume ? ["owner", "expected-plan-sha256"] : ["owner", "reduction", "reduction-sha256"])]);
@@ -4196,7 +4246,8 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     withResourceLock(statePath, `capacity:${row.device_id}`, () => {
       const measurement = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!measurement.ok) fail(`capacity repricing requires a fresh allocated-block sample: ${measurement.error}; run measure-capacity first`);
-      const sample = JSON.parse(database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(record.id).measurement_json);
+      const sampleText = database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(record.id).measurement_json;
+      const sample = JSON.parse(sampleText);
       // Recheck actual allocation under the same filesystem fence. Keep the bound
       // cache immutable, and never credit a deletion behind that cache implicitly.
       const currentSample = reducing ? workspaceAllocationSample(record.path, row.device_id, {deadline:deadline - 2_000,maxEntries:2_000_000}) : sample;
@@ -4216,9 +4267,16 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
           growthError("unsafe-growth-reduction", "reduction must lower total future budget, preserve headroom and retain the 8 GiB floor");
         }
       }
-      const priorLiability = ledgerLiability(oldPlan, record.state, measurement);
+      const existingLiability = ledgerLiability(oldPlan, record.state, measurement);
+      const priorLiability = {...existingLiability};
+      // A target whose original budget was automatically discounted cannot
+      // silently restore that discount through the no-increase lane.
+      if(!resume) {
+        const policy=projectGrowthPolicy(database,{id:record.id,state:record.state,created_at:record.createdAt},oldPlan,{...measurement,bytes:measurement.rawBytes??measurement.bytes});
+        if(policy&&policy.reason!=='fresh-workspace')priorLiability.reservedBytes=policy.effectiveRemainingBytes??oldPlan.growthBytes;
+      }
       if (expandingBudget && (plan.headroomBytes < oldPlan.headroomBytes || (!resume && !reducing &&
-        remainingCapacityBytes(plan, record.state, measurement) < priorLiability.reservedBytes))) {
+        remainingCapacityBytes(plan, record.state, measurement) < existingLiability.reservedBytes))) {
         fail("budget expansion cannot reduce headroom or total growth budget");
       }
       plan.repricing = { priorIntent: oldPlan.intent, sampledGrowthBytes, accountedGrowthBytes, remainingGrowthBytes: intent.growthBytes,
@@ -4227,19 +4285,23 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
         plan.repricing.reduction = { ...reduction, sha256: reductionSha256 };
         plan.repricing.currentMeasurement = currentSample;
       }
+      const reservations = resume ? undefined : repriceReservations(database,row.device_id,record.path);
       if (!reducing) plan.admission = assertCapacity(record.root, args, database, record.path, {
         ...plan, constructionBytes: 0, growthBytes: remainingCapacityBytes(plan, record.state, measurement),
-      }, {kind:"reprice", liability:priorLiability});
+      }, {kind:"reprice", liability:priorLiability, reservations});
       database.exec("BEGIN IMMEDIATE");
       try {
+        const current = recordBy(database, {id:record.id});
+        const currentCapacity=database.prepare("SELECT device_id,plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+        const currentSampleText=database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(record.id)?.measurement_json;
+        assertRepriceSnapshot({record,row,sampleText},{record:current,row:currentCapacity,sampleText:currentSampleText});
         if (reducing) {
-          const current = recordBy(database, {id:record.id});
           validateReduction(reduction, growthBinding(database, current).binding, required(args, "owner"), intent.growthBytes);
           const fresh = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
           if (!fresh.ok) growthError("growth-sample-required", fresh.error);
           plan.admission = assertCapacity(record.root, args, database, record.path,
             {...plan, constructionBytes:0, growthBytes:remainingCapacityBytes(plan, current.state, fresh)},
-            {kind:"reduction", plan:{...oldPlan, constructionBytes:0, growthBytes:remainingCapacityBytes(oldPlan, current.state, fresh)}});
+            {kind:"reduction", plan:{...oldPlan, constructionBytes:0, growthBytes:Math.min(priorLiability.reservedBytes,remainingCapacityBytes(oldPlan, current.state, fresh))}, reservations});
         }
         const changed = database.prepare("UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=? AND plan_json=?")
           .run(JSON.stringify(plan), record.id, row.plan_json).changes;
@@ -4251,10 +4313,9 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     }, deadline);
     print(creationRecord(database, record.id), bool(args, "json"));
   }, selected.groupId, deadline));
-  // Release both the original checkout and device locks before sampling any
-  // deciding reservation, preventing cross-checkout lock inversion on retries.
-  // Each retry rebuilds its candidate and can commit only after admission.
-  return reducing ? decide() : withCapacityRefresh(database, statePath, device, decide,
+  // Ordinary repricing uses conservative ledger promises, never fleet sampling.
+  // Explicit resume keeps its existing refusal-driven admission route.
+  return !resume ? decide() : withCapacityRefresh(database, statePath, device, decide,
     {budgetMs: Math.max(0, deadline - Date.now())});
 }
 
@@ -5048,7 +5109,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
