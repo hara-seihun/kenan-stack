@@ -32,15 +32,42 @@ test('missing pushed tip, stale head, dirty output, recipient and owner mismatch
  assert.equal(fs.existsSync(path.join(path.dirname(f.state),'source-handoffs')),false);
 }));
 test('CLI binds actual registry custody, never substitutes a label or leaves the receipt in a disappearing checkout',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.repo,'.gitignore'),'node_modules/\ncustom-generated/\n');
+ fs.writeFileSync(path.join(f.repo,'.agent-workspace-caches'),'custom-generated\n');
+ f.git('-C',f.repo,'add','.');f.git('-C',f.repo,'-c','user.name=F','-c','user.email=f@invalid','commit','-m','generated policy');
+ f.git('-C',f.repo,'push','origin','HEAD:refs/heads/agent/frozen');f.request.head=f.git('-C',f.repo,'rev-parse','HEAD');
+ for(const name of ['node_modules','custom-generated']){fs.mkdirSync(path.join(f.repo,name));fs.writeFileSync(path.join(f.repo,name,'proof'),'regenerate me');}
  const entry=new URL('./workspace.mjs',import.meta.url).pathname;
  const run=(...args)=>spawnSync(process.execPath,[entry,...args],{env:{...process.env,PI_WORKSPACE_STATE:f.state},encoding:'utf8',timeout:20000});
  const register=run('register','--retained','--path',f.repo,'--owner','child','--json');assert.equal(register.status,0,register.stderr);const record=JSON.parse(register.stdout);
  const args=['source-handoff','--id',record.id,'--path',f.repo,'--owner','child','--expected-head',f.request.head,'--recipient','parent','--remote','origin','--branch','agent/frozen','--json'];
- const passed=run(...args);assert.equal(passed.status,0,passed.stderr);const receipt=JSON.parse(passed.stdout);assert.equal(receipt.workspaceId,record.id);
+ const passed=run(...args);assert.equal(passed.status,0,passed.stderr);const receipt=JSON.parse(passed.stdout);assert.equal(receipt.workspaceId,record.id);assert.deepEqual(receipt.dependencyCustody.paths,['custom-generated','node_modules']);
  const wrong=[...args];wrong[wrong.indexOf('child')]='stranger';const refused=run(...wrong);assert.equal(refused.status,2);assert.equal(JSON.parse(refused.stdout).error.code,'handoff-stale-custody');
  fs.rmSync(f.repo,{recursive:true});assert.equal(hash(fs.readFileSync(receipt.artifact.path)),receipt.artifact.sha256);
 }));
 test('a pushed remote or receipt directory inside disposable managed custody is not a durable handoff',()=>fixture(f=>{
  assert.throws(()=>sourceHandoff(f.record,f.request,f.state,[f.repo,f.remote]),{code:'handoff-source-disposable'});
  assert.throws(()=>sourceHandoff(f.record,f.request,path.join(f.repo,'state','registry.sqlite3')),{code:'handoff-artifact-disposable'});
+}));
+
+test('ignored declared dependencies and build outputs remain local while exact source is handed off',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.repo,'.gitignore'),'node_modules/\ndist/\nprivate-output/\n');
+ f.git('-C',f.repo,'add','.gitignore');f.git('-C',f.repo,'-c','user.name=F','-c','user.email=f@invalid','commit','-m','ignore generated output');
+ f.git('-C',f.repo,'push','origin','HEAD:refs/heads/agent/frozen');f.request.head=f.git('-C',f.repo,'rev-parse','HEAD');
+ f.record.cachePaths=['node_modules','**/dist'];
+ for(const name of ['node_modules','nested/dist']){fs.mkdirSync(path.join(f.repo,name),{recursive:true});fs.writeFileSync(path.join(f.repo,name,'generated'),'local dependency bytes');}
+ const result=sourceHandoff(f.record,f.request,f.state);
+ assert.deepEqual(result.dependencyCustody.paths,['nested/dist','node_modules']);
+ assert.equal(result.dependencyCustody.disposition,'retained-in-child-checkout');
+ assert.equal(result.dependencyCustody.transferred,false);
+ assert.equal(fs.readFileSync(path.join(f.repo,'node_modules/generated'),'utf8'),'local dependency bytes');
+ assert.deepEqual(sourceHandoff(f.record,f.request,f.state),result);
+ fs.writeFileSync(path.join(f.repo,'proof.txt'),'modified source');
+ assert.throws(()=>sourceHandoff(f.record,f.request,f.state),{code:'handoff-dirty-source'});
+ f.git('-C',f.repo,'checkout','--','proof.txt');
+ fs.writeFileSync(path.join(f.repo,'untracked'),'unique source');
+ assert.throws(()=>sourceHandoff(f.record,f.request,f.state),{code:'handoff-dirty-source'});
+ fs.rmSync(path.join(f.repo,'untracked'));
+ fs.mkdirSync(path.join(f.repo,'private-output'));fs.writeFileSync(path.join(f.repo,'private-output/proof'),'unknown bytes');
+ assert.throws(()=>sourceHandoff(f.record,f.request,f.state),{code:'handoff-unclassified-ignored'});
 }));

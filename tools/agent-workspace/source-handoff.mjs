@@ -10,6 +10,20 @@ function git(repository,args){
  if(result.status!==0||result.error||result.signal)refuse('handoff-git-unavailable','source handoff could not establish fresh Git evidence');
  return result.stdout;
 }
+// Observe ignored roots without walking dependency trees. Only the owning workspace's
+// established generated-output policy can exclude bytes from a source handoff.
+function sourceStatus(record){
+ const entries=git(record.path,['status','--porcelain=v1','-z','--untracked-files=normal','--ignored=matching']).split('\0').filter(Boolean);
+ if(entries.some(entry=>!entry.startsWith('!! ')))refuse('handoff-dirty-source','handoff requires clean tracked source and no untracked files');
+ const paths=entries.map(entry=>entry.slice(3).replace(/\/$/,'' )).sort();
+ const declared=record.cachePaths??[];
+ const matches=(candidate,policy)=>{
+  if(policy.startsWith('**/'))return candidate.split('/').includes(policy.slice(3));
+  return candidate===policy||candidate.startsWith(policy+'/');
+ };
+ if(paths.some(candidate=>!declared.some(policy=>matches(candidate,policy))))refuse('handoff-unclassified-ignored','ignored output is not declared dependency or build custody');
+ return paths;
+}
 function publish(file,bytes){
  fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
  if(fs.existsSync(file)){if(!fs.readFileSync(file).equals(bytes))refuse('handoff-artifact-conflict','existing handoff artifact differs');return;}
@@ -29,7 +43,7 @@ export function sourceHandoff(record,request,statePath,workspacePaths=[record.pa
  const remotes=git(record.path,['remote']).trim().split('\n');
  if(!remotes.includes(request.remote))refuse('handoff-invalid-request','handoff remote must already be configured');
  if(git(record.path,['rev-parse','HEAD']).trim()!==request.head)refuse('handoff-stale-head','checkout HEAD changed');
- if(git(record.path,['status','--porcelain','--untracked-files=all','--ignored']).trim())refuse('handoff-dirty-source','handoff requires clean source with no omitted generated or ignored files');
+ const dependencyPaths=sourceStatus(record);
  const under=(candidate,root)=>candidate===root||candidate.startsWith(root+path.sep);
  if(workspacePaths.some(root=>under(path.resolve(path.dirname(statePath)),root)))refuse('handoff-artifact-disposable','receipt storage must be outside all managed checkouts');
  const remoteUrl=git(record.path,['remote','get-url',request.remote]).trim();
@@ -43,11 +57,11 @@ export function sourceHandoff(record,request,statePath,workspacePaths=[record.pa
  // own authorized repository route. Git tree identities bind all path bytes.
  const tree=git(record.path,['rev-parse',request.head+'^{tree}']).trim();
  const manifest=Buffer.from(git(record.path,['-c','core.quotePath=true','ls-tree','-r','--full-tree',request.head]),'utf8');
- if(git(record.path,['rev-parse','HEAD']).trim()!==request.head||git(record.path,['status','--porcelain','--untracked-files=all','--ignored']).trim())refuse('handoff-source-changed','source changed during handoff');
+ if(git(record.path,['rev-parse','HEAD']).trim()!==request.head||JSON.stringify(sourceStatus(record))!==JSON.stringify(dependencyPaths))refuse('handoff-source-changed','source or dependency custody changed during handoff');
  const identity=digest(JSON.stringify({id:record.id,head:request.head,remote:request.remote,branch:request.branch,recipient:request.recipient}));
  const directory=path.join(path.dirname(statePath),'source-handoffs',record.id,identity);
  const manifestPath=path.join(directory,'git-tree.txt');
- const receipt={schemaVersion:1,kind:'durable-pushed-source-handoff',workspaceId:record.id,ownerAtHandoff:record.owner,recipient:request.recipient,source:{remote:request.remote,branch:request.branch,commit:request.head,tree},manifest:{path:manifestPath,sha256:digest(manifest),format:'git-ls-tree-r with core.quotePath=true; Git object identities, not SHA-256 file-byte hashes'},checkoutCustodyTransferred:false,checkoutMayDisappearAfterArchive:true,nextAction:'Create a separately admitted recipient checkout from the pushed branch at the exact commit. The child checkout is disposable; this receipt grants no writing lease.'};
+ const receipt={schemaVersion:1,kind:'durable-pushed-source-handoff',workspaceId:record.id,ownerAtHandoff:record.owner,recipient:request.recipient,source:{remote:request.remote,branch:request.branch,commit:request.head,tree},manifest:{path:manifestPath,sha256:digest(manifest),format:'git-ls-tree-r with core.quotePath=true; Git object identities, not SHA-256 file-byte hashes'},...(dependencyPaths.length?{dependencyCustody:{paths:dependencyPaths,disposition:'retained-in-child-checkout',transferred:false,nextAction:'The recipient regenerates dependencies in its own checkout. Existing workspace release and cache retirement policy owns later cleanup; this handoff deletes nothing.'}}:{}),checkoutCustodyTransferred:false,checkoutMayDisappearAfterArchive:true,nextAction:'Create a separately admitted recipient checkout from the pushed branch at the exact commit. The child checkout is disposable; this receipt grants no writing lease.'};
  const bytes=Buffer.from(JSON.stringify(receipt,null,2)+'\n'),receiptPath=path.join(directory,'receipt.json');
  publish(manifestPath,manifest);publish(receiptPath,bytes);
  return {ok:true,...receipt,artifact:{path:receiptPath,sha256:digest(bytes)}};

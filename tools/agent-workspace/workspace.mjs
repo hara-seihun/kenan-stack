@@ -1527,7 +1527,8 @@ function sourceHandoffCommand(database,args) {
   assertOnly(args,["id","path","owner","expected-head","recipient","remote","branch","json"]);
   const request={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head"),recipient:required(args,"recipient"),remote:required(args,"remote"),branch:required(args,"branch")};
   return withWorkspaceLock(database,request.path,()=>{
-    print(sourceHandoff(recordBy(database,{id:request.id}),request,registryPaths.get(database),database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row=>row.path)),true);
+    const record=recordBy(database,{id:request.id});
+    print(sourceHandoff({...record,cachePaths:effectiveCachePaths(record)},request,registryPaths.get(database),database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row=>row.path)),true);
   });
 }
 

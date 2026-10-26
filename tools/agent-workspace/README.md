@@ -825,6 +825,12 @@ This read-only Git check observes the exact remote branch tip, checks the source
 again under its checkout lock, and atomically publishes a hash-bound receipt and
 Git tree manifest outside the checkout, beside the workspace registry. It does
 not push, freeze, extend a lease, transfer ownership or retain the child tree.
+Ignored dependency and build output is accepted only under the workspace’s existing
+generated-cache declarations (including defaults and the tracked repository manifest).
+The receipt explicitly retains those paths in child checkout custody without transferring
+or deleting them. The recipient regenerates its own dependencies; ordinary release and
+cache retirement retain their existing cleanup safeguards. Unknown ignored output,
+untracked files and modified tracked source still refuse the handoff.
 The receipt names the recipient, exact commit and tree, and explicitly warns that
 the child checkout can disappear after archive. Pass the receipt path and its
 SHA-256 in the done report, not a promise that the child checkout remains live.
