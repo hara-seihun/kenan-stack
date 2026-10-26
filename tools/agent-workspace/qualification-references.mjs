@@ -191,7 +191,7 @@ export function qualificationReferences(roots = null, options = {}) {
 function terminalEvidence(budget, directories, id, request) {
   const file = path.join(directories.producerAdmissionDir, `${id}.completed.json`);
   const record = readJson(budget, file);
-  if (record.missing) return { state: "none", file };
+  if (record.missing) return retainedStageEvidence(budget, directories, id, request);
   if (record.error) return { state: "unreadable", file, error: record.error };
   const value = record.value;
   if (!isObject(value) || value.state !== "completed" || !isObject(value.identity) || value.identity.operation !== id)
@@ -204,6 +204,36 @@ function terminalEvidence(budget, directories, id, request) {
     else if (!Array.isArray(value.identity.leaves) || !sameSet(value.identity.leaves, pipeline.leaves ?? [])) contradiction = "leaves";
   }
   return { state: "completed", file, contradiction };
+}
+
+// Retained staging has its own immutable completion namespace; it deliberately
+// does not create or complete a global producer record. Consume that genuine
+// original closure rather than leaving successful staging dispatched forever.
+function retainedStageEvidence(budget, directories, id, request) {
+  const file = path.join(directories.producerAdmissionDir, 'retained-stage', `${id}.json`);
+  const record = readJson(budget, file);
+  if (record.missing) return {state:'none', file};
+  if (record.error) return {state:'unreadable', file, error:record.error};
+  const v = record.value, p = request?.value?.pipeline;
+  if (!isObject(v) || v.state !== 'completed') return {state:'none', file};
+  const fail = reason => ({state:'unreadable',file,error:`${file}: retained staging completion ${reason}`});
+  const sameIdentity = identity => isObject(identity) && isObject(p) &&
+    ['operation','owner','intent','through','base'].every(k => identity[k] === p[k]) &&
+    Array.isArray(identity.leaves) && sameSet(identity.leaves, p.leaves ?? []);
+  const sha256 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const products = value => Array.isArray(value) && value.length > 0 && new Set(value).size === value.length && value.every(x => typeof x === 'string' && /^[a-z0-9-]+$/.test(x));
+  const closureFile = path.join(directories.producerAdmissionDir, 'retained-stage', `${id}.staged.json`);
+  if (v.version !== 1 || v.kind !== 'retained-stage' || p?.intent !== 'qualify-only' || p?.through !== 'staging' ||
+      !sameIdentity(v.identity) || v.identity.operation !== id || !SHA.test(v.candidate) || !products(v.products) ||
+      !sha256(v.originalSha256) || !sha256(v.qualificationSha256) || v.completion?.receipt !== closureFile || !sha256(v.completion?.sha256)) return fail('identity is incomplete or contradictory');
+  const closure = readJson(budget, closureFile);
+  if (closure.missing || closure.error) return fail('closure is unavailable');
+  const c = closure.value;
+  if (closure.sha256 !== v.completion.sha256 || !isObject(c) || c.kind !== 'retained-stage-closure' ||
+      !sameIdentity(c.identity) || c.candidate !== v.candidate || !products(c.products) || !sameSet(c.products,v.products) ||
+      c.publication !== v.publication || c.originalSha256 !== v.originalSha256 || c.qualificationSha256 !== v.qualificationSha256 ||
+      !isObject(c.hashes) || !sameSet(Object.keys(c.hashes),v.products) || !Object.values(c.hashes).every(sha256)) return fail('closure digest or original identity differs');
+  return {state:'completed',file:closureFile,contradiction:null};
 }
 
 // A launcher refusal alone is not terminal: its own text leaves the request to its owner to retry.

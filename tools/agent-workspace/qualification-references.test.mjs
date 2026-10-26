@@ -209,3 +209,30 @@ test("a host with only release locks and historical residue has no installed qua
  fs.mkdirSync(path.join(data,'qualification-authority-requests'));assert.equal(qualificationReferences(null,{dataRoot:data}).complete,false,'one existing authority source plus a missing peer is damaged, not uninstalled');
  }finally{fs.rmSync(data,{recursive:true,force:true});}
 });
+
+function retainedFixture() {
+ const f=fixture(),request=f.addRequest(A);
+ request.pipeline.intent='qualify-only';request.pipeline.through='staging';
+ f.write(path.join(f.directories.requestsDir,A+'.json'),request);
+ const dir=path.join(f.directories.producerAdmissionDir,'retained-stage');fs.mkdirSync(dir);
+ const closurePath=path.join(dir,A+'.staged.json');
+ const closure={kind:'retained-stage-closure',identity:request.pipeline,candidate:'d'.repeat(40),products:['omniscience'],publication:'unpublished',originalSha256:'e'.repeat(64),qualificationSha256:'f'.repeat(64),hashes:{omniscience:'a'.repeat(64)}};
+ f.write(closurePath,closure);
+ const record={...closure,version:1,kind:'retained-stage',state:'completed',completion:{receipt:closurePath,sha256:crypto.createHash('sha256').update(fs.readFileSync(closurePath)).digest('hex')}};
+ const recordPath=path.join(dir,A+'.json');f.write(recordPath,record);
+ return {...f,record,recordPath,closurePath};
+}
+test('completed retained staging releases only its exact qualification request',()=>{
+ const f=retainedFixture(),r=census(f);assert.deepEqual(r.errors,[]);assert.deepEqual(r.references,[]);assert.equal(r.released[0].evidence,f.closurePath);
+});
+test('active or incomplete retained staging remains protected',()=>{
+ for(const state of ['active','unknown',undefined]){const f=retainedFixture();f.record.state=state;f.write(f.recordPath,f.record);assert.equal(protects(census(f),`${CLONES}/prepared-${A}`),true);}
+});
+test('changed retained closure, identity, path, or publication authority refuses',()=>{
+ for(const change of [f=>f.write(f.closurePath,{}),f=>f.record.identity.owner='different',f=>f.record.completion.receipt='/other/closure',f=>f.record.identity.through='publication',f=>f.record.candidate='invalid']){
+  const f=retainedFixture();change(f);f.write(f.recordPath,f.record);const r=census(f);assert.equal(r.complete,false);assert.equal(protects(r,'/anything'),true);
+ }
+});
+test('a publish request is never completed by a retained staging closure',()=>{
+ const f=retainedFixture(),request=f.request(A);f.write(path.join(f.directories.requestsDir,A+'.json'),request);assert.equal(census(f).complete,false);
+});
