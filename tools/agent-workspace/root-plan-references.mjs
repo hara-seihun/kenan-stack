@@ -1,5 +1,5 @@
-// Native root plans are execution custody, including helpers outside the root and smoke
-// checkouts. Read only the owning plan directory, never arbitrary evidence JSON or an age.
+// Plans protect future dispatch dependencies, including helpers outside the execution
+// checkouts. Cancellation ends only that request, not independently observed runtime custody.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -25,6 +25,7 @@ export function rootPlanReferences(roots=null,{directory=DEFAULT_ROOT_PLANS,maxE
   const settlement=file+'.custody-released.json';let terminal;
   try{terminal=JSON.parse(read(settlement));}catch(e){if(e.code!=='ENOENT')throw Error(`native root plan settlement unreadable: ${e.message}`);}
   if(terminal!==undefined){if(terminal?.state!=='released'||terminal.planSha256!==digest||typeof terminal.owner!=='string'||!terminal.owner||typeof terminal.reason!=='string'||!terminal.reason||!Array.isArray(terminal.paths)||terminal.paths.length!==paths.size||new Set(terminal.paths).size!==paths.size||[...paths].some(p=>!terminal.paths.includes(p)))throw Error('native root plan settlement does not match all exact execution dependencies');released.push({kind:'native_root_plan',id:name,state:'released',evidence:settlement,paths:[...paths]});continue;}
+  if(plan.state==='cancelled'){released.push({kind:'native_root_plan',id:name,state:'cancelled',resourceClass:'qualification-request',evidence:file,planSha256:digest,paths:[...paths]});continue;}
   references.push({kind:'native_root_plan',id:name,state:plan.state??'unsettled',resourceClass:'qualification-request',targetPath:plan.checkout,paths:[...paths],evidence:file,planSha256:digest,commit:plan.commit});
  }catch(e){errors.push(`${file}: ${e.message}`);}}
  return finish();
@@ -33,7 +34,7 @@ export function rootPlanReferences(roots=null,{directory=DEFAULT_ROOT_PLANS,maxE
 // Publisher-owned plan copies can add execution paths after a helper prepared the
 // canonical plan. Enumerate only plan filenames, not historical test/output JSON.
 export function publisherPlanReferences(roots=null,{directory='/home/kenan/data/converge-releases',maxEntries=16384,maxPlans=256,maxFileBytes=4<<20,maxTotalBytes=32<<20}={}){
- const errors=[],references=[];let entries=0,total=0,plans=0,handle;
+ const errors=[],references=[],released=[];let entries=0,total=0,plans=0,handle;
  try{
   try{handle=fs.opendirSync(directory);}catch(e){if(e.code!=='ENOENT')throw e;}
   if(handle)for(let entry;(entry=handle.readSync())!==null;){
@@ -49,8 +50,9 @@ export function publisherPlanReferences(roots=null,{directory='/home/kenan/data/
    walk(value,0);const digest=crypto.createHash('sha256').update(bytes).digest('hex');
    let terminal;try{terminal=JSON.parse(fs.readFileSync(file+'.custody-released.json'));}catch(e){if(e.code!=='ENOENT')throw e;}
    if(terminal!==undefined){if(terminal?.state!=='released'||terminal.planSha256!==digest||typeof terminal.owner!=='string'||!terminal.owner||typeof terminal.reason!=='string'||!terminal.reason||!Array.isArray(terminal.paths)||terminal.paths.length!==paths.size||new Set(terminal.paths).size!==paths.size||[...paths].some(p=>!terminal.paths.includes(p)))throw Error(file+': publisher plan custody release mismatches exact dependencies');continue;}
+   if(value.state==='cancelled'){released.push({kind:'publisher_native_plan',id:entry.name,state:'cancelled',resourceClass:'qualification-request',evidence:file,planSha256:digest,paths:[...paths]});continue;}
    if(paths.size)references.push({kind:'publisher_native_plan',id:entry.name,state:'unreleased',resourceClass:'qualification-request',paths:[...paths],evidence:file,planSha256:digest});
   }
  }catch(e){errors.push(String(e.message));}finally{handle?.closeSync();}
- return {errors,references:roots===null?references:references.filter(r=>r.paths.some(p=>roots.some(root=>overlap(p,root)))),released:[],complete:errors.length===0,observations:[{source:'publisher-native-plans',entries,plans,bytes:total}],observedAt:Date.now()};
+ return {errors,references:roots===null?references:references.filter(r=>r.paths.some(p=>roots.some(root=>overlap(p,root)))),released,complete:errors.length===0,observations:[{source:'publisher-native-plans',entries,plans,bytes:total}],observedAt:Date.now()};
 }

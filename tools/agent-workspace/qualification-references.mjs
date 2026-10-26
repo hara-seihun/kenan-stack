@@ -82,7 +82,7 @@ export function qualificationReferences(roots = null, options = {}) {
   const directories = { ...releaseDirectories(options.dataRoot), ...Object.fromEntries(Object.entries(options).filter(([key]) => key.endsWith("Dir") || key === "queueStateFile")) };
   const nativePlans=rootPlanReferences(roots, {directory: directories.rootPlansDir, ...(options.limits ?? {})});
   const publisherPlans=publisherPlanReferences(roots,{directory:options.dataRoot ?? path.dirname(directories.requestsDir)});
-  nativePlans.errors.push(...publisherPlans.errors);nativePlans.references.push(...publisherPlans.references);nativePlans.complete=nativePlans.complete&&publisherPlans.complete;nativePlans.observations.push(...publisherPlans.observations);
+  nativePlans.errors.push(...publisherPlans.errors);nativePlans.references.push(...publisherPlans.references);nativePlans.released.push(...publisherPlans.released);nativePlans.complete=nativePlans.complete&&publisherPlans.complete;nativePlans.observations.push(...publisherPlans.observations);
   // Native root-plan custody is independent of qualification-authority installation.
   if (!fs.existsSync(directories.requestsDir) && !fs.existsSync(directories.queueStateFile))
     return withPreparedRuntimeReferences({...nativePlans, observations:[{source:"qualification-records",state:"not-installed"}, ...nativePlans.observations]},roots,{...options,dataRoot:options.dataRoot ?? path.dirname(directories.requestsDir)});
