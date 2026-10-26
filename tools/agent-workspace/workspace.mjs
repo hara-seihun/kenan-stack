@@ -6,6 +6,7 @@ import {staleAllocationForecast} from './stale-allocation.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {assertIdleGrowth,assertIdleObservation} from './idle-growth.mjs';
+import {withContentObservation} from './inode-content.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {prepareFrozenObjectCustody} from './frozen-object-custody.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
@@ -1904,7 +1905,7 @@ function creationFenceBusy(database, workspacePath) {
   } finally { closeSync(descriptor); }
 }
 
-function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() + 500, maxEntries = 50_000, excludedPaths = [] } = {}) {
+function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() + 500, maxEntries = 50_000, excludedPaths = [], observeContent } = {}) {
   const excluded = new Set(excludedPaths);
   const seen = new Set();
   let entries = 0;
@@ -1922,7 +1923,7 @@ function allocatedWorkspaceBytes(workspacePath, device, { deadline = Date.now() 
     const inode = `${stats.dev}:${stats.ino}`;
     if (seen.has(inode)) return;
     seen.add(inode);
-    lastWriteAt=Math.max(lastWriteAt,Math.ceil(stats.mtimeMs),Math.ceil(stats.ctimeMs));
+    lastWriteAt=Math.max(lastWriteAt,observeContent?observeContent(file):Math.max(Math.ceil(stats.mtimeMs),Math.ceil(stats.ctimeMs)));
     const blocks = stats.blocks * 512;
     if (!Number.isSafeInteger(blocks) || blocks < 0) throw new Error("invalid allocated-block count");
     allocatedBytes += blocks;
@@ -2240,7 +2241,7 @@ function capacityRefusalDetails(plan, reservations) {
     otherReservationsBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     otherReservationBytes: [...reservations.priced],
     sourceImports: reservations.sourceImports ?? [],
-    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:false} : {}),
+    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:reservations.samplesRead===true} : {}),
     unpricedDormant: reservations.unpricedDormant,
     measurementFailures: reservations.measurementFailures === undefined ? [] : reservations.measurementFailures,
     automaticGrowthRepricing: reservations.growthRepricing??[],
@@ -2327,7 +2328,7 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
   if (freeInodes < minFreeInodes) fail(`${freeInodes.toFixed(2)}% of inodes are free; ${minFreeInodes.toFixed(2)}% is required`);
   return { ...priorEvidence, freeBytes, requiredBytes: requirement, reservedBytes: reservations.priced.reduce((sum, bytes) => sum + bytes, 0),
     sharedHeadroomBytes: reservations.headroomBytes, unpricedDormant: reservations.unpricedDormant,
-    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:false} : {}),
+    ...(reservations.observation ? {otherReservationsObservation:reservations.observation,otherAllocationSamplesRead:reservations.samplesRead===true} : {}),
     ...(reservations.measurementFailures ? { measurementFailures: reservations.measurementFailures } : {}) };
 }
 
@@ -4288,7 +4289,16 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
         plan.repricing.reduction = { ...reduction, sha256: reductionSha256 };
         plan.repricing.currentMeasurement = currentSample;
       }
-      const reservations = resume ? undefined : repriceReservations(database,row.device_id,record.path);
+      // A true no-increase replacement needs only ledger promises. An actual
+      // increase must use CREATE's exact cache/history projection, not rebook
+      // already consumed allocation as if it were still future demand. This
+      // projection reads bound samples only; it never starts a filesystem walk.
+      let reservations = resume ? undefined : repriceReservations(database,row.device_id,record.path);
+      if(!resume&&!reducing) {
+        const after=capacityRequirement({...plan,constructionBytes:0,growthBytes:remainingCapacityBytes(plan,record.state,measurement)},reservations.priced,reservations.headroomBytes);
+        const before=priorLiability.reservedBytes+Math.max(priorLiability.headroomBytes,reservations.headroomBytes)+reservations.priced.reduce((a,b)=>a+b,0);
+        if(after>before)reservations={...capacityReservations(database,row.device_id,record.path),observation:'create-sampled-ledger',samplesRead:true};
+      }
       if (!reducing) plan.admission = assertCapacity(record.root, args, database, record.path, {
         ...plan, constructionBytes: 0, growthBytes: remainingCapacityBytes(plan, record.state, measurement),
       }, {kind:"reprice", liability:priorLiability, reservations});
@@ -4316,7 +4326,8 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     }, deadline);
     print(creationRecord(database, record.id), bool(args, "json"));
   }, selected.groupId, deadline));
-  // Ordinary repricing uses conservative ledger promises, never fleet sampling.
+  // Ordinary increases use the same sampled projection as CREATE, but never
+  // run unrelated tree refresh loops inside their bounded observation budget.
   // Explicit resume keeps its existing refusal-driven admission route.
   return !resume ? decide() : withCapacityRefresh(database, statePath, device, decide,
     {budgetMs: Math.max(0, deadline - Date.now())});
@@ -4673,7 +4684,7 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath, au
         validateIdleGrowth(database,record,plan,measurement.measurement_json,safety);
         const expected=JSON.parse(measurement.measurement_json);
         const exclusions=database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(r=>r.path).filter(p=>p.startsWith(record.path+path.sep));
-        const verify=workspaceAllocationSample(record.path,row.device_id,{deadline:deadline-1000,maxEntries:2_000_000,excludedPaths:exclusions});
+        const verify=withContentObservation(database,{deadline:deadline-1000},observeContent=>workspaceAllocationSample(record.path,row.device_id,{deadline:deadline-1000,maxEntries:2_000_000,excludedPaths:exclusions,observeContent}));
         assertIdleObservation(expected,verify);
         safety=terminalSafety(database,record,deadline,true);
         validateIdleGrowth(database,record,plan,measurement.measurement_json,safety);
@@ -4830,11 +4841,12 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
   try {
     return withWorkspaceLock(database, row.path, () => {
       const excludedPaths=paths.filter(candidate=>candidate.startsWith(`${row.path}${path.sep}`));
-      if(!incremental)return store(workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths}));
+      if(!incremental)return store(withContentObservation(database,{deadline},observeContent=>workspaceAllocationSample(row.path,row.device_id,{deadline,maxEntries:2_000_000,excludedPaths,observeContent})));
       database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
       const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
-      const slice=allocationSlice(row.path,row.device_id,prior,{deadline:Math.min(deadline,Date.now()+1000),excludedPaths});
+      const until=Math.min(deadline,Date.now()+1000);
+      const slice=withContentObservation(database,{deadline:until},observeContent=>allocationSlice(row.path,row.device_id,prior,{deadline:until,excludedPaths,observeContent}));
       if(slice.partial){
         database.prepare("INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)").run(row.id,JSON.stringify(slice.state));
         return {partial:true,visited:slice.visited,entries:slice.state.entries,startedAt:slice.state.startedAt};

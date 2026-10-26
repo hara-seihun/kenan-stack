@@ -72,7 +72,7 @@ test('re-pricing an existing reservation charges only its increment, even on an 
 });
 
 // Repricing retains every unrelated promise without reading or refreshing its cache.
-test('repricing uses conservative unrelated promises and commits consumed growth exactly once',()=>{
+test('repricing increases read CREATE sampled accounting without refreshing unrelated stale caches and commit consumed growth exactly once',()=>{
  const root=mkdtempSync(path.join(tmpdir(),'reprice-stale-'));let db;
  const state=path.join(root,'registry.sqlite3'),priorSafety=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
@@ -101,8 +101,8 @@ test('repricing uses conservative unrelated promises and commits consumed growth
   assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(other.row.id).plan_json,otherPlan);
   const refreshed=JSON.parse(db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(other.row.id).measurement_json);
   assert.deepEqual(refreshed,stale,'unrelated stale cache remains byte-for-byte unchanged');
-  assert.equal(result.admission.otherReservationsObservation,'conservative-ledger-promises');
-  assert.equal(result.admission.otherAllocationSamplesRead,false);
+  assert.equal(result.admission.otherReservationsObservation,'create-sampled-ledger');
+  assert.equal(result.admission.otherAllocationSamplesRead,true);
   assert.equal(result.admission.reservedBytes,Math.floor(free*.6));
   const admitted=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(own.row.id).plan_json;
   assert.throws(()=>run(['reprice-capacity','--id',own.row.id,'--intent','budgeted','--headroom-gib','8','--growth-mib',String(Math.ceil(free*1.3/M)),'--json']),e=>e.code==='workspace-capacity-refused'&&e.capacity.freeBytes>0&&e.capacity.requiredBytes>e.capacity.freeBytes);
@@ -176,4 +176,30 @@ test('the final transaction rejects a changed owner, identity, plan, device or s
   assert.throws(()=>workspaceTesting.assertRepriceSnapshot(snapshot,changed),{code:'capacity-reprice-conflict'});
  }
  assert.throws(()=>workspaceTesting.assertRepriceSnapshot(snapshot,{...snapshot,sampleText:'changed'}),{code:'capacity-reprice-conflict'});
+});
+
+test('a 512 MiB increase uses exactly CREATE sampled commitments rather than double-charging allocated bytes',()=>{
+ const root=mkdtempSync(path.join(tmpdir(),'reprice-create-parity-')),state=path.join(root,'registry.sqlite3');let db;
+ const prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
+ const git=(...a)=>execFileSync('git',a,{encoding:'utf8',timeout:5000}).trim();
+ const run=args=>{let text='';const write=process.stdout.write,err=process.stderr.write,exit=process.exitCode;process.stdout.write=v=>{text+=v;return true;};process.stderr.write=()=>true;try{main(args,state);return JSON.parse(text);}finally{process.stdout.write=write;process.stderr.write=err;process.exitCode=exit;}};
+ const source=name=>{const dir=path.join(root,name);mkdirSync(dir);git('init','-q',dir);git('-C',dir,'-c','user.name=F','-c','user.email=f@example.invalid','commit','-q','--allow-empty','-m','source');const head=git('-C',dir,'rev-parse','HEAD');return {dir,head,row:run(['register','--path',dir,'--owner','owner','--source-commit',head,'--json'])};};
+ try{
+  const own=source('target'),other=source('sampled-other');db=new DatabaseSync(state);const device=String(statSync(root).dev),at=Date.now(),fs=statfsSync(root),free=fs.bavail*fs.bsize;
+  const plan={intent:'source-only',estimate:'whole-tree-upper-bound',constructionBytes:0,completedAllocationBytes:0,growthBytes:512*M,headroomBytes:8*G};
+  const put=(item,p,bytes)=>{const text=JSON.stringify(p);db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(item.row.id,device,text);db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(item.row.id,JSON.stringify({ok:true,rootPath:item.dir,planSha256:createHash('sha256').update(text).digest('hex'),device,inode:String(statSync(item.dir).ino),bytes,allocatedBytes:bytes,startedAt:at,completedAt:at}));};
+  put(own,plan,0);put(other,{...plan,intent:'budgeted',growthBytes:Math.floor(free*1.2)},Math.floor(free*1.1));
+  assert.ok(workspaceTesting.repriceReservations(db,device,own.dir).priced.reduce((a,b)=>a+b,0)>free);
+  const createProjection=workspaceTesting.capacityReservations(db,device,own.dir),expected=createProjection.priced.reduce((a,b)=>a+b,0);
+  assert.ok(expected+8*G+1024*M<free,'the exact same sampled commitments admit CREATE');
+  const beforeOther=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(other.row.id).plan_json;
+  const result=run(['reprice-capacity','--id',own.row.id,'--intent','budgeted','--growth-mib','1024','--headroom-gib','8','--budget-ms','3000','--json']).capacity;
+  assert.equal(result.admission.kind,'reprice-increment');assert.equal(result.admission.incrementalBytes,512*M);assert.equal(result.admission.reservedBytes,expected);assert.equal(result.admission.otherReservationsObservation,'create-sampled-ledger');assert.equal(result.growthBytes,1024*M);
+  assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(other.row.id).plan_json,beforeOther);
+  // Missing, failed and expired-unbound observations never fabricate credit.
+  for(const text of [JSON.stringify({ok:false,error:'injected failure'}),JSON.stringify({ok:true,bytes:Math.floor(free*1.1),allocatedBytes:Math.floor(free*1.1),device,inode:String(statSync(other.dir).ino),startedAt:at-1200000,completedAt:at-1200000})]){
+   db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(text,other.row.id);
+   assert.throws(()=>run(['reprice-capacity','--id',own.row.id,'--intent','budgeted','--growth-mib','1536','--headroom-gib','8','--budget-ms','1000','--json']),e=>e.code==='workspace-capacity-refused');
+  }
+ }finally{db?.close();if(prior===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=prior;rmSync(root,{recursive:true,force:true});}
 });

@@ -1013,3 +1013,34 @@ Automatic owner cleanup uses source-scope native observations, even after future
 The policy retires only a completed priced workspace's future promise. It preserves the original growth amount, all files (including dirty unpublished work), owner, source, shared headroom and allocation baseline. Retirement records a journal, sets the existing retired-growth lifecycle and relinquishes the writing lease in one transaction. `writer-run`, registration, heartbeat, ordinary repricing and bootstrap's existing growth checks cannot reactivate it. A new writer must use `resume-growth` with the exact current owner and plan, passing genuine capacity admission.
 
 Two real, identity-bound samples must have equal allocated bytes. This is **not** last-write evidence: the complete tree observation separately reads every inode's modification and change times, including same-size changes, and their maximum must be more than an hour old. Missing samples, recent construction or resumed admission, changed plan/source/owner, active processes, units, native streaming tools or borrower writers retain the promise. A fresh complete second walk under the same checkout, borrower and device locks rejects writes during observation. The final ledger transaction revalidates the exact binding. No age or lease expiry alone grants credit. An unsupported external filesystem writer is not kernel-fenced; subsequent observation detects writes truthfully, and supported writers must first re-admit growth.
+
+### Sampled repricing and hardlink-only inode changes
+
+A genuine increase through `reprice-capacity` now reads the same current sample,
+margin, stale forecast and future-growth policy projection as CREATE. Physical
+allocation is already reflected in filesystem free bytes: it is not also charged
+as unused future growth. This foreground projection does not walk unrelated
+checkouts or refresh their trees inside the command's observation budget. Missing,
+failed or unbound stale observations retain their conservative commitments; the
+ordinary resumable sampler refreshes them independently. A complete non-increase
+still uses ledger-only accounting and never reads unrelated samples. Existing
+source, owner, sample and plan compare-and-swap checks remain mandatory.
+
+The allocated-block sampler maintains a shared-inode content proof journal in
+`workspace_inode_content`. Only a full SHA-256 match, identical device/inode/birth
+time, size, blocks, mode, owner, group and nanosecond mtime, plus a changed link
+count, proves that an inode ctime change was link-only. The hash reads an open
+non-symlink descriptor with stable metadata checked both before and after, and
+rechecks the pathname identity afterwards. Its previous payload timestamp is then
+preserved. A first observation uses real current ctime; it never manufactures an
+old timestamp from an old mtime. Payload changes, same-size writes, unexplained
+ctime changes, changed identity or permissions and incomplete proofs remain recent.
+No proof weakens the process/unit/native execution, owner/source/plan, two-sample,
+one-hour payload-idleness or final under-lock verification requirements. Complete
+final walks use the same proof journal. Old incremental cursor versions restart
+rather than retaining obsolete ctime-only evidence. Concurrent proof publication
+cannot replace newer inode evidence or lower a proved payload-write timestamp.
+
+This is cooperative admission and content observation, not kernel enforcement.
+An unsupported external writer remains possible; a changed payload, unknown
+observation or final write race retains the original reservation truthfully.
