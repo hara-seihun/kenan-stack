@@ -5393,7 +5393,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   }
   const database = openRegistry(statePath);
   try {
-    if (!["retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -5478,7 +5478,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),

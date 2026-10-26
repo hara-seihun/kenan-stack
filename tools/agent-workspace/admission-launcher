@@ -4,16 +4,21 @@
 set -eu
 lock=${AGENT_WORKSPACE_ADMISSION_LOCK:-/run/lock/agent-workspace-admission.lock}
 selected=${AGENT_WORKSPACE_SELECTED_ROOT:-/srv/pi/tools/agent-workspace}
+deadline=$(( $(date +%s) + 20 ))
+busy() {
+ printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication is draining or selecting tools. No command ran; the shared 20-second admission budget expired.","commandStarted":false,"waitBudgetSeconds":20}}'
+ exit 75
+}
+remaining() {
+ left=$(( deadline - $(date +%s) ))
+ [ "$left" -gt 0 ] || busy
+}
 exec 9>"$lock.turnstile"
-if ! flock --shared --wait 30 --conflict-exit-code 75 9; then
- printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication is draining existing operations. No command ran; resume after publication finishes."}}'
- exit 75
-fi
+remaining
+flock --shared --wait "$left" --conflict-exit-code 75 9 || busy
 exec 8>"$lock"
-if ! flock --shared --wait 30 --conflict-exit-code 75 8; then
- printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication owns admission. No command ran; resume after publication finishes."}}'
- exit 75
-fi
+remaining
+flock --shared --wait "$left" --conflict-exit-code 75 8 || busy
 flock --unlock 9
 exec 9>&-
 exec "$selected/main" "$@"

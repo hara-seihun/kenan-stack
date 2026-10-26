@@ -24,3 +24,10 @@ test('an admission timeout returns a typed machine refusal and never starts the 
  const result=spawnSync(new URL('./admission-launcher',import.meta.url).pathname,['create','--json'],{env:{...process.env,PATH:bin+':/usr/bin:/bin',AGENT_WORKSPACE_ADMISSION_LOCK:path.join(root,'lock'),AGENT_WORKSPACE_SELECTED_ROOT:selected},encoding:'utf8',timeout:3000});assert.equal(result.status,75);assert.equal(JSON.parse(result.stdout).error.code,'workspace-admission-lock-busy');assert.doesNotMatch(result.stdout,/should-not-run/);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+for(const stages of ['turnstile','shared'])test(`one absolute admission budget covers real ${stages} contention before the caller tool deadline`,async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'workspace-budget-')),lock=path.join(root,'lock'),ready=path.join(root,'ready'),selected=path.join(root,'selected');fs.mkdirSync(selected);fs.writeFileSync(path.join(selected,'main'),'#!/bin/sh\necho forbidden\n',{mode:0o755});
+ const held=stages==='turnstile'?lock+'.turnstile':lock;
+ const holder=spawn('flock',['-x',held,'sh','-c',`touch '${ready}';sleep 24`]);
+ try{const end=Date.now()+3000;while(!fs.existsSync(ready)&&Date.now()<end)await new Promise(r=>setTimeout(r,5));assert.equal(fs.existsSync(ready),true);const started=Date.now();const result=spawnSync(new URL('./admission-launcher',import.meta.url).pathname,['heartbeat','--json'],{env:{...process.env,AGENT_WORKSPACE_ADMISSION_LOCK:lock,AGENT_WORKSPACE_SELECTED_ROOT:selected},encoding:'utf8',timeout:23000});const elapsed=Date.now()-started;assert.equal(result.status,75,result.stderr);assert.ok(elapsed>=18000&&elapsed<23000,String(elapsed));const value=JSON.parse(result.stdout);assert.equal(value.error.code,'workspace-admission-lock-busy');assert.equal(value.error.commandStarted,false);assert.equal(value.error.waitBudgetSeconds,20);assert.doesNotMatch(result.stdout,/forbidden/);
+ }finally{holder.kill('SIGTERM');await new Promise(r=>holder.exitCode===null?holder.once('exit',r):r());fs.rmSync(root,{recursive:true,force:true});}
+});
