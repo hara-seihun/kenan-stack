@@ -3505,7 +3505,7 @@ function endWritingCommand(database,args) {
     const b=cacheBinding(database,record.id);
     if(b.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");
     if(database.prepare("SELECT 1 FROM workspace_capacity WHERE workspace_id=?").get(record.id))growthError("priced-workspace","use retire-growth for priced workspace");
-    const safety=terminalSafety(database,record,deadline);
+    const safety=terminalSafety(database,record,deadline,true);
     validateRetirement(d,b,safety);
     database.exec("BEGIN IMMEDIATE");
     try {
@@ -4365,7 +4365,7 @@ function growthProcessReferences(paths) {
   const snapshot = processSnapshot(true,paths);
   return paths.flatMap(root => processReferences(root,snapshot).map(reference => ({...reference,root})));
 }
-function growthSafety(database, record) {
+function growthSafety(database, record, {preservationOnly=false}={}) {
   const isolated = process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
   const dependencies = gitDependencySnapshot(database);
   const retainedBorrowers = [...dependencies.alternates.filter(value => value.recordId !== record.id && within(record.path, value.objectDirectory)),
@@ -4376,7 +4376,10 @@ function growthSafety(database, record) {
   if (common === path.join(record.path,".git")) for (const line of git(record.path,["worktree","list","--porcelain"]).split("\n")) {
     if (!line.startsWith("worktree ")) continue;
     const borrowerPath = line.slice(9);
-    if (borrowerPath !== record.path && !borrowers.has(borrowerPath)) growthError("growth-writer-unknown", `unregistered linked borrower ${borrowerPath}`);
+    if (borrowerPath !== record.path && !borrowers.has(borrowerPath)) {
+      if(!preservationOnly)growthError("growth-writer-unknown", `unregistered linked borrower ${borrowerPath}`);
+      borrowers.set(borrowerPath,null); // Retain every byte; observe its execution, not its registration.
+    }
   }
   const paths = [record.path,...borrowers.keys()];
   let processes = [];
@@ -4398,16 +4401,16 @@ function growthSafety(database, record) {
   return {errors:[docker.error, systemd.error].filter(value => value !== undefined),
     references:[...processes, ...containers.references, ...units.references,
       ...threads.filter(thread => paths.some(root => within(root, thread.cwd))),
-      ...[...borrowers.values()].filter(borrower => borrower.leaseExpiresAt > Date.now()).map(borrower => ({kind:"borrower-writing-lease",id:borrower.id})),
+      ...[...borrowers.values()].filter(borrower => !preservationOnly && borrower && borrower.leaseExpiresAt > Date.now()).map(borrower => ({kind:"borrower-writing-lease",id:borrower.id})),
       ...[...borrowers.keys()].flatMap(root => [...dockerReferences(root,docker).references, ...systemdReferences(root,systemd).references])],
     // Borrowing Git objects is retention, not a growth writer in the parent's checkout.
-    retainedBorrowers,
+    retainedBorrowers, executionRoots:paths,
     observedAt:Date.now()};
 }
 
-function terminalSafety(database,record,deadline) {
-  const safety=growthSafety(database,record);
-  const roots=[record.path,...new Set(safety.retainedBorrowers.map(b=>b.workspacePath))];
+function terminalSafety(database,record,deadline,preservationOnly=false) {
+  const safety=growthSafety(database,record,{preservationOnly});
+  const roots=safety.executionRoots??[record.path,...new Set(safety.retainedBorrowers.map(b=>b.workspacePath))];
   const isolated=process.env.NODE_TEST_CONTEXT!==undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY==="empty";
   const native=isolated?{errors:[],references:[],observations:[]}:currentStackQueueReferences(roots,{resourceKind:"physical-checkout",deadline});
   return {...safety,errors:[...safety.errors,...native.errors],references:[...safety.references,...native.references],nativeObservations:native.observations};
@@ -4654,7 +4657,7 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath, au
       if (retainedGrowth(plan)) growthError("growth-already-retired", "growth is already retired; no replay");
       const cached = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
       if (!cached.ok) growthError("growth-sample-required", cached.error);
-      let safety = terminalSafety(database, record, deadline);
+      let safety = terminalSafety(database, record, deadline,automatic);
       if(!automatic && safety.references.length && !safety.errors.length){
         const pids=[...new Set(safety.references.map(r=>r.pid).filter(pid=>Number.isSafeInteger(pid)&&pid>0))];
         const units=[...new Set(safety.references.map(r=>r.id).filter(id=>typeof id==="string"&&id.endsWith(".service")))];
@@ -4672,7 +4675,7 @@ function retireGrowthEvidence(database, selected, owner, evidence, statePath, au
         const exclusions=database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(r=>r.path).filter(p=>p.startsWith(record.path+path.sep));
         const verify=workspaceAllocationSample(record.path,row.device_id,{deadline:deadline-1000,maxEntries:2_000_000,excludedPaths:exclusions});
         assertIdleObservation(expected,verify);
-        safety=terminalSafety(database,record,deadline);
+        safety=terminalSafety(database,record,deadline,true);
         validateIdleGrowth(database,record,plan,measurement.measurement_json,safety);
       }
       validateRetirement(disposition, binding, safety);

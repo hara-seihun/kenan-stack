@@ -14,6 +14,7 @@ const base=()=>({now,record:{state:'active',path:'/source',createdAt:0},plan:{in
 test('idle promise retirement distinguishes actual last write from sample allocation stability',()=>assert.doesNotThrow(()=>assertIdleGrowth(base())));
 for(const [name,mutate,code] of [
  ['active process',v=>v.safety.references.push({pid:8}),'idle-growth-active'],
+ ['active borrower process',v=>v.safety.references.push({pid:9,root:'/borrower'}),'idle-growth-active'],
  ['active unit',v=>v.safety.references.push({id:'writer.service'}),'idle-growth-active'],
  ['native execution',v=>v.safety.references.push({kind:'tool_call',state:'running'}),'idle-growth-active'],
  ['unknown execution',v=>v.safety.errors.push('census failed'),'idle-growth-active'],
@@ -46,6 +47,7 @@ test('automatic sweep retires only future demand, preserves bytes, advances curs
  try{
  const source=path.join(root,'source');fs.mkdirSync(source);git('init','-b','main',source);git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(source,'proof'),'valuable source');git('-C',source,'add','.');git('-C',source,'commit','-m','proof');fs.appendFileSync(path.join(source,'proof'),' dirty');
  const head=git('-C',source,'rev-parse','HEAD');const rec=run(['register','--path',source,'--root',root,'--owner','owner','--source-commit',head,'--intent','source-only','--growth-mib','512','--headroom-gib','8','--json']);
+ const borrower=path.join(root,'unregistered-borrower');git('-C',source,'worktree','add','--detach',borrower,head);
  const db=new DatabaseSync(state);db.prepare('UPDATE workspace SET created_at=? WHERE id=?').run(Date.now()-7200000,rec.id);
  // Actual real inode ctime is recent, so two equal-byte samples alone do not qualify.
  run(['measure-capacity','--id',rec.id,'--budget-ms','3000','--json']);
@@ -57,6 +59,7 @@ test('automatic sweep retires only future demand, preserves bytes, advances curs
  // evidence: age the real complete observation while retaining freshness at walk.
  const actual=Date.now;Date.now=()=>actual()+7200000;
  let result;try{result=sweep();}finally{Date.now=actual;}
+ assert.equal(git('-C',borrower,'rev-parse','HEAD'),head);assert.equal(fs.readFileSync(path.join(borrower,'proof'),'utf8'),'valuable source');
  assert.equal(result.retiredCount,1);assert.equal(result.retiredPromiseBytes,512*1024**2);
  assert.equal(fs.readFileSync(path.join(source,'proof'),'utf8'),'valuable source dirty');assert.equal(git('-C',source,'rev-parse','HEAD'),head);
  const plan=JSON.parse(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json);assert.equal(plan.growthBytes,512*1024**2);assert.equal(plan.growthLifecycle.remainingGrowthBytes,0);
