@@ -113,3 +113,12 @@ test('reaper total budget accepts the host invocation but validates both phases 
  assert.throws(()=>f.reaper({'budget-ms':1500}),/total budget/);
  assert.throws(()=>f.reaper({'budget-ms':90000,'max-records':65}),/release/);
 }));
+
+test('an archived original owner cannot release publisher-adopted native plan helper source',()=>fixture(f=>{
+ const old=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;
+ const data=path.join(f.root,'publisher-custody');fs.mkdirSync(path.join(data,'root-plans'),{recursive:true});
+ fs.writeFileSync(path.join(data,'root-plans','adopted.plan.json'),JSON.stringify({state:'planned',commit:'a'.repeat(40),checkout:path.join(f.root,'prepared-root'),stages:{tests:{argv:['/usr/bin/python3',path.join(f.source,'helper.py')]}},finish:['/usr/bin/python3',path.join(f.source,'helper.py'),'finish']}));
+ process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=data;
+ try{f.bind();f.observe('stopped');const result=f.release(true);assert.equal(fs.existsSync(f.source),true,JSON.stringify(result));assert.equal(result.results[0].inspection.classification,'referenced');assert.equal(result.results[0].inspection.currentStackReferences[0].kind,'native_root_plan');}
+ finally{if(old===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=old;}
+}));
