@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
-import {hasUncoveredCommits} from './release-reachability.mjs';
+import {hasUncoveredCommits,observedRemoteHeads,REMOTE_OBJECT_BATCH_SIZE} from './release-reachability.mjs';
 
 test('one bounded union walk matches per-branch reachability; refs and foreign work unchanged', () => {
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'reachability-'));
@@ -36,4 +36,38 @@ test('timeout, invalid output and unknown custody never establish safe coverage'
  assert.throws(()=>hasUncoveredCommits(()=> 'not-a-commit',[sha],[]),/malformed/);
  assert.throws(()=>hasUncoveredCommits(()=> '',['HEAD'],[]),/exact commit/);
  assert.throws(()=>hasUncoveredCommits(()=> '',[],[]),/no candidates/);
+});
+
+function remoteFixture(change=()=>{}) {
+ const tips=Array.from({length:13735},(_,i)=>(i+1).toString(16).padStart(40,'0'));
+ const calls=[];
+ const command=(file,args,options)=>{
+  assert.equal(file,'git');
+  if(args[2]==='remote')return {status:0,stdout:'origin'};
+  if(args[2]==='ls-remote')return {status:0,stdout:tips.map((sha,i)=>`${sha}\trefs/heads/branch-${i}`).join('\n')};
+  assert.equal(args[2],'cat-file');
+  const batch=options.input.trim().split('\n');calls.push(batch);
+  // Reproduce the original quantum failure without a wall-clock-dependent sleep.
+  if(batch.length>REMOTE_OBJECT_BATCH_SIZE)return {status:1,error:{code:'ETIMEDOUT'},stdout:''};
+  assert.equal(options.env.GIT_NO_LAZY_FETCH,'1');assert.equal(options.env.GIT_NO_REPLACE_OBJECTS,'1');
+  const result={status:0,stdout:batch.map((sha,i)=>`${sha} ${Number.parseInt(sha,16)%3===0?'missing':'commit'}`).join('\n')};
+  change(result,batch,calls.length);return result;
+ };
+ return {tips,calls,command};
+}
+test('large advertised remote inventory is checked in bounded quanta without skipping heads',()=>{
+ const f=remoteFixture(),result=observedRemoteHeads(f.command,'/source');
+ assert.equal(result.ok,true);assert.equal(f.calls.length,Math.ceil(f.tips.length/REMOTE_OBJECT_BATCH_SIZE));
+ assert.deepEqual(f.calls.flat(),f.tips);
+ assert.deepEqual(result.durable,f.tips.filter(sha=>Number.parseInt(sha,16)%3!==0));
+ assert.equal(result.observations[0].heads,f.tips.length);
+});
+for(const failure of ['timeout','incomplete','wrong-id','wrong-type'])test('a late '+failure+' batch never establishes partial remote custody',()=>{
+ const f=remoteFixture((result,batch,count)=>{if(count!==3)return;
+  if(failure==='timeout'){result.status=1;result.error={code:'ETIMEDOUT'};}
+  if(failure==='incomplete')result.stdout=result.stdout.split('\n').slice(1).join('\n');
+  if(failure==='wrong-id')result.stdout=result.stdout.replace(batch[0],'f'.repeat(40));
+  if(failure==='wrong-type')result.stdout=result.stdout.replace(/ (commit|missing)/,' blob');
+ });
+ const result=observedRemoteHeads(f.command,'/source');assert.equal(result.ok,false);assert.equal(result.code,'remote-custody-unknown');assert.equal(result.durable,undefined);assert.equal(f.calls.length,3);
 });

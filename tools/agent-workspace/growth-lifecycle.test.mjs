@@ -8,6 +8,7 @@ import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 const journalRecord=(db,id)=>db.prepare('SELECT record_json FROM workspace_growth_retirement WHERE workspace_id=?').get(id).record_json;
 import {main,workspaceTesting} from './workspace.mjs';
+import {submitRelease} from './release-submission.mjs';
 import {digest,validateRetirement,retainedGrowth} from './growth-lifecycle.mjs';
 const binding={borrowersSha256:'f'.repeat(64),id:'id',path:'/source',owner:'current-owner',sourceCommit:'a'.repeat(40),durableSourceCommit:'b'.repeat(40),head:'c'.repeat(40),state:'referenced',updatedAt:1,leaseExpiresAt:0,device:'1',inode:'2',planSha256:'d'.repeat(64),sampleSha256:'e'.repeat(64)};
 const disposition=()=>({kind:'retire-future-growth',retainedUse:'source',remainingGrowthBytes:0,growthWriters:'none',writingLease:'retire',reason:'completed build',ownerEvidence:'owner terminal receipt',observedAt:Date.now(),binding:{...binding}});
@@ -39,7 +40,7 @@ test('retained growth validates lifecycle and preserves numeric budget validatio
 });
 
 // Real Git + real SQLite, private test registry. No live transition or application effect.
-for (const lease of ['valid','expired']) test(`retained growth CLI ${lease} lease preserves unpublished source and linked borrower, history/sample/headroom; fresh admission required`,()=>{
+for (const lease of ['valid','expired']) test(`retained growth CLI ${lease} lease preserves unpublished source and linked borrower, history/sample/headroom; fresh admission required`,async()=>{
  const root=mkdtempSync(path.join(tmpdir(),'retained-growth-'));
  const source=path.join(root,'source'),borrower=path.join(root,'borrower'),state=path.join(root,'registry.sqlite3');
  const git=(...args)=>execFileSync('git',args,{encoding:'utf8',timeout:5000}).trim();
@@ -94,7 +95,30 @@ for (const lease of ['valid','expired']) test(`retained growth CLI ${lease} leas
  assert.throws(()=>run(['reprice-capacity','--id',record.id,'--intent','budgeted','--headroom-gib','8','--growth-mib','512','--json']),{code:'growth-admission-required'});
  assert.throws(()=>retire(d),{code:'growth-already-retired'});
  assert.throws(()=>run(['heartbeat','--id',child.id,'--json']),{code:'growth-admission-required'});
- assert.equal(run(['release','--id',record.id,'--json']).action,'none');
+ let background;
+ const submission=submitRelease({database:db,record:originalRecord,
+  request:{id:record.id,owner:'current-owner',flags:[]},binding:{agentId:'fixture-owner',channel:'beta',callId:'fixture-call'},settlement:{kind:'none'},
+  launch:()=>{
+   // Exercise the real asynchronous submission and release implementation against
+   // the private registry. Never launch a native worker against disposable state.
+   background=Promise.resolve().then(()=>{
+    let output='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=chunk=>{output+=chunk;return true;};
+    try{workspaceTesting.releaseCommand(db,{positional:[],named:new Map([['id',[record.id]],['json',['true']]])},state,{caller:()=>({ok:true,kind:'operator'})});}
+    finally{process.stdout.write=write;process.exitCode=exit;}
+    return JSON.parse(output);
+   });
+   return {started:'private-fixture-release'};
+  }});
+ assert.equal(submission.action,'release-submitted');assert.equal(submission.completed,false);
+ assert.equal(existsSync(source),true,'accepted submission is not physical release');
+ const releaseResult=await background;
+ assert.equal(releaseResult.action,'none');
+ const terminal=run(['status','--id',record.id,'--json']).records[0];
+ assert.equal(terminal.id,record.id);assert.equal(terminal.owner,'current-owner');
+ assert.equal(terminal.state,'referenced');assert.equal(terminal.leaseExpiresAt,0);
+ assert.equal(terminal.releaseSettlement.kind,'unset','retained custody refusal starts no physical release journal');
+ assert.equal(releaseResult.record.id,terminal.id);assert.equal(releaseResult.record.state,terminal.state);
+ assert.equal(readFileSync(path.join(source,'proof.txt'),'utf8'),'irreplaceable unpublished proof');
  const reconciliation=run(['reconcile','--id',record.id,'--execute','--reap-expired','--json']);
  assert.equal(reconciliation[0].action,'none');
  assert.equal(readFileSync(path.join(source,'node_modules','keep.txt'),'utf8'),'retained runtime');

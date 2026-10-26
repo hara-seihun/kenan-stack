@@ -20,6 +20,9 @@ export function hasUncoveredCommits(git, candidates, exclusions) {
 // and is left out; local object existence alone is never counted as durable.
 // `command(file, args, options)` returns {status, stdout, error}.
 export const MAX_RELEASE_REMOTES = 16;
+// Each read shares the existing inspection deadline and two-second journal quantum.
+// A large remote must not turn one object lookup into an unbounded unit of work.
+export const REMOTE_OBJECT_BATCH_SIZE = 256;
 export function observedRemoteHeads(command, repository, {timeout = 4000} = {}) {
   const listed = command('git', ['-C', repository, 'remote'], {timeout});
   if (listed.status !== 0 || listed.error) return {ok: false, code: 'remote-custody-unknown', detail: 'remote inventory failed'};
@@ -37,15 +40,16 @@ export function observedRemoteHeads(command, repository, {timeout = 4000} = {}) 
       tips.push(sha);
     }
     const unique = [...new Set(tips)];
-    if (unique.length) {
-      const checked = command('git', ['-C', repository, 'cat-file', '--batch-check=%(objectname) %(objecttype)'], {input: unique.join('\n') + '\n', timeout});
+    for (let start = 0; start < unique.length; start += REMOTE_OBJECT_BATCH_SIZE) {
+      const batch = unique.slice(start, start + REMOTE_OBJECT_BATCH_SIZE);
+      const checked = command('git', ['-C', repository, 'cat-file', '--batch-check=%(objectname) %(objecttype)'], {input: batch.join('\n') + '\n', timeout, env: {GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1'}});
       if (checked.status !== 0 || checked.error) return {ok: false, code: 'remote-custody-unknown', detail: 'remote object inventory failed'};
       const rows = checked.stdout.split('\n').filter(Boolean);
-      if (rows.length !== unique.length) return {ok: false, code: 'remote-custody-unknown', detail: 'incomplete remote object inventory'};
+      if (rows.length !== batch.length) return {ok: false, code: 'remote-custody-unknown', detail: 'incomplete remote object inventory'};
       for (let index = 0; index < rows.length; index++) {
         const [name, type] = rows[index].split(' ');
-        if (type === 'commit' && name === unique[index]) durable.push(unique[index]);
-        else if (!(type === 'missing' && name === unique[index])) return {ok: false, code: 'remote-custody-unknown', detail: 'invalid remote object response'};
+        if (type === 'commit' && name === batch[index]) durable.push(batch[index]);
+        else if (!(type === 'missing' && name === batch[index])) return {ok: false, code: 'remote-custody-unknown', detail: 'invalid remote object response'};
       }
     }
     observations.push({remote, heads: tips.length, presentLocally: durable.length, observedAt: Date.now()});
