@@ -2094,10 +2094,24 @@ test("forty concurrent create and heartbeat clients share registry writes", asyn
   const f = fixture();
   try {
     const commit = git(f.source, "rev-parse", "HEAD");
-    const records = await Promise.all(Array.from({ length: 40 }, async (_, index) => JSON.parse(await runAsync([
-      "create", "--root", f.workspaces, "--name", `concurrent-${index}`, "--repo", f.remote,
-      "--ref", commit, "--min-free-gib", "0", "--json",
-    ], f.env))));
+    // The production capacity fence is deliberately bounded. Forty clients on two
+    // admitted CPUs can exhaust its 30-second wait without a registry failure.
+    // Continue only the exact pre-action lock refusal through the same operation;
+    // all other errors remain failures, and every client settles before cleanup.
+    const results = await Promise.allSettled(Array.from({ length: 40 }, async (_, index) => {
+      const args = ["create", "--root", f.workspaces, "--name", `concurrent-${index}`, "--repo", f.remote,
+        "--ref", commit, "--min-free-gib", "0", "--json"];
+      for (let attempt = 0; ; attempt++) {
+        try { return JSON.parse(await runAsync(args, f.env)); }
+        catch (error) {
+          if (attempt >= 2 || error.code !== 75 ||
+              !/workspace resource busy: capacity:[0-9]+: 30000ms lock budget exhausted/u.test(error.stderr ?? "")) throw error;
+        }
+      }
+    }));
+    const failures = results.filter(result => result.status === "rejected");
+    assert.deepEqual(failures.map(result => String(result.reason)), []);
+    const records = results.map(result => result.value);
     assert.equal(new Set(records.map(record => record.id)).size, 40);
     const renewed = await Promise.all(records.map(async record => JSON.parse(await runAsync([
       "heartbeat", "--path", record.path, "--json",
