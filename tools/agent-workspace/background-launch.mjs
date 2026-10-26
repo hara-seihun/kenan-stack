@@ -13,6 +13,7 @@ export function backgroundSpec(input,binding,uid,gid){
  const description='kenan-tool-call:'+JSON.stringify({version:1,...binding,background:true,uid});
  return {unit,description};
 }
+export function submitBackground(command,args,{execute=run}={}){return execute(command,args,{timeout:3000});}
 export function main(){
  if(process.getuid()!==0)throw Error('background_root_required');
  let diagnostic;
@@ -34,10 +35,13 @@ export function main(){
   process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
- const active=run('/usr/bin/systemctl',['--system','is-active','--quiet',spec.unit]);if(active.status===0)throw Error('background_already_running');
- run('/usr/bin/systemctl',['--system','reset-failed',spec.unit]);
- const result=run('/usr/bin/systemd-run',['--system','--quiet','--collect','--expand-environment=no',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${input.cwd}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv]);
- if(result.status!==0||result.error)throw Error('background_launch_failed: '+(result.stderr||result.error));
+ // Unit creation is the atomic duplicate check. Separate preflight/reset calls
+ // add two unbounded-in-series manager waits and cannot make creation safer.
+ const result=submitBackground('/usr/bin/systemd-run',['--system','--quiet','--collect','--expand-environment=no',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${input.cwd}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv]);
+ if(result.status!==0||result.error){
+  const unknown=result.error||result.signal;
+  console.error(JSON.stringify({ok:false,error:{code:unknown?'background_launch_outcome_unknown':'background_launch_refused',unit:spec.unit,retry:false,detail:unknown?'Observe this exact unit before any new launch; the system manager may have accepted it.':'The system manager rejected this exact unit creation.'}}));process.exitCode=unknown?75:2;return;
+ }
  console.log(JSON.stringify({unit:spec.unit,identity:binding}));
 }
 if(process.argv[1]&&new URL(import.meta.url).pathname===fs.realpathSync(process.argv[1])){try{main();}catch(error){console.error(error.message);process.exitCode=2;}}

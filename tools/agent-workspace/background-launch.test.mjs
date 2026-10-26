@@ -35,3 +35,7 @@ test('a background native caller with failed authentication cannot fall through 
  const r=releaseCaller({caller:()=>null,pid:100,cgroup:()=>`0::${group}`,argv:()=>['/bin/worker'],parent:()=>1});
  assert.equal(r.ok,false);assert.equal(r.error.code,'release-caller-unverified');
 });
+import {submitBackground} from './background-launch.mjs';
+test('native background submission is one atomic bounded creation, not preflight and reset waits',()=>{
+ let calls=0;const timeout={status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''};const r=submitBackground('/usr/bin/systemd-run',['--unit=exact-original.service'],{execute:(cmd,args,options)=>{calls++;assert.equal(cmd,'/usr/bin/systemd-run');assert.deepEqual(args,['--unit=exact-original.service']);assert.equal(options.timeout,3000);return timeout;}});assert.equal(r,timeout);assert.equal(calls,1);
+});
