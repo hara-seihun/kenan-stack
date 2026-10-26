@@ -26,35 +26,40 @@ function procArgv(pid){return fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').spl
 function procParent(pid){const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');return Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);}
 // Identity lives in a root-created system-manager scope, never in shell argv/env.
 // The observed cgroup and unit ControlGroup must agree with the actual caller.
-export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),query=(unit)=>boundedCommand('/usr/bin/systemctl',['--system','show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState,User,InvocationID'],{encoding:'utf8',timeout:2000,maxBuffer:8192,env:{PATH:'/usr/sbin:/usr/bin:/sbin:/bin',LC_ALL:'C',SYSTEMD_COLORS:'0'}})}={}){
+export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),onError=()=>{},query=(unit)=>boundedCommand('/usr/bin/systemctl',['--system','show',unit,'--no-pager','--property=Description,ControlGroup,Transient,ActiveState,User,InvocationID'],{encoding:'utf8',timeout:2000,maxBuffer:8192,env:{PATH:'/usr/sbin:/usr/bin:/sbin:/bin',LC_ALL:'C',SYSTEMD_COLORS:'0'}})}={}){
  const rows=read(pid).trim().split('\n');
  const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
  const nativeScope=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??'');
  const nativeBackground=/^kenan-bg-[a-f0-9-]{36}-[-A-Za-z0-9._]{1,60}\.service$/.test(unit??'')&&group?.startsWith('/user.slice/user-agents.slice/');
- if(!group||!nativeScope&&!nativeBackground)return null;
+ const fail=(code,detail)=>{onError({code,detail});return null;};
+ if(!group||!nativeScope&&!nativeBackground)return fail('caller-scope-missing','The process is not in a recognized native tool scope.');
  const r=query(unit);
- if(r.status!==0||r.error)return null;
+ if(r.status!==0||r.error)return fail('caller-scope-query-failed',`The system-manager scope query failed (${r.error?.code??r.signal??r.status}).`);
  const props=Object.fromEntries(r.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
- if(props.ControlGroup!==group||props.Transient!=='yes'||props.ActiveState!=='active'||!props.Description?.startsWith('kenan-tool-call:'))return null;
+ if(props.ControlGroup!==group)return fail('caller-scope-cgroup-mismatch','The unit ControlGroup does not match the actual process.');
+ if(props.Transient!=='yes'||props.ActiveState!=='active')return fail('caller-scope-not-active','The unit is not an active transient system-manager scope.');
+ if(!props.Description?.startsWith('kenan-tool-call:'))return fail('caller-scope-identity-missing','The root-created scope has no native call description.');
  const v=JSON.parse(props.Description.slice('kenan-tool-call:'.length));
- if(nativeBackground&&(v.background!==true||!unit.startsWith(`kenan-bg-${v.agentId}-`)||String(v.uid)!==props.User||!/^[a-f0-9]{32}$/.test(props.InvocationID??'')))return null;
+ if(nativeBackground&&(v.background!==true||!unit.startsWith(`kenan-bg-${v.agentId}-`)||String(v.uid)!==props.User||!/^[a-f0-9]{32}$/.test(props.InvocationID??'')))return fail('caller-background-mismatch','The background unit identity does not match its actual invocation.');
  return {...v,unit,group};
 }
 function identity(v){return v&&typeof v==='object'&&typeof v.callId==='string'&&v.callId.length>0&&v.callId.length<=256&&!/[\x00-\x1f]/.test(v.callId)&&typeof v.agentId==='string'&&/^[a-zA-Z0-9:_-]{1,128}$/.test(v.agentId);}
-export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,scope=procScope,uid=p=>fs.statSync(`/proc/${p}`).uid,background=true}={}) {
+export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,scope=procScope,uid=p=>fs.statSync(`/proc/${p}`).uid,background=true,onError=()=>{}}={}) {
+ const fail=(code,detail)=>{onError({code,detail});return null;};
  try{
-  const observed=scope(pid);
-  if(!identity(observed)||observed.version!==1||!CHANNEL.test(observed.channel))return null;
+  const observed=scope(pid,{onError});
+  if(observed===null)return null;
+  if(!identity(observed)||observed.version!==1||!CHANNEL.test(observed.channel))return fail('caller-scope-identity-invalid','The scope description has an invalid native identity.');
   if(background&&observed.background===true&&observed.unit.startsWith(`kenan-bg-${observed.agentId}-`)&&uid(pid)===observed.uid)return {channel:observed.channel,callId:observed.callId,agentId:observed.agentId};
-  if(!observed.unit.startsWith(`agent-tool-${observed.channel}-`))return null;
+  if(!observed.unit.startsWith(`agent-tool-${observed.channel}-`))return fail('caller-scope-channel-mismatch','The scope unit does not match its declared channel.');
   for(let current=pid,depth=0;current>1&&depth<64;depth++){
-   const up=parent(current);if(!(up>1))return null;
+   const up=parent(current);if(!(up>1))return fail('caller-server-ancestor-missing','No root-owned native server remains in the caller ancestry.');
    const server=argv(up)[1]?.match(SERVER);
-   if(server&&uid(up)===0)return server[1]===observed.channel?{channel:server[1],callId:observed.callId,agentId:observed.agentId}:null;
+   if(server&&uid(up)===0)return server[1]===observed.channel?{channel:server[1],callId:observed.callId,agentId:observed.agentId}:fail('caller-server-channel-mismatch','The root-owned server belongs to another channel.');
    current=up;
   }
- }catch{}
- return null;
+ }catch(error){return fail('caller-observation-failed',`Native caller inspection failed (${error.code??error.name}).`);}
+ return fail('caller-ancestry-limit','The caller ancestry exceeded 64 processes.');
 }
 
 export function queueReferenceSql(root,selfArgs,resourceKind){

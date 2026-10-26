@@ -190,3 +190,19 @@ test('the actual native CLI rejects a foreign registered custodian without chang
     assert.deepEqual(f.snapshot(),before);
   });
 });
+
+test('the actual native CLI releases its own pushed source with identity environment variables absent',t=>{
+  const self=nativeCaller();
+  if(self===null){t.skip('This proof requires an actual native tool scope; the synthetic route checks still run.');return;}
+  fixture(f=>{
+    // Only disposable fixture custody changes here. The current real scope and native
+    // message store, not injected caller or authentication functions, authorize the CLI.
+    f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(self.agentId,f.record.id);
+    unbindNativeOwner(f.db,f.record.id);
+    const env={...process.env,PI_WORKSPACE_STATE:f.state};
+    for(const key of ['KENAN_AGENT','KENAN_TOOL_CALL_ID','PI_WORKSPACE_TEST_CALLER'])delete env[key];
+    const result=spawnSync(process.execPath,[new URL(workspaceModule).pathname,'release','--path',f.source,'--json'],{env,encoding:'utf8',timeout:30000});
+    assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
+    const outcome=JSON.parse(result.stdout);assert.equal(outcome.action,'released');assert.equal(outcome.leaseRelease.kind,'released');assert.equal(fs.existsSync(f.source),false);
+  });
+});

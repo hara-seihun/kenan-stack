@@ -37,9 +37,10 @@ function validBinding(value){
 }
 
 // The authenticated caller of this process, or null when it is not a native worker tool call.
-export function nativeCaller({caller=callerToolCall}={}){
+export function nativeCaller({caller=callerToolCall,onError=()=>{}}={}){
  let observed=null;
- try{observed=caller();}catch{return null;}
+ try{observed=caller({onError});}catch(error){onError({code:'caller-observation-failed',detail:`Native caller inspection failed (${error.code??error.name}).`});return null;}
+ if(observed!==null&&!validBinding(observed))onError({code:'caller-binding-invalid',detail:'The scope identity does not match the native store identity protocol.'});
  return validBinding(observed)?{agentId:observed.agentId,channel:observed.channel,callId:observed.callId}:null;
 }
 

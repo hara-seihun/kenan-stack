@@ -94,7 +94,17 @@ test('actual explicit terminal retained release is stopped by the qualification 
  const git=(...args)=>execFileSync('git',args,{encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']}).trim();
  const state=path.join(f.root,'registry.sqlite3');let database;const previousNative=process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS;
  const oldQualification=process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=f.dataRoot;
- const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
+ const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{
+  if(args[0]==='release'){
+   // Authenticate the fixture's own identity at the existing dependency boundary.
+   // The outer native test runner is not the ORIGINAL fixture custodian.
+   const named=new Map();for(let i=1;i<args.length;i++){const key=args[i].slice(2),value=args[i+1]?.startsWith('--')||i+1===args.length?true:args[++i];named.set(key,[String(value)]);}
+   shadowTesting.releaseCommand(database,{positional:[],named},state,{
+    caller:()=>({ok:true,kind:'native',binding:{agentId:ORIGINAL,channel:'beta',callId:'fixture-release'}}),
+    authenticate:pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))})
+   });
+  }else main(args,state);
+ }finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
  try{
   git('init',f.source);git('-C',f.source,'config','user.name','Fixture');git('-C',f.source,'config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(f.source,'proof'),'durable');git('-C',f.source,'add','.');git('-C',f.source,'commit','-m','source');
   const remote=path.join(f.root,'durable.git');git('init','--bare',remote);git('-C',f.source,'remote','add','origin',remote);git('-C',f.source,'push','origin','HEAD:refs/heads/main');
