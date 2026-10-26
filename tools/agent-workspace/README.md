@@ -883,3 +883,17 @@ custody and the original operating headroom remain. This is not source deletion,
 release, reclaimed disk, successful qualification, activation or deployment. Settled
 owner-directed source workspaces still use ordinary `release`/`release-ended-owners`;
 a push or an expired lease alone never establishes ended writing.
+
+Durable checkout materialization repeats capacity admission through the same bounded
+on-demand measurement refresh used by source preparation and reservation creation.
+A stale sample appearing between those stages is refreshed before Git writes begin;
+only the deciding reservations are sampled, outside the device fence. The original
+checkout request and reservation survive, and a genuine remaining deficit still
+refuses materialization. No source, lease or growth plan is retired by this refresh.
+Admission also resumes the sampler's durable incremental walks in one-second
+slices instead of restarting a potentially huge targeted walk. Every deciding
+reservation gets a turn before any partial walk repeats. The thirty-second total
+repair budget and conservative treatment of incomplete samples are unchanged.
+An exhausted refusal includes `capacity-refresh` observations in its retained
+stderr, so wrappers do not lose which samples were attempted. Explicit targeted
+`measure-capacity` keeps its full requested budget unless `--incremental` is used.

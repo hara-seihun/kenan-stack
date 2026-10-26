@@ -2153,7 +2153,7 @@ function withCapacityAdmission(database, statePath, device, action) {
       const row=database.prepare("SELECT * FROM workspace WHERE path=? AND state!='creating' AND state!='released'").get(candidate.path);
       if(!row)return {kind:'not-eligible'};
       const record=recordBy(database,{id:row.id});
-      return refreshEndedOwnerSample(database,record,deadline,statePath);
+      return refreshEndedOwnerSample(database,record,deadline,statePath,{incremental:true});
     },
   });}finally{nativeTerminalProjection=null;}
 }
@@ -3107,7 +3107,11 @@ function createWorkspace(database, args, statePath) {
   try {
     if (!existsSync(materialization) || readdirSync(materialization).length === 0) {
       const plan = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(row.id);
-      assertCapacity(root, args, database, destination, plan === undefined ? undefined : JSON.parse(plan.plan_json));
+      // Source preparation and reservation admission can precede this durable
+      // child by minutes. Revalidate through the same bounded stale-sample repair
+      // here, before any Git materialization, rather than bypassing it on resume.
+      withCapacityAdmission(database, statePath, String(statSync(root).dev), () =>
+        assertCapacity(root, args, database, destination, plan === undefined ? undefined : JSON.parse(plan.plan_json)));
       if (strategy === "worktree") {
         const worktreeArgs = ["--git-dir", mirror, "worktree", "add"];
         if (mode === "review") worktreeArgs.push("--detach", destination, sourceCommit);
@@ -3761,15 +3765,17 @@ function settleEndedOwnerFutureGrowth(verdicts) {
 // here, before any lifecycle lock, through the host's supported UID-preserving read-capability
 // route (falling back to an unprivileged walk). Only the measurement cache changes; retirement
 // still validates freshness, root identity and its own terminal writer observation.
-function refreshEndedOwnerSample(database, record, deadline, statePath) {
+function refreshEndedOwnerSample(database, record, deadline, statePath, {incremental=false} = {}) {
   const row = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json FROM workspace w
     JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=?`).get(record.id);
   if (!row) return { kind: "unpriced" };
   const plan = JSON.parse(row.plan_json);
   if (!["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return { kind: "not-needed" };
   if (cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) return { kind: "fresh" };
-  const budget = Math.min(60_000, deadline - Date.now() - 10_000);
-  if (budget < 1000) return { kind: "deferred", detail: "release budget too small for a measurement" };
+  // Admission must not spend its whole budget restarting one large tree. Keep
+  // durable traversal progress and give the next deciding reservation a turn.
+  const budget = incremental ? Math.min(1000,deadline-Date.now()-1000) : Math.min(60_000, deadline - Date.now() - 10_000);
+  if (budget < (incremental ? 100 : 1000)) return { kind: "deferred", detail: "remaining budget too small for a measurement" };
   const isolated = process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
   let route = "unprivileged";
   if (!isolated && process.getuid?.() !== 0) {
@@ -3777,13 +3783,17 @@ function refreshEndedOwnerSample(database, record, deadline, statePath) {
     const measured = boundedCommand("sudo", ["-n", "/usr/bin/setpriv", `--reuid=${uid}`, `--regid=${gid}`, "--init-groups",
       "--bounding-set=-all,+dac_read_search", "--inh-caps=+dac_read_search", "--ambient-caps=+dac_read_search",
       "/usr/bin/env", `HOME=${homedir()}`, `PI_WORKSPACE_STATE=${statePath}`, "PATH=/usr/local/bin:/usr/bin:/bin",
-      process.execPath, new URL(import.meta.url).pathname, "measure-capacity", "--id", record.id, "--budget-ms", String(budget), "--json"],
-      { encoding: "utf8", timeout: budget + 5_000, maxBuffer: 1 << 20, reapGroup: true });
-    if (measured.status === 0 && !measured.error && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) return { kind: "measured", route: "read-capability" };
+      process.execPath, new URL(import.meta.url).pathname, "measure-capacity", "--id", record.id, "--budget-ms", String(budget), ...(incremental ? ["--incremental"] : []), "--json"],
+      { encoding: "utf8", timeout: budget + (incremental ? 1000 : 5_000), maxBuffer: 1 << 20, reapGroup: true });
+    if (measured.status === 0 && !measured.error) {
+      if(cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok)return {kind:'measured',route:'read-capability'};
+      if(incremental){try{if(JSON.parse(measured.stdout).results.some(item=>item.status==='partial'))return {kind:'partial',route:'read-capability'};}catch{}}
+    }
     route = "unprivileged-after-read-capability-failure";
   }
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(value => value.path);
-  const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline - 5_000, Date.now() + budget),statePath);
+  const sample = measureWorkspaceRow(database, row, paths, Math.min(deadline - (incremental ? 100 : 5_000), Date.now() + budget),statePath,incremental);
+  if(sample.partial)return {kind:'partial',route};
   return sample.ok && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok ? { kind: "measured", route } : { kind: "failed", route, detail: sample.error ?? "sample not current" };
 }
 function endedOwnerSummary(record) {
@@ -4583,7 +4593,7 @@ function capacityStatusCommand(database,args) {
 }
 
 function measureCapacityCommand(database, args, statePath) {
-  assertOnly(args, ["root", "path", "id", "budget-ms", "json"]);
+  assertOnly(args, ["root", "path", "id", "budget-ms", "incremental", "json"]);
   const budgetMs = numberFlag(args, "budget-ms", 40_000);
   if (!Number.isSafeInteger(budgetMs) || budgetMs < 1 || budgetMs > 300_000) fail("--budget-ms must be between 1 and 300000");
   const started = Date.now(), deadline = started + budgetMs;
@@ -4627,7 +4637,7 @@ function measureCapacityCommand(database, args, statePath) {
       // A targeted walk owns the requested bounded budget. Fleet sampling keeps
       // its short per-row lock window and resumable traversal slices.
       const sampleDeadline = selected === null ? Math.min(deadline, Date.now() + 2000) : deadline;
-      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null);
+      const sample = measureWorkspaceRow(database, row, paths, sampleDeadline, statePath, selected===null||bool(args,'incremental'));
       counts[sample.partial ? "deferred" : sample.ok ? "measured" : "error"] += 1;
       results.push({ path: row.path, status: sample.partial ? "partial" : sample.ok ? "measured" : "error", budgetBytes: budget, previousCache: cached.ok ? "current" : cached.code, ...(sample.partial ? {visited:sample.visited,entries:sample.entries,startedAt:sample.startedAt} : sample) });
       if(sample.partial)next.push({row,budget,cached});
@@ -4860,7 +4870,7 @@ function help() {
   agent-workspace release-ended-owners [--root PATH | ${selectorSyntax("release-ended-owners")}] [--execute]
                             [--budget-ms 30000] [--max-records 16] [--after ID|start] [--json]
   agent-workspace bind-native-owners [--root PATH | --id ID | --path PATH] [--execute] [--budget-ms 30000] [--json]
-  agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--json]
+  agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--incremental] [--json]
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
   Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
                             [--budget-ms 25000]
