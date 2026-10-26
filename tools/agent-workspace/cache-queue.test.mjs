@@ -65,6 +65,32 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   // A different invocation that merely mentions agent-workspace is not the caller.
   assert.equal(observe('physical-checkout',{...self,agentId:'live'}).self,0);
   assert.equal(observe('physical-checkout',{...self,callId:'wrong-call'}).self,0);
+  const forms=[
+   ['sibling dash',{command:`cd "${source}-followup" && make`},false],
+   ['sibling dot',{path:source+'.backup'},false],
+   ['sibling underscore',{path:source+'_copy'},false],
+   ['exact directory',{path:source},true],
+   ['descendant',{path:source+'/child/file'},true],
+   ['quoted command',{command:`cd "${source}" && make`},true],
+   ['trailing slash',{command:`ls "${source}/"`},true],
+   ['argument assignment',{command:`tool --path="${source}"`},true],
+   ['shell terminator',{command:`ls ${source}; next`},true]
+  ];
+  for(const [label,args,protect] of forms){
+   const id=uuid();query(`INSERT INTO message VALUES(${literal(id)},${literal(conversation.archived)},'tool','',${json(tool('bash',args))},'streaming');`);
+   const refs=observe('physical-checkout',self).references;
+   assert.equal(refs.some(r=>r.id===id),protect,label);
+   if(protect)assert.deepEqual(refs.find(r=>r.id===id).matchedRoots,[source],label);
+   assert.equal(JSON.parse(query(queueReferenceSql(source+'-followup',self,'physical-checkout'))).references.some(r=>r.id===id),label==='sibling dash','the actual sibling stays protected');
+   query(`DELETE FROM message WHERE id=${literal(id)};`);
+  }
+  const escaped="/fixture/a[0].b+(copy)\\quote\"";
+  for(const value of [escaped,escaped+'/leaf']){
+   const id=uuid();query(`INSERT INTO message VALUES(${literal(id)},${literal(conversation.archived)},'tool','',${json(tool('read',{path:value}))},'streaming');`);
+   assert.ok(JSON.parse(query(queueReferenceSql(escaped,self,'physical-checkout'))).references.some(r=>r.id===id));
+   assert.equal(JSON.parse(query(queueReferenceSql('/fixture/a0Xbcopy',self,'physical-checkout'))).references.some(r=>r.id===id),false,'regex metacharacters remain literal');
+   query(`DELETE FROM message WHERE id=${literal(id)};`);
+  }
   const sibling=uuid();query(`INSERT INTO message SELECT ${literal(sibling)},conversation_id,role,text,jsonb_set(parts,'{0,callId}','\"other-call\"'),state FROM message WHERE id=${literal(ids.caller)};`);
   assert.ok(observe('physical-checkout',self).references.some(r=>r.id===sibling));
   query(`DELETE FROM message WHERE id=${literal(sibling)};`);
@@ -90,7 +116,7 @@ test('every installed channel is observed against one absolute deadline and fail
   const db=args[args.indexOf('--dbname')+1];seen.push(db);const sql=args.at(-1);assert.match(sql,/statement_timeout='4000ms'/);assert.match(sql,/BEGIN READ ONLY/);
   assert.equal(sql.includes("p->>'callId'='exact-call'"),db==='kenan_production');
   return {status:0,stdout:JSON.stringify({self:db==='kenan_production'?1:0,references:db==='kenan_beta'?[{kind:'tool_call',id:'running',state:'running',resourceClass:'reserved-tool-call'}]:[]})};}});
- assert.deepEqual(ok.errors,[]);assert.deepEqual(seen,['kenan_beta','kenan_production']);assert.equal(ok.references[0].channel,'beta');assert.equal(ok.observations[1].callerToolCalls,1);
+ assert.deepEqual(ok.errors,[]);assert.deepEqual(seen,['kenan_beta','kenan_production']);assert.equal(ok.references[0].channel,'beta');assert.equal(ok.observations[1].callerToolCalls,1);assert.equal(ok.observations[0].callerIdentity.code,'CALLER_CHANNEL_DIFFERENT');
  assert.equal(currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,channels,caller,user,execute:()=>({status:2,stdout:'',stderr:'FATAL: role "kenan" does not exist'})}).errors.length,1);
  assert.equal(currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,channels,caller,user,execute:()=>({status:0,stdout:'[]'})}).errors.length,1);
  assert.equal(currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+10000,channels:()=>{throw new Error('no channels');},caller,user,execute:()=>assert.fail('no query without inventory')}).errors[0],'no channels');

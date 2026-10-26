@@ -3,6 +3,7 @@ import path from 'node:path';
 import {userInfo} from 'node:os';
 import {boundedCommand} from './bounded-command.mjs';
 import {queryNativeScope} from './native-scope-query.mjs';
+import {rootScope} from './root-scope.mjs';
 
 // Kenan Stack (the October 17 minimal rewrite) keeps one PostgreSQL database per installed channel
 // (`/srv/kenan/CHANNEL`, database `kenan_CHANNEL`) on the `kenan-postgres` cluster's socket directory.
@@ -27,13 +28,16 @@ function procArgv(pid){return fs.readFileSync(`/proc/${pid}/cmdline`,'utf8').spl
 function procParent(pid){const stat=fs.readFileSync(`/proc/${pid}/stat`,'utf8');return Number(stat.slice(stat.lastIndexOf(')')+2).split(' ')[1]);}
 // Identity lives in a root-created system-manager scope, never in shell argv/env.
 // The observed cgroup and unit ControlGroup must agree with the actual caller.
-export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),onError=()=>{},query=queryNativeScope}={}){
+export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8'),onError=()=>{},query=queryNativeScope,kernel=rootScope}={}){
  const rows=read(pid).trim().split('\n');
  const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
  const nativeScope=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??'');
  const nativeBackground=/^kenan-bg-[a-f0-9-]{36}-[-A-Za-z0-9._]{1,60}\.service$/.test(unit??'')&&group?.startsWith('/user.slice/user-agents.slice/');
  const fail=(code,detail)=>{onError({code,detail});return null;};
  if(!group||!nativeScope&&!nativeBackground)return fail('caller-scope-missing','The process is not in a recognized native tool scope.');
+ const observed=kernel(pid,group,unit);
+ if(observed.kind==='authenticated-kernel-scope')return {...observed.identity,unit,group};
+ if(observed.kind==='refused')return fail('caller-kernel-scope-refused',observed.code);
  const r=query(unit);
  if(r.status!==0||r.error)return fail('caller-scope-query-failed',`The system-manager scope query failed (${r.error?.code??r.signal??r.status}).`);
  const props=Object.fromEntries(r.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
@@ -67,13 +71,16 @@ export function queueReferenceSql(root,selfArgs,resourceKind){
  if(!['source','physical-checkout','generated-cache'].includes(resourceKind))throw new Error('explicit source or generated-cache resource kind required');
  const roots=Array.isArray(root)?root:[root];
  if(selfArgs!==null&&!identity(selfArgs))throw new Error('invalid caller tool identity');
- const jsonMatch=body=>roots.map(root=>`jsonb_path_exists(${body},${literal('strict $.** ? (@.type() == "string" && @ like_regex '+JSON.stringify(root)+' flag "q")')}::jsonpath)`).join(' OR ');
+ const referencePattern=root=>root.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'($|[/[:space:]\"\'`;|&(){}\\[\\],<>])';
+ const jsonRootMatch=(body,root)=>`jsonb_path_exists(${body},${literal('strict $.** ? (@.type() == "string" && @ like_regex '+JSON.stringify(referencePattern(root))+')')}::jsonpath)`;
+ const jsonMatch=body=>roots.map(root=>jsonRootMatch(body,root)).join(' OR ');
  const serializedMatch=body=>roots.map(root=>`strpos((${body})::text,${literal(JSON.stringify(root).slice(1,-1))})>0`).join(' OR ');
- const textMatch=body=>roots.map(root=>`strpos(${body},${literal(root)})>0`).join(' OR ');
+ const textMatch=body=>roots.map(root=>`${body} ~ ${literal(referencePattern(root))}`).join(' OR ');
  const selfCall=selfArgs===null?'FALSE':`EXISTS (SELECT 1 FROM agent a WHERE a.id=${literal(selfArgs.agentId)} AND a.conversation_id=m.conversation_id) AND EXISTS (SELECT 1 FROM jsonb_array_elements(m.parts) p WHERE p->>'type'='tool' AND p->>'callId'=${literal(selfArgs.callId)})`;
 
  const matchedRoots=body=>`to_json(array_remove(ARRAY[${roots.map(root=>`CASE WHEN (${serializedMatchForRoot(body,root)}) THEN ${literal(root)} ELSE NULL END`).join(',')}],NULL))`;
- const serializedMatchForRoot=(body,root)=>`strpos((${body})::text,${literal(JSON.stringify(root).slice(1,-1))})>0 AND jsonb_path_exists(${body},${literal('strict $.** ? (@.type() == "string" && @ like_regex '+JSON.stringify(root)+' flag "q")')}::jsonpath)`;
+ const serializedMatchForRoot=(body,root)=>`strpos((${body})::text,${literal(JSON.stringify(root).slice(1,-1))})>0 AND ${jsonRootMatch(body,root)}`;
+
  const source=resourceKind==='source';
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='4000ms';
  WITH running AS MATERIALIZED (SELECT m.id,m.conversation_id,m.parts,(${selfCall}) AS self FROM message m WHERE m.role='tool' AND m.state='streaming'),
@@ -107,7 +114,7 @@ export function currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadl
    const observed=JSON.parse(result.stdout),rows=observed?.references;
    if(!Array.isArray(rows)||rows.length>=65||!Number.isSafeInteger(observed.self)||rows.some(r=>!r||typeof r.id!=='string'||!['tool_call','agent'].includes(r.kind)||typeof r.state!=='string'))throw new Error('Kenan Stack queue observation incomplete: '+channel);
    references.push(...rows.filter(r=>resourceKind!=='generated-cache'||!isSourceOnlyRead(r,cacheRoots)).map(r=>({...r,channel,roots})));
-   observations.push({channel,roots,count:rows.length,callerToolCalls:observed.self,callerIdentity:self?.channel===channel?{state:'authenticated-system-scope',agentId:self.agentId,callId:self.callId}:{state:'not-exempted',code:'CALLER_IDENTITY_UNAVAILABLE',nextAction:'Use a current locally deployed native runtime with root scope identity; all unmatched streaming tools remain protected.'}});
+   observations.push({channel,roots,count:rows.length,callerToolCalls:observed.self,callerIdentity:self?.channel===channel?{state:'authenticated-system-scope',agentId:self.agentId,callId:self.callId}:self?{state:'not-exempted',code:'CALLER_CHANNEL_DIFFERENT',callerChannel:self.channel,nextAction:'This authenticated caller belongs to another channel; its identity grants no exemption here.'}:{state:'not-exempted',code:'CALLER_IDENTITY_UNAVAILABLE',nextAction:'Use a current locally deployed native runtime with root scope identity; all unmatched streaming tools remain protected.'}});
   }
   return {errors:[],references,observations,resourceKind,observedAt:Date.now()};
  }catch(error){return {errors:[String(error.message)],references:[],observations:[],observedAt:Date.now()};}

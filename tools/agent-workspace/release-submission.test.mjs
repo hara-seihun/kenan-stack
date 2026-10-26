@@ -26,3 +26,11 @@ test('an unknown original effect is never relaunched even if its unit is gone',(
  const first=submitRelease({...base,launch:()=>({code:'response-lost'})});assert.equal(first.state,'launch-unknown');
  submitRelease({...base,observe:()=>({ceased:true})});assert.equal(count(),0);
 }));
+
+test('a parent custody conflict preserves the child request and names the existing authenticated background continuation',()=>fixture((base,count)=>{
+ const original=submitRelease(base),before=base.database.prepare('SELECT * FROM workspace_release_submission').get();
+ const result=submitRelease({...base,record:{...base.record,owner:'parent'},binding:{...base.binding,agentId:'parent'},request:{...base.request,owner:'parent'},settlement:{kind:'completed',requestId:'retained-child-effect'}});
+ assert.equal(result.error.code,'release-submission-conflict');assert.equal(result.requestId,original.requestId);assert.equal(count(),1);
+ assert.deepEqual(result.nextAction.settleInAuthenticatedBackground,['kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id','fixture','--preserve-runtime=true','--json']);
+ assert.deepEqual(base.database.prepare('SELECT * FROM workspace_release_submission').get(),before,'guidance does not rewrite or relaunch the original effect');
+}));

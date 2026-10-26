@@ -200,10 +200,24 @@ test('the actual native CLI releases its own pushed source with identity environ
     f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(self.agentId,f.record.id);
     unbindNativeOwner(f.db,f.record.id);
     const env={...process.env,PI_WORKSPACE_STATE:f.state};
-    for(const key of ['KENAN_AGENT','KENAN_TOOL_CALL_ID','PI_WORKSPACE_TEST_CALLER'])delete env[key];
+    for(const key of ['KENAN_TOOL_CALL_ID','PI_WORKSPACE_TEST_CALLER'])delete env[key];
+    // The background event router needs an address, not an authentication grant.
+    // nativeCaller still binds this address to the real root scope and native store.
+    env.KENAN_AGENT=self.agentId;
     const result=spawnSync(process.execPath,[new URL(workspaceModule).pathname,'release','--path',f.source,'--json'],{env,encoding:'utf8',timeout:30000});
-    assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
-    const outcome=JSON.parse(result.stdout);assert.equal(outcome.action,'released');assert.equal(outcome.leaseRelease.kind,'released');assert.equal(fs.existsSync(f.source),false);
+    const submission=JSON.parse(result.stdout);
+    if(result.status===75){
+      assert.equal(submission.action,'release-submitted',result.stdout);assert.ok(submission.launch?.started,result.stdout);
+      const deadline=Date.now()+30000;
+      while(fs.existsSync(f.source)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);
+      const status=spawnSync(process.execPath,[new URL(workspaceModule).pathname,'status','--id',f.record.id,'--json'],{env,encoding:'utf8',timeout:5000});
+      assert.equal(status.status,0,status.stderr);const record=JSON.parse(status.stdout).records[0];
+      assert.equal(record.state,'released',status.stdout);assert.equal(record.releaseSettlement.kind,'completed');assert.equal(record.releaseSettlement.result.physicalDisposition.kind,'removed');
+    }else{
+      assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
+      assert.equal(submission.action,'released');assert.equal(submission.leaseRelease.kind,'released');
+    }
+    assert.equal(fs.existsSync(f.source),false);
   });
 });
 
