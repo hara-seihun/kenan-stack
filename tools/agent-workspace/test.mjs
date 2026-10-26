@@ -4125,3 +4125,37 @@ test("fixture capacity lock recovery rejects unknown outcomes and unrelated refu
   assert.equal(exactCapacityLockRefusal(refusal(checkout, 2), 30_000, { allowCeasedCheckout: true }), true);
   assert.equal(exactCapacityLockRefusal(refusal(checkout.replace("private staging removed; destination not partially published", "cleanup unknown"), 2), 30_000, { allowCeasedCheckout: true }), false);
 });
+
+
+test("budgeted shared clones preserve real shallow ancestry for history and subsequent admission", () => {
+  const f = fixture();
+  try {
+    writeFileSync(path.join(f.source, "file.txt"), "second\n");
+    git(f.source, "commit", "-am", "second");
+    git(f.source, "push", "origin", "main");
+    const shallow = path.join(f.root, "shallow");
+    execFileSync("git", ["clone", "--depth=1", `file://${f.remote}`, shallow]);
+    const head = git(shallow, "rev-parse", "HEAD");
+    assert.throws(() => git(shallow, "cat-file", "-e", `${head}^`));
+    const args = ["create", "--root", f.workspaces, "--name", "shallow-shared", "--repo", shallow,
+      "--ref", head, "--intent", "source-only", "--headroom-gib", "1", "--growth-mib", "8", "--json"];
+    const created = JSON.parse(run(args, f.env));
+    assert.equal(git(created.path, "rev-parse", "--is-shallow-repository"), "true");
+    assert.equal(git(created.path, "rev-list", "--first-parent", "--max-count=128", "HEAD"), head);
+    assert.equal(readFileSync(path.join(created.path, ".git", "shallow"), "utf8"),
+      readFileSync(path.join(shallow, ".git", "shallow"), "utf8"));
+    assert.equal(git(created.path, "status", "--porcelain"), "");
+    assert.equal(git(created.path, "rev-parse", "HEAD"), head);
+    writeFileSync(path.join(f.source, "file.txt"), "third\n");
+    git(f.source, "commit", "-am", "third");
+    git(f.source, "push", "origin", "main");
+    const advanced = git(f.source, "rev-parse", "HEAD");
+    git(created.path, "fetch", "origin", "main", "--no-tags");
+    git(created.path, "checkout", "--detach", "FETCH_HEAD");
+    assert.equal(git(created.path, "rev-list", "--first-parent", "--max-count=128", "HEAD"), `${advanced}\n${head}`);
+    const childArgs = args.map(arg => arg === "shallow-shared" ? "shallow-child" : arg === shallow ? created.path : arg === head ? advanced : arg);
+    const child = JSON.parse(run(childArgs, f.env));
+    assert.equal(child.sourceCommit, advanced);
+    assert.equal(git(child.path, "rev-list", "--first-parent", "--max-count=128", "HEAD"), `${advanced}\n${head}`);
+  } finally { f.close(); }
+});

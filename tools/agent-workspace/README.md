@@ -1065,3 +1065,16 @@ retains the idleness veto across resumable slices and requires another complete
 successful payload census before automatic retirement. Actual root replacement,
 allocation measurement failure or budget exhaustion still refuses finalization,
 leaves the original pending operation recoverable and never fabricates capacity.
+
+### Shared checkout shallow history
+
+Priced shared-object checkouts inherit the durable mirror's actual shallow
+boundaries before publishing their source refs. Git alternates share objects,
+not the `shallow` file; omitting that file makes valid truncated history appear
+corrupt after an ordinary upstream fetch. Boundary publication uses Git's
+`shallow.lock`, an atomic rename and fsync, preserves existing boundaries on
+resumption, and never invents a boundary for a missing ancestor. A complete
+mirror creates no shallow metadata. Closure qualification and import accounting
+are unchanged. The native regression creates a real shallow donor, advances its
+upstream, performs an ordinary fetch in the admitted clone and admits that clone
+as a subsequent source.

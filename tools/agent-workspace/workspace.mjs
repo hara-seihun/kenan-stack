@@ -2750,6 +2750,33 @@ function cloneSourceTag(statePath, mirror, sourceCommit) {
   });
 }
 
+function inheritShallowBoundary(directory, mirror) {
+  const read = file => {
+    try { return readFileSync(file, "utf8").split("\n").filter(Boolean); }
+    catch (error) { if (error.code === "ENOENT") return []; throw error; }
+  };
+  const inherited = read(path.join(mirror, "shallow"));
+  if (inherited.length === 0) return;
+  const target = path.join(directory, "shallow");
+  const existing = read(target);
+  const boundaries = [...new Set([...existing, ...inherited])];
+  if (boundaries.some(id => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(id))) {
+    fail("shared source has invalid shallow boundary metadata");
+  }
+  if (boundaries.length === existing.length) return;
+  // Alternates share objects, not Git's shallow metadata. Publish the actual
+  // donor boundaries before refs, never invent a boundary at a missing parent.
+  const lock = `${target}.lock`;
+  const descriptor = openSync(lock, "wx", 0o600);
+  try {
+    try { writeFileSync(descriptor, `${boundaries.join("\n")}\n`); fsyncSync(descriptor); }
+    finally { closeSync(descriptor); }
+    renameSync(lock, target);
+    const parent = openSync(directory, "r");
+    try { fsyncSync(parent); } finally { closeSync(parent); }
+  } finally { rmSync(lock, { force: true }); }
+}
+
 function prepareSharedSourceClone(destination, repository, sourceCommit, input, mirror) {
   const objectSource = path.join(mirror, "objects");
   if (!existsSync(path.join(destination, ".git"))) {
@@ -2776,6 +2803,7 @@ function prepareSharedSourceClone(destination, repository, sourceCommit, input, 
     return;
   }
   if (!existsSync(alternates)) writeFileSync(alternates, `${objectSource}\n`);
+  inheritShallowBoundary(rawDirectory, mirror);
   if (origin === null) git(destination, ["remote", "add", "origin", repository]);
   ensureOriginFetch(destination);
   for (const [name, value] of Object.entries({ ...REFERENCE_CLONE_CONFIG, "core.hooksPath": "/dev/null", "submodule.recurse": "false" })) {
@@ -5200,7 +5228,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   if(argv[0]==='execution-cessation') {
