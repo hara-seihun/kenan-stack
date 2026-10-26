@@ -141,3 +141,47 @@ test('targeted sampling honors requested budgets longer than one minute',()=>fix
   assert.ok(pass.elapsedMs>=80000);assert.ok(pass.elapsedMs<180000);
  },10000);
 }));
+
+// The idle-growth observer and allocation sampler run independently. Alternating
+// their modes must advance two resumable walks, not continually reset one slot.
+test('alternating allocation and content modes each finish exact resumable observations',()=>fixture(f=>{
+ const directory=path.join(f.rows.large.path,'alternating');fs.mkdirSync(directory);
+ for(let i=0;i<32;i++)fs.writeFileSync(path.join(directory,String(i)),`payload ${i}`);
+ const now=Date.now,lstat=fs.lstatSync;let elapsed=0;
+ Date.now=()=>now()+elapsed;
+ fs.lstatSync=(file,...args)=>{const result=lstat(file,...args);if(path.dirname(String(file))===directory)elapsed+=125;return result;};
+ syncBuiltinESMExports();
+ const completed=new Map();
+ try{
+  for(let i=0;i<120&&completed.size<2;i++){
+   const mode=i%2===1;if(completed.has(mode))continue;
+   const pass=f.run(['measure-capacity','--id',f.rows.large.id,'--incremental',...(mode?['--content-proof']:[]),'--budget-ms','400','--json']);
+   for(const sample of pass.results)if(sample.ok){assert.equal(sample.writeObservationComplete,mode);completed.set(mode,sample);}
+   if(completed.size===0)assert.equal(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id),undefined,'partial totals never become credit');
+  }
+ }finally{Date.now=now;fs.lstatSync=lstat;syncBuiltinESMExports();}
+ assert.equal(completed.size,2,'neither periodic observer may starve the other mode');
+ const exact=workspaceTesting.workspaceAllocationSample(f.rows.large.path,f.device,{deadline:Date.now()+5000,maxEntries:2000000});
+ assert.equal(exact.ok,true);
+ for(const sample of completed.values()){assert.equal(sample.bytes,exact.bytes);assert.equal(sample.allocatedBytes,exact.allocatedBytes);assert.equal(sample.inode,exact.inode);}
+ assert.equal(f.db.prepare('SELECT 1 FROM workspace_capacity_walk WHERE workspace_id=?').get(f.rows.large.id),undefined);
+ assert.equal(f.db.prepare('SELECT 1 FROM workspace_capacity_content_walk WHERE workspace_id=?').get(f.rows.large.id),undefined);
+}));
+
+test('legacy explicitly tagged content progress migrates without becoming allocation credit',()=>fixture(f=>{
+ withSlowWalk(f,()=>{
+  const partial=f.run(['measure-capacity','--id',f.rows.large.id,'--incremental','--content-proof','--budget-ms','400','--json']);
+  assert.equal(partial.progress.measured,0);
+  const saved=f.db.prepare('SELECT state_json FROM workspace_capacity_content_walk WHERE workspace_id=?').get(f.rows.large.id).state_json;
+  // Reproduce the old schema's single shared slot, not a live registry edit.
+  f.db.prepare('INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)').run(f.rows.large.id,saved);
+  f.db.prepare('DELETE FROM workspace_capacity_content_walk WHERE workspace_id=?').run(f.rows.large.id);
+  const allocation=f.run(['measure-capacity','--id',f.rows.large.id,'--incremental','--budget-ms','400','--json']);
+  assert.equal(allocation.progress.measured,0);
+  assert.equal(f.db.prepare('SELECT state_json FROM workspace_capacity_content_walk WHERE workspace_id=?').get(f.rows.large.id).state_json,saved);
+  const current=JSON.parse(f.db.prepare('SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?').get(f.rows.large.id).state_json);
+  assert.equal(current.contentProof,false);
+  assert.notEqual(current.startedAt,JSON.parse(saved).startedAt);
+  assert.equal(f.db.prepare('SELECT 1 FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id),undefined);
+ },50);
+}));

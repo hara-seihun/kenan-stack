@@ -40,7 +40,7 @@ test('native registration refreshes the exact stale reservation before a genuine
   db=new DatabaseSync(state);db.prepare('UPDATE workspace SET created_at=? WHERE id=?').run(Date.now()-3*3600000,registered.id);
   db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(registered.id);
   db.prepare('DELETE FROM workspace_growth_policy WHERE workspace_id=?').run(registered.id);
-  const device=String(fs.statSync(old).dev),slice=allocationSlice(old,device,null,{maxEntries:1});assert.equal(slice.partial,true);slice.state.startedAt-=10_000;
+  const device=String(fs.statSync(old).dev),slice=allocationSlice(old,device,null,{maxEntries:1});assert.equal(slice.partial,true);slice.state.contentProof=true;slice.state.startedAt-=10_000;
   db.exec('CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY,state_json TEXT NOT NULL)');db.prepare('INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)').run(registered.id,JSON.stringify(slice.state));
   const row=db.prepare('SELECT * FROM workspace WHERE id=?').get(registered.id),plan=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(registered.id).plan_json;
   const stat=fs.statfsSync(root),growth=Math.floor((stat.bavail*stat.bsize-9*1024**3)/1024**2);
@@ -72,7 +72,7 @@ for(const cache of ['missing','stale'])test(`a reserved checkout child refreshes
   const priorPlan=JSON.parse(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(pending.id).plan_json);
   db.prepare('UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?').run(JSON.stringify({...priorPlan,...capacity,constructionBytes:0}),pending.id);
   process.env.PI_WORKSPACE_CHECKOUT_JOB=pending.id;process.env.PI_WORKSPACE_CHECKOUT_STAGE=path.join(root,'.checkout.creating-'+pending.id);
-  const device=String(fs.statSync(old).dev),slice=allocationSlice(old,device,null,{maxEntries:1});assert.equal(slice.partial,true);slice.state.startedAt-=10_000;
+  const device=String(fs.statSync(old).dev),slice=allocationSlice(old,device,null,{maxEntries:1});assert.equal(slice.partial,true);slice.state.contentProof=true;slice.state.startedAt-=10_000;
   db.exec('CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY,state_json TEXT NOT NULL)');db.prepare('INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)').run(oldRecord.id,JSON.stringify(slice.state));
   const oldBefore=db.prepare('SELECT * FROM workspace WHERE id=?').get(oldRecord.id),planBefore=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(oldRecord.id).plan_json;
   const result=run(['create','--root',root,'--name','checkout','--repo',sourcePath,'--ref',head,'--owner','child','--mode','writer','--intent','budgeted','--headroom-gib','8','--growth-mib',String(growthMiB),'--lease-seconds','3600','--json']);

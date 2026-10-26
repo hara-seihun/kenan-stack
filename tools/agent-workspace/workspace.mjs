@@ -4943,7 +4943,23 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
         return store(sample);
       }
       database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
-      const saved=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
+      database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_content_walk(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)");
+      // Allocation sampling and optional payload-idleness proofs are independent
+      // periodic observers. Neither may reset the other's incomplete traversal.
+      // Preserve an explicitly tagged legacy content walk in its own slot; an
+      // untagged or malformed legacy state still restarts conservatively.
+      const legacy=database.prepare("SELECT state_json FROM workspace_capacity_walk WHERE workspace_id=?").get(row.id);
+      let legacyState;try{legacyState=legacy?JSON.parse(legacy.state_json):null;}catch{}
+      if(legacyState?.contentProof===true){
+        database.exec("BEGIN IMMEDIATE");
+        try{
+          database.prepare("INSERT OR IGNORE INTO workspace_capacity_content_walk VALUES(?,?)").run(row.id,legacy.state_json);
+          database.prepare("DELETE FROM workspace_capacity_walk WHERE workspace_id=?").run(row.id);
+          database.exec("COMMIT");
+        }catch(error){database.exec("ROLLBACK");throw error;}
+      }
+      const walkTable=contentProof?"workspace_capacity_content_walk":"workspace_capacity_walk";
+      const saved=database.prepare(`SELECT state_json FROM ${walkTable} WHERE workspace_id=?`).get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
       if(prior && prior.contentProof!==contentProof)prior=null;
       const until=Math.min(deadline,Date.now()+1000);
@@ -4951,10 +4967,10 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
       const slice=contentProof?withContentObservation(database,{deadline:until},walk):walk(undefined);
       if(slice.partial){
         slice.state.contentProof=contentProof;
-        database.prepare("INSERT OR REPLACE INTO workspace_capacity_walk VALUES(?,?)").run(row.id,JSON.stringify(slice.state));
+        database.prepare(`INSERT OR REPLACE INTO ${walkTable} VALUES(?,?)`).run(row.id,JSON.stringify(slice.state));
         return {partial:true,visited:slice.visited,entries:slice.state.entries,startedAt:slice.state.startedAt};
       }
-      database.prepare("DELETE FROM workspace_capacity_walk WHERE workspace_id=?").run(row.id);
+      database.prepare(`DELETE FROM ${walkTable} WHERE workspace_id=?`).run(row.id);
       return store(slice);
     }, row.group_id, deadline);
   } catch (error) { return store({ ok: false, startedAt: Date.now(), completedAt: Date.now(), error: error.message }); }
