@@ -7,6 +7,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {rootPlanReferences,DEFAULT_ROOT_PLANS} from './root-plan-references.mjs';
 
 export const DEFAULT_RELEASE_DATA = "/home/kenan/data/converge-releases";
 export const LIMITS = Object.freeze({ maxEntries: 4096, maxFileBytes: 4 << 20, maxTotalBytes: 128 << 20 });
@@ -21,6 +22,7 @@ export function releaseDirectories(dataRoot = DEFAULT_RELEASE_DATA) {
     producerAdmissionDir: path.join(dataRoot, "producer-admission"),
     launcherDir: path.join(dataRoot, "release-launcher"),
     queueStateFile: path.join(dataRoot, "merge-queue", "state.json"),
+    rootPlansDir: dataRoot === DEFAULT_RELEASE_DATA ? DEFAULT_ROOT_PLANS : path.join(dataRoot,'root-plans'),
   };
 }
 
@@ -77,13 +79,13 @@ function overlaps(left, right) {
  */
 export function qualificationReferences(roots = null, options = {}) {
   const directories = { ...releaseDirectories(options.dataRoot), ...Object.fromEntries(Object.entries(options).filter(([key]) => key.endsWith("Dir") || key === "queueStateFile")) };
-  // This is an application-specific census. Hosts without the Converge release
-  // component have no such custody; an existing but damaged component fails closed.
+  const nativePlans=rootPlanReferences(roots, {directory: directories.rootPlansDir, ...(options.limits ?? {})});
+  // Native root-plan custody is independent of qualification-authority installation.
   if (!fs.existsSync(directories.requestsDir) && !fs.existsSync(directories.queueStateFile))
-    return {errors:[],references:[],released:[],observations:[{source:"qualification-records",state:"not-installed"}],complete:true,observedAt:Date.now()};
+    return {...nativePlans, observations:[{source:"qualification-records",state:"not-installed"}, ...nativePlans.observations]};
   const limits = { ...LIMITS, ...(options.limits ?? {}) };
   const budget = new Budget(limits);
-  const errors = [], references = [], released = [], ignored = [];
+  const errors = [...nativePlans.errors], references = [...nativePlans.references], released = [...nativePlans.released], ignored = [];
   if (roots !== null && (!Array.isArray(roots) || roots.some((root) => !absolute(root)))) {
     return { errors: ["exact absolute reference roots required"], references: [], released, observations: [], complete: false, observedAt: Date.now() };
   }
