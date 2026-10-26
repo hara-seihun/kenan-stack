@@ -52,7 +52,7 @@ test('READY closure refresh refuses missing objects, alternate custody, changed 
   f.git(f.repository,'config','filter.bad.smudge','cat');assert.throws(()=>w.revalidatePreparedSource(value,input,f.sourceCommit),/checkout filters/);f.git(f.repository,'config','--unset','filter.bad.smudge');
   fs.writeFileSync(path.join(f.mirror,'objects/info/alternates'),path.join(f.repository,'.git/objects')+'\n');assert.equal(w.revalidatePreparedSource(value,input,f.sourceCommit),null);fs.unlinkSync(path.join(f.mirror,'objects/info/alternates'));
   const tree=f.git(f.mirror,'rev-parse','HEAD^{tree}'),object=path.join(f.mirror,'objects',tree.slice(0,2),tree.slice(2)),originalObject=fs.readFileSync(object);
-  fs.writeFileSync(object,'corrupt tree object');fs.rmSync(path.join(f.mirror,'pi-workspace-closure'),{recursive:true,force:true});
+  fs.chmodSync(object,0o600);fs.writeFileSync(object,'corrupt tree object');fs.rmSync(path.join(f.mirror,'pi-workspace-closure'),{recursive:true,force:true});
   assert.equal(w.revalidatePreparedSource(value,input,f.sourceCommit),null,'corrupt exact-commit custody refuses');
   fs.writeFileSync(object,originalObject);fs.unlinkSync(object);
   // Remove stale memo: changing a loose object's parent metadata alone is not covered by a nested unlink.
