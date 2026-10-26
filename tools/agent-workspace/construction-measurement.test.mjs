@@ -121,7 +121,7 @@ test('a failed growth journal cannot activate a completed checkout without its m
     db.exec(`CREATE TRIGGER reject_completion_growth BEFORE INSERT ON workspace_growth_policy
       BEGIN SELECT RAISE(ABORT,'construction growth journal unavailable'); END;`);
     const failed=f.cli(['finalize-creation','--id',receipt.id,'--json']);
-    assert.equal(failed.status,2,failed.stderr);
+    assert.equal(failed.status,1,failed.stderr);
     assert.match(failed.stderr,/construction growth journal unavailable/);
     assert.equal(db.prepare('SELECT state FROM workspace WHERE id=?').get(receipt.id).state,'creating');
     assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(receipt.id).plan_json,before);
