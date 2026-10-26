@@ -24,6 +24,17 @@ def save_journal(file,data):
         if os.path.exists(temporary):os.unlink(temporary)
 
 def rollback(file,root,expected):
+    if not os.path.exists(file):
+        # A rejected eligibility check in an older release could leave only an intent.
+        # Recover it without assuming that a missing journal means mutable source.
+        rs,entries=inspect_tree(root,expected,os.lstat(root).st_uid)
+        for p,ident in entries:
+            if stat.S_ISLNK(ident[2]):continue
+            fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                if identity(os.fstat(fd))!=ident or flags(fd)&IMMUTABLE:raise ValueError('unjournaled immutable custody; retain intent')
+            finally:os.close(fd)
+        return {'state':'unfrozen-intent','root':root,'entries':len(entries)}
     with open(file) as stream:data=json.load(stream)
     if data['root']!=root or data['identity']!=expected or identity(os.lstat(root))[:2]!=expected:raise ValueError('rollback custody mismatch')
     for p,ident,before in reversed(data['flags']):
@@ -35,7 +46,7 @@ def rollback(file,root,expected):
     data['state']='rolled-back';save_journal(file,data)
     return {'state':'rolled-back','root':root}
 
-def freeze(root,expected,owner_uid,max_entries=50000,inject=None,journal=None):
+def inspect_tree(root,expected,owner_uid,max_entries=50000):
     deadline=time.monotonic()+20
     root=os.path.abspath(root)
     if os.path.realpath(root)!=root: raise ValueError('snapshot path must be canonical')
@@ -59,9 +70,37 @@ def freeze(root,expected,owner_uid,max_entries=50000,inject=None,journal=None):
         elif not stat.S_ISREG(s.st_mode) or s.st_nlink!=1: raise ValueError('snapshot nonprivate inode')
         entries.append((p,identity(s)))
     walk(root)
+    return rs,entries
+
+def validate_git(root,custody=None):
     if not os.path.isdir(root+'/.git') or os.path.islink(root+'/.git'): raise ValueError('snapshot needs independent .git')
-    for name in ['objects/info/alternates','commondir','gitdir']:
+    for name in ['commondir','gitdir']:
         if os.path.lexists(root+'/.git/'+name): raise ValueError('snapshot has shared Git custody')
+    alternate=root+'/.git/objects/info/alternates'
+    if os.path.lexists(alternate):
+        if not custody or custody.get('kind')!='managed-mirror-pins':raise ValueError('snapshot has unpinned shared Git custody')
+        if os.path.islink(alternate):raise ValueError('snapshot alternate is a symlink')
+        with open(alternate) as stream:value=stream.read()
+        if value!=custody['alternate']+'\n':raise ValueError('snapshot alternate custody changed')
+        if os.path.realpath(custody['alternate'])!=custody['alternate'] or os.path.lexists(custody['alternate']+'/info/alternates'):raise ValueError('snapshot alternate is not independent')
+    elif custody and custody.get('kind')!='private-git':raise ValueError('snapshot alternate disappeared')
+
+def validate(root,expected,owner_uid,max_entries=50000,custody=None):
+    rs,entries=inspect_tree(root,expected,owner_uid,max_entries)
+    validate_git(root,custody)
+    # Qualify inode flags during eligibility, before the CLI writes its intent.
+    for p,ident in entries:
+        if stat.S_ISLNK(ident[2]):continue
+        fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            if identity(os.fstat(fd))!=ident:raise ValueError('snapshot inode raced')
+            flags(fd)
+        finally:os.close(fd)
+    return rs,entries
+
+def freeze(root,expected,owner_uid,max_entries=50000,inject=None,journal=None,custody=None):
+    deadline=time.monotonic()+20
+    rs,entries=validate(root,expected,owner_uid,max_entries,custody)
     changed=[]
     if journal:
         original=[]
@@ -96,7 +135,7 @@ def freeze(root,expected,owner_uid,max_entries=50000,inject=None,journal=None):
             finally: os.close(fd)
             if inject: inject(index,p)
         actual=[]
-        old=entries; entries=[]; walk(root); actual=entries
+        old=entries; _,actual=inspect_tree(root,expected,owner_uid,max_entries)
         if actual!=old: raise ValueError('snapshot tree changed during freeze')
         if journal:
             with open(journal) as stream:data=json.load(stream)
@@ -127,7 +166,9 @@ if __name__=='__main__':
     journal=custody+'/'+hashlib.sha256(json.dumps([root,expected]).encode()).hexdigest()+'.json'
     lock=os.open(journal+'.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    if request.get('kind')=='freeze-source-snapshot':result=freeze(root,expected,request['uid'],journal=journal)
+    if request.get('kind')=='validate-source-snapshot':
+        rs,entries=validate(root,expected,request['uid'],custody=request.get('objectCustody'));result={'state':'eligible','entries':len(entries)}
+    elif request.get('kind')=='freeze-source-snapshot':result=freeze(root,expected,request['uid'],journal=journal,custody=request.get('objectCustody'))
     elif request.get('kind')=='rollback-source-snapshot':result=rollback(journal,root,expected)
     else:raise SystemExit('unsupported snapshot operation')
     print(json.dumps(result))

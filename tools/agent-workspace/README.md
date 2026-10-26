@@ -659,11 +659,18 @@ not locked. Child exit/output is returned in the result, not inferred success.
 This is cooperative writer admission, **not protection against raw editors**.
 
 For an actual immutable handoff, prepare a **separately admitted source-only
-snapshot workspace** at the exact source SHA with enough budget for independent
-Git custody; ordinary create may use alternates, which must first be safely
-fully dissociated within that budget. No borrowed objects, worktrees, hardlinked
-regular files, nested mounts, external symlinks, generated/ignored/untracked
-files are accepted. Do not freeze a compiler/build workspace.
+snapshot workspace** at the exact source SHA. Private Git custody and the normal
+managed, independent mirror alternate are supported. For a managed alternate,
+the freezer preserves the minimal borrowed object boundary with permanent,
+create-or-verify mirror refs under `refs/pi-workspace-frozen/WORKSPACE/HEAD/`.
+Local commit, tree and blob objects remain inside the immutable snapshot. Full
+source and mirror-boundary closure is checked before and after pin publication;
+ordinary mirror pruning therefore cannot remove the required borrowed objects.
+There is no object copy, repack or full-history growth charge. These refs remain
+preservation custody even after an explicit thaw; no capacity credit is implied.
+Unmanaged or nested alternates, shared worktrees, shallow/grafted/replaced Git,
+hardlinked regular files, nested mounts, external symlinks and generated,
+ignored or untracked files refuse. Do not freeze a compiler/build workspace.
 
 ```
 agent-workspace freeze-source --id SNAPSHOT_ID --path SNAPSHOT_PATH \
@@ -671,7 +678,9 @@ agent-workspace freeze-source --id SNAPSHOT_ID --path SNAPSHOT_PATH \
   --authorization HANDOFF_EVIDENCE --json
 ```
 
-Under that same lock, this freezes the complete private snapshot's regular
+Under the checkout lock and the managed mirror's mutation lock, eligibility is
+fully validated before any intent fence is written. An eligibility refusal leaves
+no writer fence. This then freezes the complete private snapshot's regular
 files/directories using Linux immutable flags and transfers recorded custody
 only after post-freeze HEAD/clean-tree validation. Ordinary raw writes, Git
 commits, deletes and renames fail with EPERM, without chmod/chown or touching
@@ -693,10 +702,16 @@ The snapshot and its lifetime have independent preservation custody, not capacit
 credit. Cleanup cannot silently remove immutable source. Explicit rollback:
 `thaw-source --id SNAPSHOT_ID --path SNAPSHOT_PATH --owner CURRENT_OWNER
 --expected-head FULL_SHA --json` replays only that exact original-flags journal,
-under custody locks, and keeps recipient ownership. It is a deliberate new
+under custody locks, and keeps recipient ownership. A historical rejected intent
+without a journal is cleared only after a complete inode-bound observation proves
+that no immutable flags remain; unknown physical custody retains the fence.
+A failed freeze reconciles its original journal before removing its intent.
+It is a deliberate new
 mutable-source operation, never a timer-based waiver.
 
 Focused qualification: `node --test tools/agent-workspace/writer-custody.test.mjs
+ tools/agent-workspace/freeze-eligibility.test.mjs
+ tools/agent-workspace/frozen-object-custody.test.mjs
  tools/agent-workspace/bounded-command.test.mjs` and
 `sudo -n python3 tools/agent-workspace/frozen-source.test.py`.
 Publication uses the existing tools-only `install-capacity-host` selective

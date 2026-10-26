@@ -4,6 +4,7 @@ import {staleAllocationForecast} from './stale-allocation.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
+import {prepareFrozenObjectCustody} from './frozen-object-custody.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
 import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
@@ -1518,12 +1519,20 @@ function thawSourceCommand(database,args) {
   const input={id:required(args,"id"),path:path.resolve(required(args,"path")),owner:required(args,"owner"),head:required(args,"expected-head")};
   return withWorkspaceLock(database,input.path,()=>{
     const record=recordBy(database,{id:input.id});
-    assertWriterBinding(record,input,{head:gitInfo(input.path).head,frozen:false});
+    // A rejected intent can outlive its writing lease or an ordinary release refusal.
+    // Thaw repairs exact physical custody; it never grants a new writing lease.
+    if(record.id!==input.id||record.path!==input.path||record.owner!==input.owner||record.mode!=="writer"||record.state==="released") fail("writer-stale-custody");
+    if(realpathSync(input.path)!==input.path||gitInfo(input.path).head!==input.head) fail("writer-stale-head");
+    const marker=path.join(input.path,".git","pi-frozen-handoff.json");
+    if(!existsSync(marker)) fail("snapshot-intent-required");
+    const intent=JSON.parse(readFileSync(marker,"utf8"));
+    if(intent.kind!=="frozen-source-intent"||intent.id!==input.id||intent.path!==input.path||intent.head!==input.head) fail("snapshot-marker-conflict");
     const stat=lstatSync(input.path);
     const result=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"rollback-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
     if(result.status!==0) fail("snapshot-rollback-unaccepted: "+(result.stderr||result.error?.message));
-    rmSync(path.join(input.path,".git","pi-frozen-handoff.json"));
-    print({ok:true,binding:input,rollback:JSON.parse(result.stdout),ownerUnchanged:true},true);
+    rmSync(path.join(input.path,".git","pi-frozen-handoff.json"),{force:true});
+    database.prepare("UPDATE workspace SET detail = ?, updated_at = ? WHERE id = ?").run("source freeze intent reconciled; existing state and writing lease unchanged",Date.now(),record.id);
+    print({ok:true,binding:input,writingLeaseUnchanged:true,rollback:JSON.parse(result.stdout),ownerUnchanged:true},true);
   });
 }
 
@@ -1551,9 +1560,26 @@ function freezeSourceCommand(database,args) {
     const recipient=required(args,"recipient"), authorization=required(args,"authorization");
     if(recipient===input.owner||!authorization.trim()) fail("snapshot-recipient-transfer-required");
     const stat=lstatSync(input.path);
-    if(!previous) writeFileSync(marker,JSON.stringify({kind:"frozen-source-intent",id:input.id,path:input.path,head:input.head,ownerAtFreeze:input.owner})+"\n",{flag:"wx",mode:0o600});
-    const helper=spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({kind:"freeze-source-snapshot",path:input.path,device:stat.dev,inode:stat.ino,uid:stat.uid}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
-    if(helper.status!==0) fail("snapshot-freeze-unaccepted: "+(helper.stderr||helper.error?.message));
+    // Managed imports serialize mirror mutation with this same resource key.
+    // Keep it through eligibility, preservation refs and physical freeze.
+    const alternateFile=path.join(input.path,".git","objects","info","alternates");
+    const alternate=existsSync(alternateFile)?readFileSync(alternateFile,"utf8").trim():null;
+    const freeze=()=>{
+    let objectCustody=prepareFrozenObjectCustody({path:input.path,head:input.head,id:input.id,statePath:registryPaths.get(database),dryRun:true});
+    const helperRequest={path:input.path,device:stat.dev,inode:stat.ino,uid:stat.uid,objectCustody};
+    const helperCall=kind=>spawnSync("sudo",["-n","/usr/bin/python3",new URL("./frozen-source.py",import.meta.url).pathname],{input:JSON.stringify({...helperRequest,kind}),encoding:"utf8",timeout:25000,maxBuffer:1048576});
+    const preflight=helperCall("validate-source-snapshot");
+    if(preflight.status!==0) fail("snapshot-ineligible: "+(preflight.stderr||preflight.error?.message));
+    objectCustody=prepareFrozenObjectCustody({path:input.path,head:input.head,id:input.id,statePath:registryPaths.get(database)});
+    helperRequest.objectCustody=objectCustody;
+    if(!previous) writeFileSync(marker,JSON.stringify({kind:"frozen-source-intent",id:input.id,path:input.path,head:input.head,ownerAtFreeze:input.owner,objectCustody})+"\n",{flag:"wx",mode:0o600});
+    const helper=helperCall("freeze-source-snapshot");
+    if(helper.status!==0) {
+      // Reconcile the exact helper journal. Never remove an uncertain physical fence.
+      const rollback=helperCall("rollback-source-snapshot");
+      if(rollback.status===0) rmSync(marker,{force:true});
+      fail("snapshot-freeze-unaccepted: "+(helper.stderr||helper.error?.message)+(rollback.status===0?"; intent reconciled":"; immutable custody retained for thaw-source"));
+    }
     const after=command("git",["-C",input.path,"status","--porcelain","--untracked-files=all","--ignored"]);
     if(gitInfo(input.path).head!==input.head||after.status!==0||after.stdout) fail("snapshot-head-raced; immutable source retained for reconciliation");
     database.exec("BEGIN IMMEDIATE");
@@ -1563,7 +1589,9 @@ function freezeSourceCommand(database,args) {
       if(!transfer.ok) fail("snapshot-transfer-failed: "+transfer.error.code);
       database.exec("COMMIT");
     }catch(error){database.exec("ROLLBACK");throw error;}
-    print({ok:true,binding:{...input,owner:recipient},transfer:transfer.transfer,snapshot:JSON.parse(helper.stdout),nextAction:"create a separately admitted writable build workspace from this frozen exact Git source; never bootstrap this snapshot"},true);
+    print({ok:true,binding:{...input,owner:recipient},transfer:transfer.transfer,snapshot:{...JSON.parse(helper.stdout),objectCustody},nextAction:"create a separately admitted writable build workspace from this frozen exact Git source; never bootstrap this snapshot"},true);
+    };
+    return alternate?withResourceLock(registryPaths.get(database),`mirror:${path.dirname(alternate)}`,freeze):freeze();
   });
 }
 

@@ -44,6 +44,14 @@ class Freeze(unittest.TestCase):
     if kind=='alternates':(p/'.git/objects/info').mkdir(parents=True);(p/'.git/objects/info/alternates').write_text('/external')
     with self.assertRaises(ValueError):m.freeze(str(p),ident,uid)
     (p/'body').write_text('still mutable');outside.write_text('preserved')
+ def test_unjournaled_rollback_refuses_unknown_immutable_custody(self):
+  with tempfile.TemporaryDirectory() as root:
+   p,ident,uid=self.fixture(root)
+   fd=os.open(p/'body',os.O_RDONLY);m.setflags(fd,m.flags(fd)|m.IMMUTABLE);os.close(fd)
+   try:
+    with self.assertRaisesRegex(ValueError,'unjournaled immutable custody'):m.rollback(root+'/missing-journal',str(p),ident)
+    with self.assertRaises(PermissionError):(p/'body').write_text('unsafe')
+   finally:thaw(str(p))
  def test_failed_freeze_restores_only_changed_flags(self):
   with tempfile.TemporaryDirectory() as root:
    p,ident,uid=self.fixture(root);pre=p/'preexisting';pre.write_text('immutable')
