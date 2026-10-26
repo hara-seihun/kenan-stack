@@ -4914,7 +4914,7 @@ function measureCapacityCommand(database, args, statePath) {
     if (!cached.ok) { chargedAfter += budget; after[cached.code] = (after[cached.code] ?? 0) + 1; }
     else if (oldestCurrentStartedAt === null || cached.startedAt < oldestCurrentStartedAt) oldestCurrentStartedAt = cached.startedAt;
   }
-  const idleGrowth = retireIdleGrowthCommand(database, parseArgs(["--budget-ms",String(Math.max(1,Math.min(10000,deadline-Date.now()))),"--max-records","16",...(root?["--root",root]:[])]),statePath);
+  const idleGrowth = selected===null ? retireIdleGrowthCommand(database, parseArgs(["--budget-ms",String(Math.max(1,Math.min(10000,deadline-Date.now()))),"--max-records","16",...(root?["--root",root]:[])]),statePath) : {kind:"target-only-no-idle-sweep"};
   print({ kind: "capacity-measurement", idleGrowth, budgetMs, elapsedMs: Date.now() - started,
     progress: { pricedRows: rows.length, eligible: queue.length, skipped, ...counts,
       fullyChargedBytesBefore: chargedBefore, fullyChargedBytesAfter: chargedAfter, uncreditedAfter: after,

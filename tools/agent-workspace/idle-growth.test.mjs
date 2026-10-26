@@ -72,3 +72,7 @@ test('maintenance capability launcher preserves sudo observer elevation instead 
  assert.ok(text.includes('--ambient-caps=+dac_read_search'));
  assert.ok(!text.includes('--bounding-set=-all'));
 });
+test('target-only measurement does not initiate an unrelated idle sweep',()=>{
+ const text=fs.readFileSync(new URL('./workspace.mjs',import.meta.url),'utf8');
+ assert.ok(text.includes('const idleGrowth = selected===null ? retireIdleGrowthCommand'));
+});
