@@ -15,7 +15,7 @@ export function releaseCaller({caller=nativeCaller, pid=process.pid,
     const binding=caller();
     if(binding!==null)return {ok:true, kind:'native', binding};
     for(let current=pid, depth=0;current>1&&depth<64;depth++) {
-      if(cgroup(current).includes('/agent-tool-')||server.test(argv(current)[1]??''))
+      if(cgroup(current).includes('/agent-tool-')||/\/kenan-bg-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}-/.test(cgroup(current))||server.test(argv(current)[1]??''))
         return refused('release-caller-unverified','The native tool context exists, but its authenticated caller identity is unavailable.');
       const up=parent(current);
       if(!Number.isSafeInteger(up)||up<1||up===current)

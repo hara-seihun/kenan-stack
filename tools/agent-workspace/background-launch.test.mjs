@@ -29,3 +29,9 @@ test('the installed symlink invokes the actual CLI rather than silently doing no
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-cli-'));
  try{const file=path.join(root,'linked.mjs');fs.symlinkSync(new URL('./background-launch.mjs',import.meta.url).pathname,file);const r=spawnSync(process.execPath,[file,'launch'],{input:'{}',encoding:'utf8',timeout:5000});assert.equal(r.status,2);assert.match(r.stderr,/background_(root|native_caller)_required/);}finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+import {releaseCaller} from './release-authority.mjs';
+test('a background native caller with failed authentication cannot fall through to operator authority',()=>{
+ const r=releaseCaller({caller:()=>null,pid:100,cgroup:()=>`0::${group}`,argv:()=>['/bin/worker'],parent:()=>1});
+ assert.equal(r.ok,false);assert.equal(r.error.code,'release-caller-unverified');
+});
