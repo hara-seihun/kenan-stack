@@ -157,6 +157,12 @@ test('an owner that becomes live before the locked fresh readback is preserved',
  assert.equal(r.results[0].action,'none');assert.equal(r.results[0].code,'owner-live');assert.ok(fs.existsSync(f.source));assert.equal(f.row().state,'active');
 }));
 
+test('a manager-held trigger handed off by the ended owner does not keep the owner live',()=>fixture(STOPPED,f=>{
+ f.priced();f.observe(ended(STOPPED,{wakes:[{id:'w4',channel:'beta',agentId:'manager:converge',heldFor:STOPPED,held:true,text:'nothing about paths'}]}));
+ const r=f.release('--execute');
+ assert.equal(r.results[0].action,'released',JSON.stringify(r));
+}));
+
 test('non-native owners are never candidates',()=>fixture('task-name-owner',f=>{
  f.observe({agents:[],wakes:[]});const r=f.release('--execute');
  assert.equal(r.candidates,0);assert.equal(r.results.length,0);assert.ok(fs.existsSync(f.source));

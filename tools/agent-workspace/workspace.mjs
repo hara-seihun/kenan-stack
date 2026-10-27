@@ -4139,7 +4139,7 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
   if (observation.errors.length) return { code: "owner-unknown" };
   const unended = verdicts.find((verdict, index) => verdict.kind !== "ended" && (existsSync(group[index].path) || verdict.kind === "live"));
   if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
-  const directWake = observation.wakes.some(wake => group.some(record => wake.agentId === endedReleaseOwner(database, record) || wake.heldFor === endedReleaseOwner(database, record)));
+  const directWake = observation.wakes.some(wake => wake.held !== true && group.some(record => wake.agentId === endedReleaseOwner(database, record) || wake.heldFor === endedReleaseOwner(database, record)));
   if (directWake) return { code: "pending-owner-wake" };
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };

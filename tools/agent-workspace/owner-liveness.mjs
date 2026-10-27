@@ -69,7 +69,7 @@ export function classifyOwner(owner,observation){
  if(!rows.length)return {kind:'unknown',code:'owner-absent-from-native-store',owner,detail:'absence is not evidence that the owner ended'};
  const live=rows.filter(a=>a.archived!==true&&a.state!=='stopped');
  if(live.length)return {kind:'live',code:'owner-live',owner,agents:live};
- const wakes=observation.wakes.filter(w=>w.agentId===owner||w.heldFor===owner);
+ const wakes=observation.wakes.filter(w=>w.held!==true&&(w.agentId===owner||w.heldFor===owner));
  if(wakes.length)return {kind:'live',code:'owner-pending-wake',owner,wakes:wakes.map(w=>({id:w.id,channel:w.channel}))};
  return {kind:'ended',code:rows.every(a=>a.archived===true)?'owner-archived':'owner-stopped',owner,
   agents:rows.map(a=>({id:a.id,channel:a.channel,role:a.role,state:a.state,archived:a.archived,goalId:a.goalId??null,updatedAt:a.updatedAt??null,parentAgentId:a.parentAgentId??null}))};
