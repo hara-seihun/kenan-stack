@@ -1619,6 +1619,12 @@ function adoptEndedActionsCommand(database,args,statePath) {
 
 function reassignCommand(database, args) {
   assertOnly(args, ["id", "path", "from-owner", "from-source-commit", "from-state", "owner", "source-commit", "authorization", "json"]);
+  const requiredFlags = ["id", "path", "from-owner", "from-source-commit", "from-state", "owner", "source-commit", "authorization"];
+  const missing = requiredFlags.filter(flag => one(args, flag) === undefined);
+  if (missing.length) fail(`reassign is missing required flags: ${missing.map(flag => `--${flag}`).join(", ")}. ` +
+    "Read the current values with agent-workspace status --id ID --json. " +
+    "--authorization is a reference to the existing task, message or handoff evidence authorizing this transfer; it is not a separately issued credential. " +
+    "The authenticated current custodian must run this command; the reference does not grant custody.");
   const fromSource = required(args, "from-source-commit");
   const sourceCommit = required(args, "source-commit");
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(sourceCommit) ||

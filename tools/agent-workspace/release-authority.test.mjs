@@ -228,3 +228,16 @@ test('caller authentication exposes sanitized query cause and channel count with
  assert.equal(result.result.diagnostic.channelCount,0);
  assert.match(result.result.diagnostic.errors[0],/cannot extract elements from a scalar/);
 }));
+
+
+test('reassign reports every missing binding and the authorization evidence source without mutation',()=>fixture(f=>{
+  const before=f.snapshot();
+  assert.throws(()=>main(['reassign','--id',f.record.id,'--owner',CHILD,'--json'],f.state),error=>{
+    for(const flag of ['path','from-owner','from-source-commit','from-state','source-commit','authorization'])assert.ok(error.message.includes('--'+flag),error.message);
+    assert.match(error.message,/existing task, message or handoff evidence/);
+    assert.match(error.message,/not a separately issued credential/);
+    assert.match(error.message,/authenticated current custodian/);
+    return true;
+  });
+  assert.deepEqual(f.snapshot(),before);
+}));
