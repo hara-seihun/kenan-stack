@@ -39,3 +39,14 @@ import {submitBackground} from './background-launch.mjs';
 test('native background submission is one atomic bounded creation, not preflight and reset waits',()=>{
  let calls=0;const timeout={status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''};const r=submitBackground('/usr/bin/systemd-run',['--unit=exact-original.service'],{execute:(cmd,args,options)=>{calls++;assert.equal(cmd,'/usr/bin/systemd-run');assert.deepEqual(args,['--unit=exact-original.service']);assert.equal(options.timeout,3000);return timeout;}});assert.equal(r,timeout);assert.equal(calls,1);
 });
+
+import {backgroundDirectory} from './background-launch.mjs';
+test('an outer cleanup unit launched inside its release target uses a neutral directory',()=>{
+ const cwd='/home/kenan/work/clones/cleanup-target',home='/home/kenan';
+ for(const argv of [
+  ['/usr/local/bin/kenan-bg','--run','cleanup','/var/tmp/log','/bin/bash','-c',`cd /home/kenan && agent-workspace release --path ${cwd} --json`],
+  ['/usr/local/bin/kenan-bg','--run','cleanup','/var/tmp/log','/home/kenan/.local/bin/agent-workspace','release','--path',cwd],
+ ])assert.equal(backgroundDirectory({cwd,argv},home),home);
+ assert.equal(backgroundDirectory({cwd,argv:['/bin/bash','-c','bun test']},home),cwd);
+ assert.equal(backgroundDirectory({cwd,argv:['/usr/bin/agent-workspace','status','--path',cwd]},home),cwd);
+});

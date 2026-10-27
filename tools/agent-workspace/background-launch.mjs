@@ -5,6 +5,14 @@ import fs from 'node:fs';
 import {spawnSync} from 'node:child_process';
 import {callerToolCall} from './cache-queue.mjs';
 const run=(cmd,args,opts={})=>spawnSync(cmd,args,{encoding:'utf8',timeout:10000,maxBuffer:2**20,...opts});
+// Cleanup shells commonly change directory before releasing their own checkout.
+// systemd still retains the original WorkingDirectory, even after that shell cd.
+// Only cleanup launches change cwd; ordinary jobs retain their caller's cwd.
+export function backgroundDirectory(input,home){
+ const release=input.argv.some(arg=>/(?:^|[\s/;|&'"()])agent-workspace(?:[\s'";]|$)/.test(arg))
+  && input.argv.some(arg=>/(?:^|[\s'";])release(?:[\s'";]|$)/.test(arg));
+ return release?home:input.cwd;
+}
 export function backgroundSpec(input,binding,uid,gid){
  if(!binding||!Number.isSafeInteger(uid)||uid<=0||!Number.isSafeInteger(gid)||gid<0)throw Error('background_native_caller_required');
  if(!/^[a-f0-9-]{36}$/.test(binding.agentId)||!/^[-A-Za-z0-9._]{1,60}$/.test(input.name??'')||input.agentId!==binding.agentId)throw Error('background_owner_mismatch');
@@ -37,7 +45,7 @@ export function main(){
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
  // Unit creation is the atomic duplicate check. Separate preflight/reset calls
  // add two unbounded-in-series manager waits and cannot make creation safer.
- const result=submitBackground('/usr/bin/systemd-run',['--system','--quiet','--collect','--expand-environment=no',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${input.cwd}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv]);
+ const result=submitBackground('/usr/bin/systemd-run',['--system','--quiet','--collect','--expand-environment=no',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv]);
  if(result.status!==0||result.error){
   const unknown=result.error||result.signal;
   console.error(JSON.stringify({ok:false,error:{code:unknown?'background_launch_outcome_unknown':'background_launch_refused',unit:spec.unit,retry:false,detail:unknown?'Observe this exact unit before any new launch; the system manager may have accepted it.':'The system manager rejected this exact unit creation.'}}));process.exitCode=unknown?75:2;return;

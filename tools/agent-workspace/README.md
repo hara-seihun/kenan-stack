@@ -1116,3 +1116,10 @@ Physical release keeps its 150-second execution budget even for an operator with
 A targeted `release-ended-owners --id ID --execute` from an authenticated live native worker transfers the ended owner's checkout directly to that requesting worker, without deleting source or granting new writing capacity. Unknown owners, live owners and pending wakes remain protected. An earlier automatic transfer to a manager can be accepted by that manager's directly launched repair worker using its unchanged native lineage and recorded transfer. Periodic operator sweeps retain their existing parent-custody behavior. Detached checkout HEADs can be reassigned using exact source identities; attaching a synthetic branch is unnecessary.
 
 An ignored `.husky/_` directory is recognized as generated output only when committed `package.json` has the exact `prepare` command `husky` or `husky install`. Tracked files and arbitrary ignored evidence remain protected.
+
+Background commands invoking `agent-workspace release` use the authenticated Unix
+account's home as the transient unit's working directory, rather than retaining
+the checkout being removed. Cleanup commands must use explicit workspace IDs or
+absolute paths. Other background commands keep their original working directory.
+The native safety census still protects actual process working directories,
+executables and open files inside a checkout.
