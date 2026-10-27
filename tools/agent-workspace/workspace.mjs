@@ -728,6 +728,9 @@ function safetySnapshot(database) {
     gitAlternates: observed.gitDependencies.alternates,
     linkedWorktrees: observed.gitDependencies.linkedWorktrees,
     installed: isolated ? [] : observed.installed,
+    // One transition owns this snapshot. Immutable advertised commit identities
+    // can be reused while local HEAD, branches and source bytes are rechecked.
+    remoteCustody: new Map(),
   };
 }
 
@@ -866,7 +869,7 @@ function gitStatusExcludingNested(record, args, nestedWorkspaces = []) {
   return git(record.path, [...args, "--", ".", ...exclusions]);
 }
 
-function gitDisposition(record, nestedWorkspaces = []) {
+function gitDisposition(record, nestedWorkspaces = [], remoteCustody) {
   const lines = gitStatusExcludingNested(record, ["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=normal"], nestedWorkspaces).split("\n");
   const changed = lines.filter((line) => line && !line.startsWith("!! "));
   if (changed.length > 0) return { safe: false, sourceRetention: true, reason: `working tree has changes: ${changed.slice(0, 8).join(" | ")}` };
@@ -898,7 +901,8 @@ function gitDisposition(record, nestedWorkspaces = []) {
   // Local remote-tracking refs can be stale: a commit pushed under any other branch name is
   // durable too. Every head each remote advertises now is read before calling a commit unique.
   if (initiallyUncovered) {
-    const observed = observedRemoteHeads(command, record.path);
+    const observed = remoteCustody?.get(record.path) ?? observedRemoteHeads(command, record.path);
+    if (observed.ok) remoteCustody?.set(record.path, observed);
     if (!observed.ok && observed.code !== "remote-custody-absent") return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable: ${observed.detail}; checkout and generated caches retained`, head};
     if (observed.ok) durable.push(...observed.durable);
     if (uncovered() && !recordedMergesCover()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
@@ -1150,7 +1154,7 @@ function inspectRecord(record, options = {}) {
       systemdUnits: systemd.references,
     };
   }
-  const disposition = duringInspection(options.deadline, () => gitDisposition(record, options.nestedWorkspaces));
+  const disposition = duringInspection(options.deadline, () => gitDisposition(record, options.nestedWorkspaces, options.safety?.remoteCustody));
   return {
     classification: disposition.safe ? "reclaimable" : "repair-required",
     reason: disposition.reason,
