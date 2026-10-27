@@ -34,3 +34,8 @@ test('a parent custody conflict preserves the child request and names the existi
  assert.deepEqual(result.nextAction.settleInAuthenticatedBackground,['kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id','fixture','--preserve-runtime=true','--json']);
  assert.deepEqual(base.database.prepare('SELECT * FROM workspace_release_submission').get(),before,'guidance does not rewrite or relaunch the original effect');
 }));
+test('a completed linked release remains completed after authenticated custody changed',()=>fixture((base,count)=>{
+ submitRelease(base);
+ const result=submitRelease({...base,record:{...base.record,state:'released',owner:'repair'},request:{...base.request,owner:'repair'},settlement:{kind:'completed',requestId:'linked-physical-release'}});
+ assert.equal(result.action,'already-released');assert.equal(count(),1);assert.equal(result.releaseSettlement.requestId,'linked-physical-release');
+}));

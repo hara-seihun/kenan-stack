@@ -19,7 +19,7 @@ function fixture(action){
   const record=run(['register','--path',source,'--root',root,'--owner','task-label','--json']);db=workspaceTesting.openRegistry(state);unbindNativeOwner(db,record.id);
   const bind=()=>bindNativeOwner(db,record.id,{agentId:AGENT,channel:'beta',callId:'call_123'},'caller-scope',{fixture:true});
   const observe=(agentState,wakes=[])=>fs.writeFileSync(native,JSON.stringify({errors:[],agents:[{id:AGENT,channel:'beta',role:'worker',state:agentState,archived:agentState==='stopped',goalId:null,updatedAt:1}],wakes,observations:[],observedAt:Date.now()}));
-  const release=(execute=false)=>run(['release-ended-owners','--id',record.id,...(execute?['--execute']:[]),'--json']);
+  const release=(execute=false)=>workspaceTesting.releaseEndedOwnersCommand(db,{positional:[],named:new Map([['id',[record.id]],...(execute?[['execute',['true']]]:[]),['json',['true']]])},state,{caller:()=>({ok:true,kind:'operator'})});
     const args=(entries=[])=>({positional:[],named:new Map(entries.map(([k,v])=>[k,[String(v)]]))});
   const authenticated=pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))});
   const receipt=(r,number=1)=>{
@@ -140,4 +140,27 @@ test('a native child with an unobservable parent is retained without forging own
  f.bind();f.observe('stopped');const file=path.join(f.root,'native.json'),value=JSON.parse(fs.readFileSync(file));
  value.agents[0].parentAgentId='77777777-7777-4777-8777-777777777777';fs.writeFileSync(file,JSON.stringify(value));
  assert.equal(f.release(true).results[0].code,'parent-custody-unknown');assert.equal(fs.existsSync(f.source),true);
+}));
+
+for(const managerHop of [false,true])test('an authenticated live repair worker adopts ended custody directly'+(managerHop?' after an earlier manager transfer':''),()=>fixture(f=>{
+ const repair='88888888-8888-4888-8888-888888888888',parent='manager:converge',file=path.join(f.root,'native.json');
+ f.bind();f.observe('stopped');let value=JSON.parse(fs.readFileSync(file));
+ value.agents[0].parentAgentId=parent;value.agents.push({id:parent,channel:'beta',role:'manager',state:'running',archived:false});
+ fs.writeFileSync(file,JSON.stringify(value));
+ if(managerHop)assert.equal(f.release(true).results[0].action,'transferred-to-parent');
+ value.agents.push({id:repair,parentAgentId:parent,channel:'beta',role:'worker',state:'running',archived:false});fs.writeFileSync(file,JSON.stringify(value));
+ const authority={caller:()=>({ok:true,kind:'native',binding:{agentId:repair,channel:'beta',callId:'authentic-repair'}}),authenticate:f.authenticated};
+ const before=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id);
+ const result=workspaceTesting.releaseEndedOwnersCommand(f.db,f.args([['id',f.record.id],['execute',true]]),f.state,authority);
+ assert.equal(result.counts['transferred-to-requester'],1,JSON.stringify(result));
+ const after=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id);
+ assert.equal(after.owner,repair);assert.equal(nativeOwnerBinding(f.db,f.record.id).agentId,repair);
+ for(const key of ['path','source_commit','lease_expires_at','state'])assert.equal(after[key],before[key]);assert.equal(fs.existsSync(f.source),true);
+ // A worker with live custody is never taken over by the next requester.
+ const again=workspaceTesting.releaseEndedOwnersCommand(f.db,f.args([['id',f.record.id],['execute',true]]),f.state,authority);
+ assert.equal(again.results[0].code,'owner-live');
+}));
+test('a failed caller authentication cannot acquire ended-owner custody',()=>fixture(f=>{
+ f.bind();f.observe('stopped');const result=workspaceTesting.releaseEndedOwnersCommand(f.db,f.args([['id',f.record.id],['execute',true]]),f.state,{caller:()=>({ok:false,error:{code:'release-caller-unverified'}})});
+ assert.equal(result.error.code,'release-caller-unverified');assert.equal(fs.existsSync(f.source),true);assert.equal(nativeOwnerBinding(f.db,f.record.id).agentId,AGENT);
 }));

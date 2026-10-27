@@ -62,10 +62,11 @@ import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { procScope, currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
-import { OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
+import { NATIVE_CUSTODIAN_ID, OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import {adoptEndedActions} from "./actions-adoption.mjs";
 import {submitRelease} from './release-submission.mjs';
+import {releaseBudgetMs} from './release-budget.mjs';
 import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
 import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
@@ -1034,8 +1035,19 @@ function repositoryManifestCachePaths(workspacePath) {
   return accepted;
 }
 
+function repositoryPrepareCachePaths(workspacePath) {
+  const manifest = command("git", ["-C", workspacePath, "show", "HEAD:package.json"]);
+  if (manifest.status !== 0) return [];
+  try {
+    const pkg = JSON.parse(manifest.stdout);
+    // Only the known Husky generator owns this exact internal directory. Read
+    // committed source, never an untracked or locally edited prepare script.
+    if (!/^husky(?: install)?$/.test(pkg.scripts?.prepare ?? "")) return [];
+    return repositoryOwnedCachePaths(workspacePath, [".husky/_=package.json"]);
+  } catch { return []; }
+}
 function effectiveCachePaths(record) {
-  return [...new Set([...DEFAULT_CACHE_PATHS, ...record.cachePaths, ...repositoryManifestCachePaths(record.path)])];
+  return [...new Set([...DEFAULT_CACHE_PATHS, ...record.cachePaths, ...repositoryManifestCachePaths(record.path), ...repositoryPrepareCachePaths(record.path)])];
 }
 
 function stripCaches(record, statePath, invalidateCapacity, observeLink) {
@@ -1481,7 +1493,7 @@ function reassignWorkspace(database, input, authorityDependencies) {
       return refuse("repository-mismatch", `recorded ${record.repository}, observed ${info.repository}`);
     }
     const branch = command("git", ["-C", record.path, "symbolic-ref", "--quiet", "HEAD"]);
-    if (branch.status !== 0) return refuse("writer-branch-unknown", "writer HEAD must be attached to a branch");
+    if (branch.status !== 0 && branch.status !== 1) return refuse("writer-branch-unknown", "writer HEAD observation failed");
     if (info.head !== input.sourceCommit) return refuse("head-mismatch", `observed ${info.head}, requested ${input.sourceCommit}`);
   } catch (error) {
     return refuse("checkout-inspection-failed", error instanceof Error ? error.message : String(error));
@@ -4106,6 +4118,18 @@ function refreshEndedOwnerSample(database, record, deadline, statePath, {increme
   if(sample.partial)return {kind:'partial',route};
   return sample.ok && cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok ? { kind: "measured", route } : { kind: "failed", route, detail: sample.error ?? "sample not current" };
 }
+function endedReleaseOwner(database, record) {
+  const owner = canonicalNativeOwner(database, record);
+  if (OWNER_AGENT_ID.test(owner)) return owner;
+  if (!owner.startsWith("manager:") || !NATIVE_CUSTODIAN_ID.test(owner) || !database.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_parent_custody'").get()) return owner;
+  const custody = database.prepare('SELECT * FROM workspace_parent_custody WHERE workspace_id=?').get(record.id);
+  const last = database.prepare('SELECT * FROM workspace_reassignment WHERE workspace_id=? ORDER BY sequence DESC LIMIT 1').get(record.id);
+  let evidence; try { evidence = JSON.parse(custody?.evidence_json ?? 'null'); } catch { return owner; }
+  const matches = last ? last.new_owner === owner && last.old_owner === custody.child_owner && last.authorization === custody.evidence_json
+    : record.sourceCommit === null;
+  return custody?.parent_owner === owner && matches && ['transfer','native-ended-child-parent-custody'].includes(evidence?.kind) &&
+    evidence.parent === owner && OWNER_AGENT_ID.test(evidence.child ?? '') ? evidence.child : owner;
+}
 function endedOwnerSummary(record) {
   return { id: record.id, path: record.path, owner: record.owner, state: record.state, groupId: record.groupId };
 }
@@ -4114,7 +4138,7 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
   if (observation.errors.length) return { code: "owner-unknown" };
   const unended = verdicts.find((verdict, index) => verdict.kind !== "ended" && (existsSync(group[index].path) || verdict.kind === "live"));
   if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
-  const directWake = observation.wakes.some(wake => group.some(record => wake.agentId === canonicalNativeOwner(database, record) || wake.heldFor === canonicalNativeOwner(database, record)));
+  const directWake = observation.wakes.some(wake => group.some(record => wake.agentId === endedReleaseOwner(database, record) || wake.heldFor === endedReleaseOwner(database, record)));
   if (directWake) return { code: "pending-owner-wake" };
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
@@ -4123,11 +4147,11 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline) {
   if (Date.now() >= deadline) return { code: "deferred" };
   return null;
 }
-function lockedEndedOwnerVerdicts(database, group, deadline) {
+function lockedEndedOwnerVerdicts(database, group, deadline, requester) {
   // Fresh native readback and record CAS under the checkout lock; no earlier verdict is reused.
   const current = recordsInGroup(database, recordBy(database, { id: group[0].id }));
-  const fresh = ownerLivenessObservation(current.map(record => canonicalNativeOwner(database, record)), deadline);
-  const verdicts = current.map(record => classifyOwner(canonicalNativeOwner(database, record), fresh));
+  const fresh = ownerLivenessObservation([...current.map(record => endedReleaseOwner(database, record)), ...(requester ? [requester.agentId] : [])], deadline);
+  const verdicts = current.map(record => classifyOwner(endedReleaseOwner(database, record), fresh));
   const changed = current.length !== group.length || current.some(record => {
     const before = group.find(candidate => candidate.id === record.id);
     return !before || before.owner !== record.owner || before.path !== record.path || before.sourceCommit !== record.sourceCommit;
@@ -4135,17 +4159,27 @@ function lockedEndedOwnerVerdicts(database, group, deadline) {
   return { current, fresh, verdicts, changed };
 }
 function releaseEndedOwnerGroup(database, group, observation, options) {
-  const verdicts = group.map(record => classifyOwner(canonicalNativeOwner(database, record), observation));
+  const verdicts = group.map(record => classifyOwner(endedReleaseOwner(database, record), observation));
   const refusal = endedOwnerRefusal(database, group, verdicts, observation, options.deadline);
   if (refusal) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", ...refusal }));
   if (!options.execute) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "would-release-ended-owner" }));
   if (options.deadline - Date.now() < 10_000) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", code: "deferred" }));
   const released = withWorkspaceLock(database, group[0].path, () => {
-    const locked = lockedEndedOwnerVerdicts(database, group, options.deadline);
+    const locked = lockedEndedOwnerVerdicts(database, group, options.deadline, options.requester);
     const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline);
     if (freshRefusal) return { refused: locked.current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: locked.verdicts[index], action: "none", ...freshRefusal })) };
     const byId = new Map(locked.current.map((record, index) => [record.id, locked.verdicts[index]]));
-    const parents=locked.current.map(record=>parentCustody(canonicalNativeOwner(database,record),locked.fresh));
+    const requester = options.requester;
+    if (requester) {
+      const rows = locked.fresh.agents.filter(a => a.id === requester.agentId);
+      if (locked.current.some(record => !OWNER_AGENT_ID.test(canonicalNativeOwner(database,record)) && rows[0]?.parentAgentId !== canonicalNativeOwner(database,record)) ||
+          rows.length !== 1 || rows[0].channel !== requester.channel || rows[0].role !== 'worker' ||
+          rows[0].archived || rows[0].state === 'stopped')
+        return {refused:locked.current.map(record=>({record:endedOwnerSummary(record),action:'none',code:'requester-not-live'}))};
+    }
+    const parents=locked.current.map(record=>requester ? {kind:'transfer',parent:requester.agentId,
+      channel:requester.channel,child:endedReleaseOwner(database,record),observedAt:locked.fresh.observedAt}
+      : parentCustody(endedReleaseOwner(database,record),locked.fresh));
     if(parents.some(p=>p.kind==='unknown'))return {refused:locked.current.map(record=>({record:endedOwnerSummary(record),action:'none',code:'parent-custody-unknown'}))};
     if(parents.some(p=>p.kind==='transfer')){
       // Group custody cannot be split by cleanup. Transfer only a complete proved group.
@@ -4155,14 +4189,14 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
       try{
         const results=locked.current.map((record,index)=>{
           const parent=parents[index],now=Date.now();
-          const authorization=JSON.stringify({kind:'native-ended-child-parent-custody',...parent});
+          const authorization=JSON.stringify({...parent,kind:requester?'native-ended-owner-requester-custody':'native-ended-child-parent-custody'});
           if(record.sourceCommit!==null)database.prepare(`INSERT INTO workspace_reassignment(workspace_id,path,old_owner,old_source_commit,new_owner,new_source_commit,authorization,occurred_at) VALUES(?,?,?,?,?,?,?,?)`)
             .run(record.id,record.path,record.owner,record.sourceCommit,parent.parent,record.sourceCommit,authorization,now);
           database.prepare(`INSERT INTO workspace_parent_custody(workspace_id,child_owner,parent_owner,evidence_json,occurred_at) VALUES(?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET child_owner=excluded.child_owner,parent_owner=excluded.parent_owner,evidence_json=excluded.evidence_json,occurred_at=excluded.occurred_at`).run(record.id,record.owner,parent.parent,authorization,now);
           database.prepare('UPDATE workspace SET owner=?,updated_at=? WHERE id=?').run(parent.parent,now,record.id);
           // The parent relationship is native evidence, never a fabricated parent tool call.
-          reassignNativeOwner(database,record.id,null,null);
-          return {record:endedOwnerSummary(recordBy(database,{id:record.id})),action:'transferred-to-parent',custody:parent,sourceDeleted:false};
+          reassignNativeOwner(database,record.id,requester??null,authorization);
+          return {record:endedOwnerSummary(recordBy(database,{id:record.id})),action:requester?'transferred-to-requester':'transferred-to-parent',custody:parent,sourceDeleted:false};
         });
         database.exec('COMMIT');return {refused:results};
       }catch(error){database.exec('ROLLBACK');throw error;}
@@ -4192,7 +4226,7 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
     if (sample.kind !== "measured") return item;
     try {
       return withWorkspaceLock(database, item.record.path, () => {
-        const locked = lockedEndedOwnerVerdicts(database, group, options.deadline);
+        const locked = lockedEndedOwnerVerdicts(database, group, options.deadline, options.requester);
         const index = locked.current.findIndex(record => record.id === item.record.id);
         const again = locked.changed || index < 0 ? { code: "owner-liveness-changed" }
           : locked.verdicts[index].kind !== "ended" ? { code: locked.verdicts[index].kind === "live" ? "owner-live" : "owner-unknown" }
@@ -4302,7 +4336,7 @@ function bindNativeOwnersCommand(database, args, statePath, {authenticate=authen
     observation: { errors: authentication.errors }, results };
 }
 
-function releaseEndedOwnersCommand(database, args, statePath) {
+function releaseEndedOwnersCommand(database, args, statePath, authorityDependencies) {
   assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "max-records", "after", "json"]);
   const budget = numberFlag(args, "budget-ms", 30_000), maxRecords = numberFlag(args, "max-records", 16);
   if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 40_000) fail("--budget-ms must be between 1000 and 40000");
@@ -4310,8 +4344,14 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   const execute = bool(args, "execute"), deadline = Date.now() + budget;
   const targeted = one(args, "id") !== undefined || one(args, "path") !== undefined;
   if (targeted && one(args, "root") !== undefined) fail("release-ended-owners accepts --root or a single --id/--path selector");
+  let requester;
+  if (targeted && execute) {
+    const authority = authorizeWorkspaceRelease(database, [], statePath, {deadline,...authorityDependencies});
+    if (!authority.ok) return authority;
+    if (authority.kind === 'native' && OWNER_AGENT_ID.test(authority.binding.agentId)) requester = authority.binding;
+  }
   let records = targeted ? [recordBy(database, selectorFrom(args, "release-ended-owners"))] : listRecords(database, one(args, "root"));
-  records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && (OWNER_AGENT_ID.test(canonicalNativeOwner(database, record)) || !existsSync(record.path)));
+  records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && (OWNER_AGENT_ID.test(canonicalNativeOwner(database, record)) || (requester && OWNER_AGENT_ID.test(endedReleaseOwner(database, record))) || !existsSync(record.path)));
   const scope = `owner-liveness:${one(args, "root") === undefined ? "*" : path.resolve(one(args, "root"))}`;
   const cursor=ownerCursor(database,args,scope,targeted), explicitWalk=one(args,"after")!==undefined;
   const ordered=records.map(record=>record.id);
@@ -4322,10 +4362,10 @@ function releaseEndedOwnersCommand(database, args, statePath) {
   const scan=ownerCursor(database,{...args,named:new Map([...args.named].filter(([name])=>name!=="after"))},scope+":scan",targeted||explicitWalk);
   const window=(explicitWalk||pool.length<=512?records:ownerPage(pool,scan.anchor)).slice(0,512);
   const observedMembers=window.flatMap(record=>recordsInGroup(database,record));
-  const owners=[...new Set(observedMembers.map(record=>canonicalNativeOwner(database,record)).filter(owner=>OWNER_AGENT_ID.test(owner)))];
+  const owners=[...new Set(observedMembers.map(record=>endedReleaseOwner(database,record)).filter(owner=>OWNER_AGENT_ID.test(owner)))];
   // Large groups cannot overflow native authentication; retain them instead of weakening proof.
   const observation=ownerLivenessObservation(owners.slice(0,512),deadline);
-  const priority=record=>classifyOwner(canonicalNativeOwner(database,record),observation).kind==="ended"?0:1;
+  const priority=record=>classifyOwner(endedReleaseOwner(database,record),observation).kind==="ended"?0:1;
   // A large scan window can contain more ended owners than one action page. Remember actual
   // attempts, not just the window anchor, so repeatedly retained trees cannot starve its tail.
   database.exec("CREATE TABLE IF NOT EXISTS workspace_owner_sweep_attempt(sequence INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, workspace_id TEXT NOT NULL, UNIQUE(scope,workspace_id))");
@@ -4339,7 +4379,7 @@ function releaseEndedOwnersCommand(database, args, statePath) {
     const group = recordsInGroup(database, record);
     for (const member of group) visited.add(member.id);
     try {
-      results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath }));
+      results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath, requester }));
     } catch (error) {
       results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : error.code ?? "owner-liveness-release-failed", detail: error.message })));
     }
@@ -5432,7 +5472,7 @@ export const workspaceTesting = { growthSafety, inheritShallowBoundary, complete
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
   const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;
-  const releaseEntryDeadline=argv[0]==='release'?releaseStarted+(releaseScope?.background===true?150_000:20_000):undefined;
+  const releaseEntryDeadline=argv[0]==='release'?releaseStarted+releaseBudgetMs(releaseScope):undefined;
   if(argv[0]==='execution-cessation') {
     const args=parseArgs(argv.slice(1));assertOnly(args,['holder']);
     print(executionCessation(JSON.parse(required(args,'holder'))),true);return;

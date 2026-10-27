@@ -94,3 +94,41 @@ test('one transition shares remote custody, but rechecks every local branch and 
   assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');
  }finally{process.env.PATH=oldPath;}
 }));
+
+test('tracked Husky prepare owns only ignored internal hooks, not arbitrary ignored evidence',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:'husky'}}));
+ fs.appendFileSync(path.join(f.source,'.gitignore'),'\.husky/_/\n');
+ f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','tracked prepare');f.git('-C',f.source,'push','origin','main');
+ fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/h'),'generated hooks');
+ fs.mkdirSync(path.join(f.source,'private-evidence'));fs.writeFileSync(path.join(f.source,'private-evidence/proof'),'valuable');
+ const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.ok(result.cacheDisposition.paths.includes('.husky/_'));
+ assert.equal(fs.existsSync(path.join(f.source,'.husky/_')),false);assert.equal(fs.readFileSync(path.join(f.source,'private-evidence/proof'),'utf8'),'valuable');
+}));
+for(const kind of ['untracked','different-generator'])test('Husky inference refuses '+kind+' prepare source',()=>fixture(f=>{
+ fs.appendFileSync(path.join(f.source,'.gitignore'),'.husky/_/\n');f.git('-C',f.source,'commit','-am','ignore generated');
+ fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:kind==='untracked'?'husky':'custom-tool'}}));
+ if(kind!=='untracked'){f.git('-C',f.source,'add','package.json');f.git('-C',f.source,'commit','-m','different generator');}f.git('-C',f.source,'push','origin','main');
+ fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/proof'),'preserve');
+ assert.equal(f.release().physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'.husky/_/proof')),true);
+}));
+test('a detached pushed checkout transfers and releases without attaching a synthetic branch',()=>fixture(f=>{
+ const head=f.git('-C',f.source,'rev-parse','HEAD');f.git('-C',f.source,'checkout','--detach',head);
+ const record=f.db.prepare('SELECT state FROM workspace WHERE id=?').get(f.record.id);
+ const result=workspaceTesting.reassignWorkspace(f.db,{id:f.record.id,path:f.source,fromOwner:'fixture',fromSourceCommit:head,fromState:record.state,owner:'repair',sourceCommit:head,authorization:'test detached handoff'},{caller:()=>({ok:true,kind:'operator'})});
+ assert.equal(result.ok,true,JSON.stringify(result));assert.equal(f.release().physicalDisposition.kind,'removed');
+}));
+
+test('ordinary clean pushed Converge-shaped detached checkout releases with 14000 remote heads and 29 generated outputs',()=>fixture(f=>{
+ const outputs=Array.from({length:29},(_,i)=>`products/product${i}/src/client.generated.ts`);
+ fs.writeFileSync(path.join(f.source,'.agent-workspace-caches'),outputs.join('\n')+'\n');
+ fs.appendFileSync(path.join(f.source,'.gitignore'),outputs.join('\n')+'\n');
+ f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','tracked generated output contracts');f.git('-C',f.source,'push','origin','main');
+ const head=f.git('-C',f.source,'rev-parse','HEAD');
+ const refs=Array.from({length:14000},(_,i)=>`create refs/heads/remote-${i} ${head}`).join('\n')+'\n';
+ execFileSync('git',['--git-dir',f.remote,'update-ref','--stdin'],{input:refs,timeout:10000,stdio:['pipe','pipe','pipe']});
+ f.git('-C',f.source,'update-ref','-d','refs/remotes/origin/main');f.git('-C',f.source,'checkout','--detach',head);
+ for(const output of outputs){fs.mkdirSync(path.dirname(path.join(f.source,output)),{recursive:true});fs.writeFileSync(path.join(f.source,output),'generated');}
+ const start=Date.now(),result=f.release();
+ assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));assert.equal(fs.existsSync(f.source),false);
+ assert.equal(result.cacheDisposition.paths.length,30);assert.ok(Date.now()-start<150000,'physical release must finish inside its unchanged background bound');
+}));

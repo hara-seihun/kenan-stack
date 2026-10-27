@@ -87,7 +87,11 @@ for (const route of ['ordinary','group','terminal-retention']) test(`supported $
       db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(record.id);db.close();
       terminal=['--end-retention','--owner','fixture','--expected-plan-sha256',digest(plan)];
     }
-    const output=run(['release','--id',record.id,...terminal,'--json']);
+    // Use the explicitly injected fixture operator, never the real running worker's
+    // foreground context (which would detach physical effects outside this fixture).
+    const db=w.openRegistry(state),named=new Map([['id',[record.id]],['json',['true']]]);
+    for(let i=0;i<terminal.length;i++){const key=terminal[i].slice(2);named.set(key,[terminal[i+1]?.startsWith('--')||!terminal[i+1]?'true':terminal[++i]]);}
+    let text='',output;const write=process.stdout.write;process.stdout.write=x=>{text+=x;return true;};try{w.releaseCommand(db,{positional:[],named},state,{caller:()=>({ok:true,kind:'operator'})});output=JSON.parse(text);}finally{process.stdout.write=write;db.close();}
     const result=route==='group'?output.find(r=>r.record.id===record.id):output;
     assert.equal(result.action,route==='group'?'released-group':'released',JSON.stringify(result));assert.ok(result.removedCaches.includes('products/kenan/node_modules'));
     assert.equal(fs.readFileSync(path.join(f.external,'payload'),'utf8'),'external original bytes');

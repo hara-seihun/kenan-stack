@@ -93,13 +93,17 @@ function fixture(owner,action){
   fs.writeFileSync(path.join(source,'.gitignore'),'node_modules/\n');fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');
   const initial=git('-C',source,'rev-parse','HEAD');
   let out='';const write=process.stdout.write;process.stdout.write=x=>{out+=x;return true;};try{main(['register','--path',source,'--root',root,'--owner',owner,'--source-commit',initial,'--lease-seconds','86400','--json'],state);}finally{process.stdout.write=write;}
-  const record=JSON.parse(out);db=new DatabaseSync(state);unbindNativeOwner(db,record.id);
+  const record=JSON.parse(out);db=workspaceTesting.openRegistry(state);unbindNativeOwner(db,record.id);
   const priced=()=>{const st=fs.statSync(source),now=Date.now(),plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096};
    db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify(plan));
    db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));return plan;};
   const plan=()=>JSON.parse(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(record.id).plan_json);
   const row=()=>({...db.prepare('SELECT state,lease_expires_at FROM workspace WHERE id=?').get(record.id)});
-  const release=(...extra)=>run(['release-ended-owners','--id',record.id,...extra,'--json']);
+  const release=(...extra)=>{
+   const named=new Map([['id',[record.id]],['json',['true']]]);
+   for(let i=0;i<extra.length;i++){const key=extra[i].slice(2);named.set(key,[extra[i+1]&&!extra[i+1].startsWith('--')?extra[++i]:'true']);}
+   const result=workspaceTesting.releaseEndedOwnersCommand(db,{positional:[],named},state,{caller:()=>({ok:true,kind:'operator'})});return {...result,exitCode:result.ok?undefined:75};
+  };
   action({root,source,git,run,record,db,priced,plan,row,release,observe});
  }finally{db?.close();for(const [key,value] of [['PI_WORKSPACE_TEST_EXTERNAL_SAFETY',prior.safety],['PI_WORKSPACE_TEST_OWNER_LIVENESS',prior.native]]){if(value===undefined)delete process.env[key];else process.env[key]=value;}fs.rmSync(root,{recursive:true,force:true});}
 }
