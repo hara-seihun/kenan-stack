@@ -12,7 +12,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
  if(row && record.state==='released' && settlement.kind==='completed')return {ok:true,action:'already-released',record,releaseSettlement:settlement};
  if(row && row.request_json!==requestText)return {ok:false,error:{code:'release-submission-conflict',detail:'Reconcile the original submission before changing its candidate, custodian or release flags.'},requestId:row.request_id,
   nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],
-   settleInAuthenticatedBackground:['kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
+   settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
    continuation:'After reconciling the original terminal effect, the authenticated current custodian may settle retained disposal in this background route. Normal custody and physical safety checks still apply; this does not replace the original submission or settlement.'}};
 
  let continueKnown=false;

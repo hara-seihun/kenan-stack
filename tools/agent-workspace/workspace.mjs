@@ -3022,7 +3022,7 @@ function sourceRevalidationWorker() {
           const proof = revalidatePreparedSourceWithinBudget(value, input, sourceCommit, true);
           if (proof !== null && named !== null && named !== undefined) {
             const args = { named: new Map(named), positional: [] };
-            reservePreparedCreation(database, args, input.statePath, input, proof);
+            reservePreparedCreation(database, args, input.statePath, { ...input, sourceCommit }, proof);
           }
           return proof;
         })), named ? one({ named: new Map(named) }, "group") : undefined);
@@ -3036,7 +3036,7 @@ function sourceRevalidationWorker() {
 }
 
 function prepareCreationSource(database, args, input) {
-  let sourceCommit = resolveRequestedSource(input.repository, input.ref);
+  let sourceCommit = input.sourceCommit ?? resolveRequestedSource(input.repository, input.ref);
   if (input.intent !== null && !/^[0-9a-f]{40}$/u.test(sourceCommit)) {
     const resolved = command("git", ["--git-dir", input.mirror, "rev-parse", "--verify", `${sourceCommit}^{commit}`]);
     if (resolved.status !== 0) fail("source capacity estimate unknown: remote commit is absent from durable mirror custody; remote import remains unestimated");
@@ -3219,7 +3219,7 @@ function reservePreparedCreation(database, args, statePath, source, prepared) {
     || ["intent", "growthBytes", "headroomBytes"].some(key => capacityIntent(args)?.[key] !== intent?.[key])
     || JSON.stringify(many(args, "sparse-pattern")) !== JSON.stringify(sparsePatterns))
     fail("completed source admission arguments differ from the original request");
-  if (!prepared.sourceCommit.startsWith(resolveRequestedSource(repository, ref)))
+  if (!prepared.sourceCommit.startsWith(source.sourceCommit ?? resolveRequestedSource(repository, ref)))
     fail("completed source admission no longer names the original commit");
   const request = creationRequest(args, repository), input = JSON.parse(request);
   const mode = input.mode, strategy = input.strategy;
@@ -3298,8 +3298,9 @@ function createWorkspace(database, args, statePath) {
   } else {
     if (existsSync(destination)) fail(`workspace already exists: ${destination}`);
     mkdirSync(root, { recursive: true });
+    const pinnedCommit = resolveRequestedSource(repository, ref);
     const preparation = withResourceLock(statePath, `source-preparation:${destination}`, () =>
-      prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns }));
+      prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns, sourceCommit: pinnedCommit }));
     if (preparation.state !== "ready") {
       print({ ok: true, state: "preparing", jobKind: "source", jobId: preparation.jobId, progressPath: preparation.progressPath, resultPath: preparation.resultPath,
         observeCommand: `agent-workspace source-status --job-id ${preparation.jobId} --json`,
@@ -3308,7 +3309,7 @@ function createWorkspace(database, args, statePath) {
       return;
     }
     reservePreparedCreation(database, args, statePath,
-      { root, destination, repository, mirror, ref, intent, sparsePatterns }, preparation.value);
+      { root, destination, repository, mirror, ref, intent, sparsePatterns, sourceCommit: pinnedCommit }, preparation.value);
     row = database.prepare("SELECT * FROM workspace WHERE path = ?").get(destination);
     if (row.creation_request !== request) fail(`workspace creation was claimed by another request: ${destination}`);
   }
@@ -5659,7 +5660,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
                 return {ceased:!observed.error&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
               },launch:name=>{
                 const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
-                const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath)});
+                const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath),env:{KENAN_BG_IDENTITY:'1'}});
                 if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
                 try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
               }});
