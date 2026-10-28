@@ -3924,6 +3924,17 @@ function settleReleasedFutureGrowth(database, item, requestId, statePath) {
   if (!plan || !["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return item;
   try {
     const record = recordBy(database, {id:item.record.id});
+    const row = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json
+      FROM workspace w JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=?`).get(record.id);
+    // Release owns the sample it needs, rather than leaving an unrecoverable
+    // growth-status instruction. The caller already holds the reentrant checkout
+    // lock; sample before taking the capacity fence used by retirement.
+    if (!cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) {
+      const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(value => value.path);
+      const deadline = Math.min(inspectionDeadline ?? Infinity, Date.now()+60_000);
+      const sample = measureWorkspaceRow(database, row, paths, deadline, statePath, false, false);
+      if (!sample.ok) growthError("growth-sample-required", sample.error ?? "release allocation sample failed");
+    }
     const {binding} = growthBinding(database, record);
     const disposition = {kind:"retire-future-growth", retainedUse:"source", remainingGrowthBytes:0,
       growthWriters:"none", writingLease:"retire", observedAt:Date.now(), binding,
@@ -5655,7 +5666,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
               members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
             const result=submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
               observe:row=>{
-                const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`kenan-bg-${authority.binding.agentId}-${row.unit_name}.service`],{timeout:2000});
+                const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
                 const fields=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>line.split('=')));
                 return {ceased:!observed.error&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
               },launch:name=>{

@@ -10,7 +10,17 @@ export function submitRelease({database,record,request,binding,launch,settlement
  const requestText=JSON.stringify(request);
  let row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
  if(row && record.state==='released' && settlement.kind==='completed')return {ok:true,action:'already-released',record,releaseSettlement:settlement};
- if(row && row.request_json!==requestText)return {ok:false,error:{code:'release-submission-conflict',detail:'Reconcile the original submission before changing its candidate, custodian or release flags.'},requestId:row.request_id,
+ const originalRequest=row?(JSON.parse(row.continuations_json??'[]').at(-1)?.request??JSON.parse(row.request_json)):null;
+ // A completed, retained ordinary release may safely continue with the documented
+ // non-destructive runtime-preservation flag. Preserve original custody and wait
+ // for its exact worker to cease before admitting that linked continuation.
+ const preservingContinuation=row && row.state==='terminal-known' && settlement.kind==='completed' &&
+  settlement.result?.physicalDisposition?.kind==='retained' &&
+  JSON.stringify({...originalRequest,flags:undefined})===JSON.stringify({...request,flags:undefined}) &&
+  !originalRequest.flags.some(([key])=>key==='preserve-runtime') &&
+  JSON.stringify(request.flags)===JSON.stringify([...originalRequest.flags,['preserve-runtime',['true']]].sort(([a],[b])=>a.localeCompare(b))) &&
+  observe(row).ceased===true;
+ if(row && JSON.stringify(originalRequest)!==requestText && !preservingContinuation)return {ok:false,error:{code:'release-submission-conflict',detail:'Reconcile the original submission before changing its candidate, custodian or release flags.'},requestId:row.request_id,
   nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],
    settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
    continuation:'After reconciling the original terminal effect, the authenticated current custodian may settle retained disposal in this background route. Normal custody and physical safety checks still apply; this does not replace the original submission or settlement.'}};
@@ -21,7 +31,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
   const requestId=row?.request_id??randomUUID(),name=row?.unit_name??'aw-release-'+createHash('sha256').update(record.id+requestText).digest('hex').slice(0,32);
   if(!row)database.prepare('INSERT INTO workspace_release_submission(workspace_id,request_id,request_json,binding_json,unit_name,state,launch_json) VALUES(?,?,?,?,?,?,NULL)').run(record.id,requestId,requestText,JSON.stringify(binding),name,'launch-unknown');
   else {
-   const history=JSON.parse(row.continuations_json??'[]');history.push({priorTerminal:JSON.parse(row.terminal_json),binding,continuedAt:Date.now()});
+   const history=JSON.parse(row.continuations_json??'[]');history.push({priorTerminal:JSON.parse(row.terminal_json),binding,request,continuedAt:Date.now()});
    database.prepare("UPDATE workspace_release_submission SET state='launch-unknown',terminal_json=NULL,continuations_json=? WHERE workspace_id=? AND request_id=?").run(JSON.stringify(history),record.id,requestId);
   }
   row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);

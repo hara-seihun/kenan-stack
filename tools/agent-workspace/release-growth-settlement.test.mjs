@@ -48,11 +48,14 @@ test('active linked borrower refuses retirement and preserves original reservati
  assert.equal(JSON.parse(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(f.record.id).plan_json).growthLifecycle,undefined);
  checkBytes(f,head);
 }));
-test('stale or failed sample refuses settlement without dropping allocation',()=>fixture(f=>{
+for (const missing of [false,true]) test((missing?'missing':'failed')+' allocation sample is repaired by release itself',()=>fixture(f=>{
  const head=f.commit();priced(f);
- f.db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify({ok:false,error:'unknown physical allocation'}),f.record.id);
- const r=f.release();assert.equal(r.futureGrowthSettlement.kind,'retained');assert.equal(r.futureGrowthSettlement.code,'growth-sample-required');
- assert.equal(JSON.parse(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(f.record.id).plan_json).growthLifecycle,undefined);checkBytes(f,head);
+ if(missing)f.db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(f.record.id);
+ else f.db.prepare('UPDATE workspace_capacity_measurement SET measurement_json=? WHERE workspace_id=?').run(JSON.stringify({ok:false,error:'unknown physical allocation'}),f.record.id);
+ const r=f.run(['release','--id',f.record.id,'--json']);
+ assert.equal(r.futureGrowthSettlement.kind,'retired',JSON.stringify(r));
+ assert.equal(JSON.parse(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.record.id).measurement_json).ok,true);
+ assert.equal(f.run(['release','--id',f.record.id,'--json']).action,'none');checkBytes(f,head);
 }));
 for(const mode of ['running','unknown'])test(mode+' thread custody refuses growth settlement',()=>fixture(f=>{
  const head=f.commit();priced(f);const file=path.join(f.root,'thread.sqlite3'),db=new DatabaseSync(file),prior=process.env.PI_THREAD_DATABASE;

@@ -39,3 +39,18 @@ test('a completed linked release remains completed after authenticated custody c
  const result=submitRelease({...base,record:{...base.record,state:'released',owner:'repair'},request:{...base.request,owner:'repair'},settlement:{kind:'completed',requestId:'linked-physical-release'}});
  assert.equal(result.action,'already-released');assert.equal(count(),1);assert.equal(result.releaseSettlement.requestId,'linked-physical-release');
 }));
+
+test('documented preserve-runtime continuation retains original identity and is idempotent',()=>fixture((base,count)=>{
+ const request={...base.request,flags:[]};
+ const first=submitRelease({...base,request});
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0,finishedAt:1}));
+ const continuation={...base,settlement:{kind:'completed',result:{physicalDisposition:{kind:'retained'}}}};
+ const live=submitRelease({...continuation,observe:()=>({ceased:false})});
+ assert.equal(live.error.code,'release-submission-conflict');assert.equal(count(),1);
+ const resumed=submitRelease({...continuation,observe:()=>({ceased:true})});
+ assert.equal(resumed.requestId,first.requestId);assert.equal(count(),2);
+ const again=submitRelease(continuation);assert.equal(again.requestId,first.requestId);assert.equal(count(),2);
+ const row=base.database.prepare('SELECT * FROM workspace_release_submission').get();
+ assert.deepEqual(JSON.parse(row.request_json),request);
+ assert.deepEqual(JSON.parse(row.continuations_json)[0].request,base.request);
+}));
