@@ -3219,14 +3219,20 @@ test("reassignment refuses unknown and mismatched writer state without mutation"
     database.prepare("UPDATE workspace SET state='active', mode='review' WHERE id=?").run(record.id);
     check(args, "mode-not-writer");
     database.prepare("UPDATE workspace SET mode='writer' WHERE id=?").run(record.id);
-    git(record.path, "checkout", "--detach");
-    check(args, "writer-branch-unknown");
-    git(record.path, "checkout", "agent/refused");
     git(record.path, "remote", "set-url", "origin", "https://example.invalid/replaced.git");
     check(args, "repository-mismatch");
     git(record.path, "remote", "set-url", "origin", f.remote);
-    rmSync(record.path, { recursive: true });
+    const hidden=record.path+".temporarily-hidden";
+    execFileSync("mv",[record.path,hidden]);
     check(args, "checkout-inspection-failed");
+    execFileSync("mv",[hidden,record.path]);
+    // A detached HEAD is an observed valid checkout, not an observation failure.
+    git(record.path, "checkout", "--detach");
+    const detached=JSON.parse(run(args,f.env));
+    assert.equal(detached.ok,true);
+    assert.equal(detached.record.owner,"borrower");
+    assert.equal(git(record.path,"rev-parse","HEAD"),record.sourceCommit);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM workspace_reassignment").get().n,1);
     database.close();
   } finally { f.close(); }
 });
@@ -3397,12 +3403,21 @@ test("adoption imports mutable object borrowers before releasing their source", 
     const sourceRecord = records.find((record) => record.path === source);
     const borrowerRecord = records.find((record) => record.path === borrower);
 
-    const held = JSON.parse(run(["release", "--id", sourceRecord.id, "--json"], f.env));
+    // This physical-settlement fixture is an operator invocation, not the real
+    // hosting agent's asynchronous authenticated foreground release.
+    const releaseAsOperator=id=>{
+      const write=process.stdout.write,previous=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY,exit=process.exitCode;let output='';
+      process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';process.stdout.write=value=>{output+=value;return true;};
+      try{main(['release','--id',id,'--json'],f.env.PI_WORKSPACE_STATE,{releaseAuthorityDependencies:{caller:()=>({ok:true,kind:'operator'})}});}
+      finally{process.stdout.write=write;process.exitCode=exit;if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;}
+      return JSON.parse(output);
+    };
+    const held = releaseAsOperator(sourceRecord.id);
     assert.equal(held.action, "released");
     assert.equal(existsSync(source), false);
     assert.equal(git(borrower, "show", "HEAD:file.txt"), "source");
 
-    const borrowerRelease = JSON.parse(run(["release", "--id", borrowerRecord.id, "--json"], f.env));
+    const borrowerRelease = releaseAsOperator(borrowerRecord.id);
     assert.equal(borrowerRelease.action, "released");
   } finally {
     f.close();

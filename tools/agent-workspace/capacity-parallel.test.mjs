@@ -49,7 +49,7 @@ test('source liability has no timed waiver, excludes only its exact destination 
  const {workspaceTesting}=await import('./workspace.mjs');
  const db=new DatabaseSync(':memory:');
  try {
-  db.exec(`CREATE TABLE workspace(id TEXT,state TEXT,path TEXT,root TEXT,created_at INTEGER);
+  db.exec(`CREATE TABLE workspace(id TEXT,owner TEXT,state TEXT,path TEXT,root TEXT,created_at INTEGER);
    CREATE TABLE workspace_capacity(workspace_id TEXT,device_id TEXT,plan_json TEXT);
    CREATE TABLE workspace_source_capacity(destination TEXT PRIMARY KEY,device_id TEXT,plan_json TEXT,receipt TEXT);`);
   const plan={intent:'source-only',estimate:'whole-tree-upper-bound',constructionBytes:100,growthBytes:50,headroomBytes:8192};
