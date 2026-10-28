@@ -2267,12 +2267,13 @@ function repriceReservations(database, device, reservedPath) {
 // proven failed creations using the cancellation safety check,
 // under the checkout fence and then the filesystem fence (never the reverse).
 // lstat distinguishes genuine absence from unreadable roots and dangling symlinks.
-function settleMissingCapacity(database, statePath, device, deadline = Date.now() + 5000) {
+function settleMissingCapacity(database, statePath, device, deadline = Date.now() + 5000, selectedIds = null) {
   const rows = database.prepare(`SELECT w.id,w.path,w.group_id FROM workspace w
     JOIN workspace_capacity c ON c.workspace_id=w.id
     WHERE c.device_id=? AND w.state!='released'`).all(device);
   const results = [];
   for (const row of rows) {
+    if (selectedIds && !selectedIds.has(row.id)) continue;
     if (Date.now() >= deadline) break;
     const absent = () => { try { lstatSync(row.path); return false; } catch (error) { return error.code === 'ENOENT'; } };
     if (!absent()) continue;
@@ -5217,7 +5218,7 @@ function measureCapacityCommand(database, args, statePath) {
   const rows = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json FROM workspace w
     JOIN workspace_capacity c ON c.workspace_id=w.id
     WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)`).all(selected, selected, root, root);
-  const missing = [...new Set(rows.map(row=>row.device_id))].flatMap(device=>settleMissingCapacity(database,statePath,device,deadline));
+  const missing = [...new Set(rows.map(row=>row.device_id))].flatMap(device=>settleMissingCapacity(database,statePath,device,deadline,new Set(rows.map(row=>row.id))));
   const releasedMissing = new Set(missing.map(item=>item.id));
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
   const skipped = { "retired-future-growth": 0, "zero-liability": 0 };
