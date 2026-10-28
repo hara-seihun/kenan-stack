@@ -1135,7 +1135,7 @@ outcome is never retried automatically. A newly admitted continuation labels the
 ### Idempotent native background launches
 
 Native `kenan-bg` submissions reserve each worker/name pair under the root-owned
-`/var/lib/pi-stack/background-launch` directory. The kernel releases the per-name
+`/var/lib/agent-workspace/background-launch` directory (only that leaf is created; its parent comes from `admission-tmpfiles.conf`). The kernel releases the per-name
 lock on process exit. Repeating the same command and working directory returns
 the original unit and log, even after completion or reboot; a changed command
 must use a different name. Do not delete these receipts to retry external effects.

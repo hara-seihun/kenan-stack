@@ -3,6 +3,7 @@
 // detachment. User-manager metadata and inherited UUIDs never grant this identity.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {callerToolCall} from './cache-queue.mjs';
 const run=(cmd,args,opts={})=>spawnSync(cmd,args,{encoding:'utf8',timeout:10000,maxBuffer:2**20,...opts});
@@ -52,8 +53,14 @@ export function settleBackground(result,observed,spec){
  // reservation, so a retry cannot replay effects even after a process crash.
  return {ok:false,code:'background_launch_outcome_unknown',retry:false,detail:result?.error?.code||result?.signal||'The original submission has no authoritative reply.'};
 }
-export function launchOnce(input,binding,uid,spec,args,{root='/var/lib/pi-stack/background-launch',execute=run}={}){
- fs.mkdirSync(root,{recursive:true,mode:0o700});
+export const BACKGROUND_ROOT='/var/lib/agent-workspace/background-launch';
+// Only the leaf is created: a missing parent is an error, never a tree a root process invents (2026-10-28: creating
+// /var/lib/pi-stack recursively as root 0700 made every model call fail for 3.5 hours).
+export function launchOnce(input,binding,uid,spec,args,{root=BACKGROUND_ROOT,execute=run}={}){
+ try{fs.mkdirSync(root,{mode:0o700});}catch(error){
+  if(error.code==='ENOENT')return {ok:false,code:'background_state_parent_missing',retry:false,detail:`${path.dirname(root)} must exist before background launches can be recorded.`};
+  if(error.code!=='EEXIST')throw error;
+ }
  const key=spec.unit,file=`${root}/${key}.json`,fd=fs.openSync(`${root}/${key}.lock`,'a',0o600);
  try{
   // flock locks the inherited open file description; our fd retains it after

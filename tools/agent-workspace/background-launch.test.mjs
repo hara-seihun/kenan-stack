@@ -123,3 +123,12 @@ test('completed successful jobs do not remain active merely to retain retry evid
  assert.equal(source.includes("'--collect'"),false);
  assert.equal(source.includes('--property=Type=exec'),true);
 });
+test('background receipts live under a state directory that is not a retired pi path, and a missing parent is an error, not a created tree',async()=>{
+ const {BACKGROUND_ROOT,launchOnce}=await import('./background-launch.mjs');
+ assert.equal(BACKGROUND_ROOT,'/var/lib/agent-workspace/background-launch');
+ const base=fs.mkdtempSync(path.join(os.tmpdir(),'background-parent-'));
+ try{
+  const r=launchOnce(input,binding,1000,spec,[],{root:path.join(base,'missing','background-launch')});
+  assert.equal(r.code,'background_state_parent_missing');assert.equal(fs.existsSync(path.join(base,'missing')),false);
+ }finally{fs.rmSync(base,{recursive:true,force:true});}
+});
