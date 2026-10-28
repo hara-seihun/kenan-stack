@@ -42,6 +42,7 @@ export function settleBackground(result,observed,spec){
   let wanted;try{wanted=JSON.parse(spec.description.slice('kenan-tool-call:'.length));}catch{}
   if(!owner?.background||owner.agentId!==wanted?.agentId||owner.channel!==wanted?.channel||owner.uid!==wanted?.uid)return {ok:false,code:'background_owner_mismatch',retry:false};
   if(result?.status===0&&!result.error)return {ok:true};
+  if(observed.ActiveState==='activating')return {ok:false,code:'background_launch_outcome_unknown',retry:false,detail:'The exact unit is still starting; the command has not confirmed exec yet.'};
   if(observed.ActiveState==='failed')return {ok:false,code:'background_launch_failed',retry:false,detail:`The unit failed: ${observed.Result}; exec status ${observed.ExecMainStatus}.`};
   return {ok:true};
  }
@@ -105,7 +106,7 @@ export function main(){
  // retention makes lost D-Bus replies reconcilable even for very short jobs.
  const args=['--system','--quiet','--expand-environment=no','--property=Type=exec','--property=RemainAfterExit=yes',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
  const response=launchOnce(input,binding,uid,spec,args);
- if(!response.ok){console.error(JSON.stringify({ok:false,error:response}));process.exitCode=response.retry?2:75;return;}
+ if(!response.ok){console.error(JSON.stringify({ok:false,error:response}));process.exitCode=response.code==='background_launch_outcome_unknown'?75:2;return;}
  console.log(JSON.stringify(response));
 
 }

@@ -87,3 +87,17 @@ test('a crashed or timed-out submission reserves its name until exact reconcilia
  };
  try{for(let i=0;i<2;i++)assert.equal(launchOnce(input,binding,1000,spec,[],{root,execute}).code,'background_launch_outcome_unknown');assert.equal(starts,1);}finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('the inherited flock stays held until the parent closes its descriptor',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-lock-')),file=path.join(root,'lock'),fd=fs.openSync(file,'a');
+ try{
+  assert.equal(spawnSync('/usr/bin/flock',['-x','3'],{stdio:['ignore','pipe','pipe',fd]}).status,0);
+  assert.equal(spawnSync('/usr/bin/flock',['-n',file,'/bin/true']).status,1);
+  fs.closeSync(fd);
+  assert.equal(spawnSync('/usr/bin/flock',['-n',file,'/bin/true']).status,0);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('a queued unit with a lost reply is not falsely reported as started',()=>{
+ const r=settleBackground({status:null,error:{code:'ETIMEDOUT'}},{...properties,LoadState:'loaded',ActiveState:'activating'},spec);
+ assert.equal(r.ok,false);assert.equal(r.code,'background_launch_outcome_unknown');assert.equal(r.retry,false);
+});
