@@ -234,3 +234,54 @@ test('expired incomplete allocation progress restarts without erasing the comple
   assert.equal(f.db.prepare('SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?').get(f.rows.large.id).measurement_json,original);
  },500);
 }));
+
+test('capacity admission settles a missing retained directory once and preserves its source and plan history',()=>fixture(f=>{
+ const record=f.rows.retired;
+ const before=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(record.id);
+ const plan=f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(record.id).plan_json;
+ fs.rmSync(record.path,{recursive:true});
+ const admittedDb=workspaceTesting.openRegistry(f.state);
+ const admit=()=>workspaceTesting.withCapacityAdmission(admittedDb,f.state,f.device,()=>{
+  const current=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(record.id);
+  assert.equal(current.state,'released');
+  assert.equal(current.lease_expires_at,0);
+  assert.equal(current.source_commit,before.source_commit);
+  assert.equal(current.durable_source_commit,before.durable_source_commit);
+  assert.equal(f.db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(record.id).plan_json,plan);
+ });
+ try { admit();admit(); } finally { admittedDb.close(); }
+ const history=f.db.prepare('SELECT * FROM workspace_retention_release WHERE workspace_id=?').all(record.id);
+ assert.equal(history.length,1);
+ const observation=JSON.parse(history[0].inspection_json);
+ assert.equal(observation.bytes,0);assert.equal(observation.growthBytes,0);assert.equal(observation.newWritesAuthorized,false);
+}));
+
+test('targeted sampler settles an absent retained path instead of returning a measurement failure',()=>fixture(f=>{
+ fs.rmSync(f.rows.retired.path,{recursive:true});
+ const result=f.run(['measure-capacity','--id',f.rows.retired.id,'--budget-ms','5000','--json']);
+ assert.equal(result.results[0].status,'missing-path-settled');
+ assert.equal(result.results[0].growthBytes,0);
+ assert.equal(f.db.prepare('SELECT state FROM workspace WHERE id=?').get(f.rows.retired.id).state,'released');
+}));
+
+test('admission never settles pending creation or a dangling root symlink as missing',()=>fixture(f=>{
+ const creating=f.rows.small,link=f.rows.large;
+ f.db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(creating.id);
+ fs.rmSync(creating.path,{recursive:true});fs.rmSync(link.path,{recursive:true});
+ fs.symlinkSync(path.join(f.root,'not-present'),link.path);
+ const admittedDb=workspaceTesting.openRegistry(f.state);
+ try { workspaceTesting.withCapacityAdmission(admittedDb,f.state,f.device,()=>{}); } finally { admittedDb.close(); }
+ assert.equal(f.db.prepare('SELECT state FROM workspace WHERE id=?').get(creating.id).state,'creating');
+ assert.notEqual(f.db.prepare('SELECT state FROM workspace WHERE id=?').get(link.id).state,'released');
+}));
+
+
+test('admission automatically settles an absent failed creation through cancellation safety',()=>fixture(f=>{
+ const record=f.rows.large;
+ f.db.prepare("UPDATE workspace SET state='creating',detail='creation failed; private staging removed: capacity refused' WHERE id=?").run(record.id);
+ fs.rmSync(record.path,{recursive:true});
+ const db=workspaceTesting.openRegistry(f.state);
+ try { workspaceTesting.withCapacityAdmission(db,f.state,f.device,()=>{}); } finally { db.close(); }
+ assert.equal(f.db.prepare('SELECT state FROM workspace WHERE id=?').get(record.id).state,'released');
+ assert.equal(JSON.parse(f.db.prepare('SELECT inspection_json FROM workspace_retention_release WHERE workspace_id=?').get(record.id).inspection_json).bytes,0);
+}));

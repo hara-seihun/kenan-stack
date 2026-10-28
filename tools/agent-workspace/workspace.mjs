@@ -2263,12 +2263,59 @@ function repriceReservations(database, device, reservedPath) {
 
 // Only a pre-effect admission refusal may retry. Acquire the device fence for
 // each decision/commit, but release it before acquiring another checkout's fence.
+// Missing directories have no growth to measure. Settle completed records and
+// proven failed creations using the cancellation safety check,
+// under the checkout fence and then the filesystem fence (never the reverse).
+// lstat distinguishes genuine absence from unreadable roots and dangling symlinks.
+function settleMissingCapacity(database, statePath, device, deadline = Date.now() + 5000) {
+  const rows = database.prepare(`SELECT w.id,w.path,w.group_id FROM workspace w
+    JOIN workspace_capacity c ON c.workspace_id=w.id
+    WHERE c.device_id=? AND w.state!='released'`).all(device);
+  const results = [];
+  for (const row of rows) {
+    if (Date.now() >= deadline) break;
+    const absent = () => { try { lstatSync(row.path); return false; } catch (error) { return error.code === 'ENOENT'; } };
+    if (!absent()) continue;
+    try {
+      const result = withWorkspaceLock(database, row.path, () => {
+        if (!absent()) return null;
+        return withResourceLock(statePath, `capacity:${device}`, () => {
+          const record = recordBy(database, {id:row.id});
+          if (record.state==='released' || !absent()) return null;
+          if (record.state==='creating') {
+            if (!record.detail?.startsWith('creation failed;')) return null;
+            assertCreationCancellationSafe(database,record);
+          }
+          const plan = database.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(row.id);
+          database.exec('BEGIN IMMEDIATE');
+          try {
+            database.exec(`CREATE TABLE IF NOT EXISTS workspace_retention_release (
+              sequence INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id TEXT NOT NULL, occurred_at INTEGER NOT NULL,
+              record_json TEXT NOT NULL, plan_json TEXT NOT NULL, inspection_json TEXT NOT NULL)`);
+            const inspection = {classification:'missing',reason:'checkout path is absent',bytes:0,growthBytes:0,newWritesAuthorized:false};
+            database.prepare('INSERT INTO workspace_retention_release(workspace_id,occurred_at,record_json,plan_json,inspection_json) VALUES(?,?,?,?,?)')
+              .run(row.id,Date.now(),JSON.stringify(record),plan.plan_json,JSON.stringify(inspection));
+            // Use the existing missing-path settlement, retaining source and plan history.
+            database.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(row.id);
+            updateState(database,record,'released',inspection.reason);
+            database.exec('COMMIT');
+            return {id:row.id,path:row.path,kind:'missing-path-settled',...inspection};
+          } catch (error) { database.exec('ROLLBACK'); throw error; }
+        },deadline);
+      },row.group_id,deadline);
+      if(result) results.push(result);
+    } catch { /* Busy or uncertain records retain their entire liability. */ }
+  }
+  return results;
+}
+
 function withCapacityAdmission(database, statePath, device, action) {
   return withCapacityRefresh(database, statePath, device,
     () => withResourceLock(statePath, `capacity:${device}`, action));
 }
 
 function withCapacityRefresh(database, statePath, device, action, options = {}) {
+  settleMissingCapacity(database,statePath,device);
   try{return admitWithRefresh({
     ...options,
     decide: () => {try{return action();}finally{nativeTerminalProjection=null;}},
@@ -3637,6 +3684,13 @@ function cancelCreationCommand(database, args) {
   assertOnly(args, ["id", "path", "json"]);
   const record = recordBy(database, selectorFrom(args, 'cancel-creation'));
   if (record.state !== "creating") fail(`workspace cannot cancel creation from state ${record.state}`);
+  assertCreationCancellationSafe(database,record);
+  database.prepare("UPDATE workspace SET state='released', lease_expires_at=0, updated_at=?, detail='creation cancelled; destination absent' WHERE id=? AND state='creating'")
+    .run(Date.now(), record.id);
+  print(recordBy(database, { id: record.id }), bool(args, "json"));
+}
+
+function assertCreationCancellationSafe(database,record) {
   const statePath = registryPaths.get(database);
   const jobs = path.join(path.dirname(statePath), "checkout-jobs", record.id);
   if (existsSync(jobs)) for (const entry of readdirSync(jobs, { withFileTypes: true })) {
@@ -3656,9 +3710,6 @@ function cancelCreationCommand(database, args) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  database.prepare("UPDATE workspace SET state='released', lease_expires_at=0, updated_at=?, detail='creation cancelled; destination absent' WHERE id=? AND state='creating'")
-    .run(Date.now(), record.id);
-  print(recordBy(database, { id: record.id }), bool(args, "json"));
 }
 
 function heartbeatCommand(database, args, statePath) {
@@ -4473,6 +4524,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
   const selected = reducing ? growthSelected(database, args) : recordBy(database, selection.value.id===undefined?{path:selection.value.path}:{id:selection.value.id});
   if(resume&&selection.value.path!==undefined&&selected.path!==path.resolve(selection.value.path))growthError("growth-identity-changed", "resume-growth id and path do not name the same workspace");
   const device = database.prepare("SELECT device_id FROM workspace_capacity WHERE workspace_id=?").get(selected.id)?.device_id;
+  settleMissingCapacity(database,statePath,device,deadline);
   const decide = () => duringInspection(deadline, () => withWorkspaceLock(database, selected.path, () => {
     const record = recordBy(database, { id: selected.id });
     if (!["active", "referenced", "blocked", "repair-required"].includes(record.state)) fail(`workspace cannot reprice capacity from state ${record.state}`);
@@ -5165,12 +5217,15 @@ function measureCapacityCommand(database, args, statePath) {
   const rows = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json FROM workspace w
     JOIN workspace_capacity c ON c.workspace_id=w.id
     WHERE w.state!='released' AND (? IS NULL OR w.id=?) AND (? IS NULL OR w.root=?)`).all(selected, selected, root, root);
+  const missing = [...new Set(rows.map(row=>row.device_id))].flatMap(device=>settleMissingCapacity(database,statePath,device,deadline));
+  const releasedMissing = new Set(missing.map(item=>item.id));
   const paths = database.prepare("SELECT path FROM workspace WHERE state!='released'").all().map(row => row.path);
   const skipped = { "retired-future-growth": 0, "zero-liability": 0 };
   database.exec("CREATE TABLE IF NOT EXISTS workspace_capacity_attempt(workspace_id TEXT PRIMARY KEY, attempted_at INTEGER NOT NULL)");
   const settled=selected===null?terminalQualificationPaths(rows):new Map();
   const queue = [];
   for (const row of rows) {
+    if(releasedMissing.has(row.id)) continue;
     const plan = JSON.parse(row.plan_json);
     const budget = measuredBudgetBytes(plan, row.state);
     if (selected === null && budget === 0) { skipped[retainedGrowth(plan) ? "retired-future-growth" : "zero-liability"] += 1; continue; }
@@ -5184,8 +5239,8 @@ function measureCapacityCommand(database, args, statePath) {
     || (a.cached.ok ? a.cached.startedAt - b.cached.startedAt : a.attempt-b.attempt || (a.cached.lastObservation?.startedAt??0)-(b.cached.lastObservation?.startedAt??0) || b.budget-a.budget)
     || (a.row.id < b.row.id ? -1 : a.row.id > b.row.id ? 1 : 0));
   const chargedBefore = queue.filter(item => !item.cached.ok).reduce((sum, item) => sum + item.budget, 0);
-  const results = [];
-  const counts = { measured: 0, error: 0, deferred: 0 };
+  const results = missing.map(item=>({...item,status:"missing-path-settled",ok:true}));
+  const counts = { measured: missing.length, error: 0, deferred: 0 };
   let pending=queue;
   do {
     const next=[];
