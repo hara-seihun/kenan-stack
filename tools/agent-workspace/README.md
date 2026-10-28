@@ -1140,7 +1140,9 @@ must use a different name. Do not delete these receipts to retry external effect
 The wrapper must consume the helper's returned log and must not truncate logs
 before admission (`deploy/install-background.sh` in Kenan Stack installs it).
 
-The transient service uses `Type=exec` and retains its terminal state. Submission
+The transient service uses `Type=exec`, retains failed units for diagnosis, and
+lets successful units become inactive normally. Durable submission receipts,
+not lingering active units, prevent replay. Submission
 allows 15 seconds rather than killing the D-Bus client after three seconds during
 manager reloads. A failed submission reads back that exact system unit, retains
 actual system-manager refusal details, and resolves a lost reply when the unit

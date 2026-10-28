@@ -23,7 +23,7 @@ export function backgroundSpec(input,binding,uid,gid){
  return {unit,description};
 }
 // A three-second kill used to discard the D-Bus reason during manager reloads.
-// Type=exec waits only for exec, not command completion; retain the unit for readback.
+// Type=exec waits only for exec, not command completion; retain failed units for readback.
 export function submitBackground(command,args,{execute=run}={}){return execute(command,args,{timeout:15000});}
 export function launchIdentity(input){
  const argv=[...input.argv];
@@ -103,8 +103,8 @@ export function main(){
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
  // A durable name reservation and kernel-held lock prevent retry races. Unit
- // retention makes lost D-Bus replies reconcilable even for very short jobs.
- const args=['--system','--quiet','--expand-environment=no','--property=Type=exec','--property=RemainAfterExit=yes',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
+ // failures remain available for readback after their processes have exited.
+ const args=['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
  const response=launchOnce(input,binding,uid,spec,args);
  if(!response.ok){console.error(JSON.stringify({ok:false,error:response}));process.exitCode=response.code==='background_launch_outcome_unknown'?75:2;return;}
  console.log(JSON.stringify(response));

@@ -116,3 +116,10 @@ test('a definitely refused submission can retry, returning the log actually used
   const r=launchOnce(retry,binding,1000,spec,[],{root,execute});assert.equal(r.ok,true);assert.equal(r.log,'/tmp/accepted.log');assert.equal(starts,2);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
+
+test('completed successful jobs do not remain active merely to retain retry evidence',()=>{
+ const source=fs.readFileSync(new URL('./background-launch.mjs',import.meta.url),'utf8');
+ assert.equal(source.includes('--property=RemainAfterExit=yes'),false);
+ assert.equal(source.includes("'--collect'"),false);
+ assert.equal(source.includes('--property=Type=exec'),true);
+});
