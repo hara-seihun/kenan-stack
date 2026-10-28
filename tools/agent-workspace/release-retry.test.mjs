@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {runReleaseWorker} from './release-retry.mjs';
+import {runReleaseWorker,transientToolCallReference} from './release-retry.mjs';
 const child=(receipt,status=0)=>({stdout:JSON.stringify(receipt),stderr:'',status});
 const busy={futureGrowthSettlement:{kind:'retained',code:'workspace-capacity-lock-busy'}};
 const settled={futureGrowthSettlement:{kind:'retired',sequence:631}};
@@ -25,4 +25,38 @@ test('unknown effects and non-lock safety refusals are never retried',async()=>{
   let calls=0;const outcome=await runReleaseWorker(()=>{calls++;return result;});
   assert.equal(calls,1);if(result.signal)assert.equal(outcome.known,false);
  }
+});
+
+// Oct 28 regression (goal 13e96a50): backup-incr-6d03 stayed repair-required because the
+// background release ran while the caller's own next foreground call, which merely named
+// the checkout, was still streaming. The worker must re-observe until that call ends.
+const toolRef={kind:'tool_call',id:'3c9ba053',state:'running',resourceClass:'reserved-tool-call',toolName:'bash'};
+const referenced=(refs=[toolRef])=>({inspection:{classification:'referenced',currentStackQueueProtected:true,currentStackReferences:refs},physicalDisposition:{kind:'retained'}});
+const released={action:'released',physicalDisposition:{kind:'removed'},futureGrowthSettlement:{kind:'retired'}};
+test('a checkout retained only by a running tool call is re-observed until that call ends',async()=>{
+ let calls=0,slept=[];
+ const result=await runReleaseWorker(()=>child(++calls<3?referenced():released),{sleep:async ms=>{slept.push(ms);}});
+ assert.equal(calls,3);assert.deepEqual(slept,[2000,2000]);assert.equal(result.exitCode,0);assert.deepEqual(result.receipt,released);
+});
+test('a terminal continuation retained only by a running tool call also retries (exit 2)',async()=>{
+ const values=[child({ok:false,...referenced(),error:{code:'retention-release-protected'}},2),child(released)];
+ const result=await runReleaseWorker(()=>values.shift(),{sleep:async()=>{}});
+ assert.equal(values.length,0);assert.deepEqual(result.receipt,released);
+});
+test('a tool call that outlives the budget leaves the original retained result, not success',async()=>{
+ let clock=0,calls=0;
+ const result=await runReleaseWorker(()=>{calls++;return child(referenced());},{now:()=>clock,sleep:async ms=>{clock+=ms;},budgetMs:7000});
+ assert.equal(calls,4);assert.equal(result.exitCode,0);assert.equal(result.receipt.physicalDisposition.kind,'retained');
+});
+test('agents, processes, unknown observations and mixed references are never waited out',()=>{
+ for(const receipt of [
+  referenced([{kind:'agent',id:'w',state:'idle'}]),
+  referenced([toolRef,{kind:'agent',id:'w',state:'idle'}]),
+  referenced([]),
+  {inspection:{classification:'blocked',currentStackQueueProtected:true,reason:'current Stack queue observation unavailable'}},
+  {inspection:{classification:'referenced',reason:'1 process',processes:[{pid:1}]}},
+  {inspection:{classification:'repair-required',sourceRetention:true}},
+  [referenced(),{inspection:{classification:'referenced',processes:[{pid:1}]}}],
+ ])assert.equal(transientToolCallReference(receipt),false,JSON.stringify(receipt));
+ assert.equal(transientToolCallReference([referenced(),released]),true);
 });
