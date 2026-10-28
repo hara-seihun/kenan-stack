@@ -37,7 +37,7 @@ test('a background native caller with failed authentication cannot fall through 
 });
 import {submitBackground} from './background-launch.mjs';
 test('native background submission is one atomic bounded creation, not preflight and reset waits',()=>{
- let calls=0;const timeout={status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''};const r=submitBackground('/usr/bin/systemd-run',['--unit=exact-original.service'],{execute:(cmd,args,options)=>{calls++;assert.equal(cmd,'/usr/bin/systemd-run');assert.deepEqual(args,['--unit=exact-original.service']);assert.equal(options.timeout,3000);return timeout;}});assert.equal(r,timeout);assert.equal(calls,1);
+ let calls=0;const timeout={status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''};const r=submitBackground('/usr/bin/systemd-run',['--unit=exact-original.service'],{execute:(cmd,args,options)=>{calls++;assert.equal(cmd,'/usr/bin/systemd-run');assert.deepEqual(args,['--unit=exact-original.service']);assert.equal(options.timeout,15000);return timeout;}});assert.equal(r,timeout);assert.equal(calls,1);
 });
 
 import {backgroundDirectory} from './background-launch.mjs';
@@ -49,4 +49,41 @@ test('an outer cleanup unit launched inside its release target uses a neutral di
  ])assert.equal(backgroundDirectory({cwd,argv},home),home);
  assert.equal(backgroundDirectory({cwd,argv:['/bin/bash','-c','bun test']},home),cwd);
  assert.equal(backgroundDirectory({cwd,argv:['/usr/bin/agent-workspace','status','--path',cwd]},home),cwd);
+});
+
+import {launchOnce,settleBackground,launchIdentity} from './background-launch.mjs';
+test('a definite manager refusal preserves its actual reason rather than inventing an unknown outcome',()=>{
+ const r=settleBackground({status:1,stderr:'Failed to connect to bus: No such file or directory'}, {LoadState:'not-found'},spec);
+ assert.equal(r.code,'background_launch_refused');assert.equal(r.retry,true);assert.match(r.detail,/connect to bus/);
+});
+test('a lost submission reply is resolved by the retained exact unit, never by absence alone',()=>{
+ const lost={status:null,error:{code:'ETIMEDOUT'}};
+ assert.equal(settleBackground(lost,{...properties,LoadState:'loaded'},spec).ok,true);
+ assert.equal(settleBackground(lost,{LoadState:'not-found'},spec).retry,false);
+ assert.equal(settleBackground(lost,{...properties,LoadState:'loaded',Description:'foreign'},spec).code,'background_owner_mismatch');
+});
+test('named retries return the original log without executing again, including after unit collection or reboot',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-once-'));let starts=0;
+ const original={...input,argv:['/usr/local/bin/kenan-bg','--run','fixture','/tmp/first.log','/bin/true']};
+ const execute=(cmd,args,options)=>{
+  if(cmd==='/usr/bin/flock')return spawnSync(cmd,args,options);
+  if(cmd==='/usr/bin/systemd-run'){starts++;return {status:0,stdout:'',stderr:''};}
+  return {status:0,stdout:'LoadState=not-found\n'};
+ };
+ try{
+  const a=launchOnce(original,binding,1000,spec,[],{root,execute});assert.equal(a.ok,true);
+  const retry={...original,argv:[...original.argv]};retry.argv[3]='/tmp/new.log';
+  const b=launchOnce(retry,{...binding,callId:'later-call'},1000,spec,[],{root,execute});
+  assert.equal(b.ok,true);assert.equal(b.reused,true);assert.equal(b.log,'/tmp/first.log');assert.equal(starts,1);
+  const conflict=launchOnce({...retry,cwd:'/different'},binding,1000,spec,[],{root,execute});assert.equal(conflict.code,'background_name_conflict');assert.equal(starts,1);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('a crashed or timed-out submission reserves its name until exact reconciliation, without replay',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-pending-'));let starts=0;
+ const execute=(cmd,args,options)=>{
+  if(cmd==='/usr/bin/flock')return spawnSync(cmd,args,options);
+  if(cmd==='/usr/bin/systemd-run'){starts++;return {status:null,error:{code:'ETIMEDOUT'}};}
+  return {status:0,stdout:'LoadState=not-found\n'};
+ };
+ try{for(let i=0;i<2;i++)assert.equal(launchOnce(input,binding,1000,spec,[],{root,execute}).code,'background_launch_outcome_unknown');assert.equal(starts,1);}finally{fs.rmSync(root,{recursive:true,force:true});}
 });

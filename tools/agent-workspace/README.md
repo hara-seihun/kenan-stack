@@ -1129,3 +1129,22 @@ The worker prints the final result rather than the transient intermediate result
 outcome is never retried automatically. A newly admitted continuation labels the old receipt as
 `previousReleaseSettlement`; an identical request after successful growth retirement returns
 `release-completed` with the new settlement and does not launch another worker.
+
+### Idempotent native background launches
+
+Native `kenan-bg` submissions reserve each worker/name pair under the root-owned
+`/var/lib/pi-stack/background-launch` directory. The kernel releases the per-name
+lock on process exit. Repeating the same command and working directory returns
+the original unit and log, even after completion or reboot; a changed command
+must use a different name. Do not delete these receipts to retry external effects.
+The wrapper must consume the helper's returned log and must not truncate logs
+before admission (`deploy/install-background.sh` in Kenan Stack installs it).
+
+The transient service uses `Type=exec` and retains its terminal state. Submission
+allows 15 seconds rather than killing the D-Bus client after three seconds during
+manager reloads. A failed submission reads back that exact system unit, retains
+actual system-manager refusal details, and resolves a lost reply when the unit
+is present. An unavailable manager or an interrupted submission with no unit
+remains honestly unknown and reserves the original name; absence alone cannot
+prove that an external effect never ran. Successful submissions are retained
+durably and are never replayed automatically.
