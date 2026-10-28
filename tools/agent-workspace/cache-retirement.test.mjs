@@ -79,7 +79,7 @@ test('known source read differs from cache read, aliased target and unresolved B
 
 
 test('literal JSON path lookup and old pending cache staging identity remain exact',()=>fixture(f=>{
- const sql=queueReferenceSql('/source/a.[x]\\b',null,'generated-cache');assert.match(sql,/flag \"q\"/);assert.doesNotMatch(sql,/Memoize|jsonb_path_query/);
+ const sql=queueReferenceSql('/source/a.[x]\\b',null,'generated-cache');assert.match(sql,/jsonb_path_exists/);assert.ok(sql.includes(JSON.stringify(String.raw`/source/a\.\[x\]\\b`).slice(1,-1)));assert.ok(sql.includes('($|[/[:space:]'));assert.doesNotMatch(sql,/flag "q"/);assert.doesNotMatch(sql,/Memoize|jsonb_path_query/);
  const request={...f.r,operationId:'caption-build-f4b1-58b-1040',cachePath:'.converge-cache'};
  assert.equal(path.basename(cacheStagingRoots(request,f.base)[0]),'9d2e97ab18ff9c33fc9970608c2b566f575a64055e3dc197c9f9d3a02c3de235');
 }));

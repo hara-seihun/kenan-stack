@@ -3221,7 +3221,7 @@ test("reassignment refuses unknown and mismatched writer state without mutation"
     database.prepare("UPDATE workspace SET mode='writer' WHERE id=?").run(record.id);
     git(record.path, "remote", "set-url", "origin", "https://example.invalid/replaced.git");
     check(args, "repository-mismatch");
-    git(record.path, "remote", "set-url", "origin", f.remote);
+    git(record.path, "remote", "set-url", "origin", record.repository);
     const hidden=record.path+".temporarily-hidden";
     execFileSync("mv",[record.path,hidden]);
     check(args, "checkout-inspection-failed");
