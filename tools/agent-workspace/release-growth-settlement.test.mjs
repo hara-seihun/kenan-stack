@@ -1,10 +1,13 @@
 import './scratch-env.mjs';
 import{test}from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import os from'node:os';import path from'node:path';import{execFileSync,spawn}from'node:child_process';import{DatabaseSync}from'node:sqlite';
 const{main,workspaceTesting}=await import(process.env.WORKSPACE_RELEASE_MODULE||'./workspace.mjs');
+// These fixtures exercise synchronous physical settlement, not native foreground
+// submission. Inject the operator observer in-process so the hosting agent's
+// authenticated cgroup cannot launch real background units against temporary state.
 function fixture(action){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'release-custody-')),source=path.join(root,'source'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3');const previous=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';let db;
  const git=(...a)=>execFileSync('git',a,{encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']}).trim();
- const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
+ const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{out+=x;return true;};try{main(args,state,{releaseAuthorityDependencies:{caller:()=>({ok:true,kind:'operator'})}});}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(out);};
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(source,'.gitignore'),'node_modules/\nprivate-evidence/\n');fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');const initial=git('-C',source,'rev-parse','HEAD');
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',initial,'--json']);fs.mkdirSync(path.join(source,'node_modules'));fs.writeFileSync(path.join(source,'node_modules','receipt'),'generated cache');db=new DatabaseSync(state);

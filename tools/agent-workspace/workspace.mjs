@@ -5538,7 +5538,7 @@ Records outlive the directory, so status explains what became of a checkout that
 
 export const workspaceTesting = { growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
-export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
+export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {releaseAuthorityDependencies} = {}) {
   const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;
   const releaseEntryDeadline=argv[0]==='release'?releaseStarted+releaseBudgetMs(releaseScope):undefined;
   if(argv[0]==='execution-cessation') {
@@ -5711,12 +5711,12 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
       try {
         duringInspection(deadline,()=>{
           const members=recordsInGroup(database,record);
-          const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline});
+          const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline,...releaseAuthorityDependencies});
           if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
           const foreground=authority.kind==='native'&&releaseScope?.background!==true;
           const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
           lock(()=>{
-            if(!foreground)return releaseCommand(database,args,statePath,{deadline});
+            if(!foreground)return releaseCommand(database,args,statePath,{deadline,...releaseAuthorityDependencies});
             assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
             const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
               members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
