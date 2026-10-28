@@ -101,3 +101,18 @@ test('a queued unit with a lost reply is not falsely reported as started',()=>{
  const r=settleBackground({status:null,error:{code:'ETIMEDOUT'}},{...properties,LoadState:'loaded',ActiveState:'activating'},spec);
  assert.equal(r.ok,false);assert.equal(r.code,'background_launch_outcome_unknown');assert.equal(r.retry,false);
 });
+
+test('a definitely refused submission can retry, returning the log actually used by its new attempt',()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-refused-'));let starts=0;
+ const original={...input,argv:['/usr/local/bin/kenan-bg','--run','fixture','/tmp/refused.log','/bin/true']};
+ const execute=(cmd,args,options)=>{
+  if(cmd==='/usr/bin/flock')return spawnSync(cmd,args,options);
+  if(cmd==='/usr/bin/systemd-run'){starts++;return starts===1?{status:1,stderr:'Failed to connect to bus'}:{status:0};}
+  return {status:0,stdout:'LoadState=not-found\n'};
+ };
+ try{
+  assert.equal(launchOnce(original,binding,1000,spec,[],{root,execute}).code,'background_launch_refused');
+  const retry={...original,argv:[...original.argv]};retry.argv[3]='/tmp/accepted.log';
+  const r=launchOnce(retry,binding,1000,spec,[],{root,execute});assert.equal(r.ok,true);assert.equal(r.log,'/tmp/accepted.log');assert.equal(starts,2);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

@@ -65,7 +65,7 @@ export function launchOnce(input,binding,uid,spec,args,{root='/var/lib/pi-stack/
   if(saved&&(saved.identity!==identity||saved.channel!==binding.channel||saved.uid!==uid))return {ok:false,code:'background_name_conflict',retry:false,detail:'This name already belongs to a different command, directory or owner. Use its original status receipt.'};
   if(saved?.state==='accepted')return {...saved.response,reused:true};
   const write=value=>{const tmp=file+'.tmp';const out=fs.openSync(tmp,'w',0o600);try{fs.writeFileSync(out,JSON.stringify(value)+'\n');fs.fsyncSync(out);}finally{fs.closeSync(out);}fs.renameSync(tmp,file);const dir=fs.openSync(root,'r');try{fs.fsyncSync(dir);}finally{fs.closeSync(dir);}};
-  const log=saved?.log??(input.argv[1]==='--run'?input.argv[3]:null);
+  const log=saved?.state==='pending'?saved.log:(input.argv[1]==='--run'?input.argv[3]:null);
   const record={identity,channel:binding.channel,uid,log,state:'pending'};
   let result;
   if(!saved||saved.state==='refused'){
