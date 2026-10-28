@@ -1123,3 +1123,9 @@ the checkout being removed. Cleanup commands must use explicit workspace IDs or
 absolute paths. Other background commands keep their original working directory.
 The native safety census still protects actual process working directories,
 executables and open files inside a checkout.
+
+A background release retries typed checkout-lock and capacity-lock refusals for up to two minutes.
+The worker prints the final result rather than the transient intermediate results. An unknown child
+outcome is never retried automatically. A newly admitted continuation labels the old receipt as
+`previousReleaseSettlement`; an identical request after successful growth retirement returns
+`release-completed` with the new settlement and does not launch another worker.

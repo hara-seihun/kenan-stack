@@ -5675,7 +5675,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE) {
                 if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
                 try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
               }});
-            print(result,true);process.exitCode=result.action==='already-released'?0:75;
+            print(result,true);process.exitCode=result.action==='already-released'||result.completed===true?0:75;
           });
         });
       }catch(error){

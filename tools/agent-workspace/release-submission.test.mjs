@@ -54,3 +54,17 @@ test('documented preserve-runtime continuation retains original identity and is 
  assert.deepEqual(JSON.parse(row.request_json),request);
  assert.deepEqual(JSON.parse(row.continuations_json)[0].request,base.request);
 }));
+
+test('a capacity continuation never returns the old lock-busy result as its current settlement',()=>fixture((base,count)=>{
+ const first=submitRelease(base);
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:75}));
+ const old={kind:'completed',result:{futureGrowthSettlement:{kind:'retained',code:'workspace-capacity-lock-busy'}}};
+ const retry=submitRelease({...base,settlement:old,observe:()=>({ceased:true})});
+ assert.equal(count(),2);assert.equal(retry.requestId,first.requestId);
+ assert.equal(retry.releaseSettlement,undefined);assert.deepEqual(retry.previousReleaseSettlement,old);
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0}));
+ const current={kind:'completed',result:{futureGrowthSettlement:{kind:'retired',sequence:631}}};
+ const done=submitRelease({...base,settlement:current});
+ assert.equal(done.completed,true);assert.equal(done.action,'release-completed');assert.deepEqual(done.result,current.result);
+ assert.equal(count(),2);assert.equal(done.requestId,first.requestId);
+}));

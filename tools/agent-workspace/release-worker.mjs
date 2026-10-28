@@ -2,22 +2,15 @@
 import {spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 import {nativeCaller} from './native-owner.mjs';
-import {setTimeout} from 'node:timers/promises';
+import {runReleaseWorker} from './release-retry.mjs';
 const [cli,state,...argv]=process.argv.slice(2);
 // The immutable worker inherits only the root-created background identity; main
 // authenticates it normally. Busy acquisition never begins a physical transition.
-let known=false,lastReceipt;
-for(let attempt=0;attempt<20;attempt++){
- const result=spawnSync(process.execPath,[cli,...argv],{encoding:'utf8',env:{...process.env,PI_WORKSPACE_STATE:state},timeout:180000,maxBuffer:8<<20});
- process.stdout.write(result.stdout??'');process.stderr.write(result.stderr??'');
- try{lastReceipt=JSON.parse(result.stdout);}catch{lastReceipt=null;}
- if(result.error||result.signal){console.error(JSON.stringify({ok:false,code:'release-worker-outcome-unknown',retry:false,next:'Reconcile the original release journal before continuation.'}));process.exitCode=75;break;}
- if(result.status!==75){process.exitCode=result.status;known=Boolean(lastReceipt)&&(result.status===0||result.status===2);break;}
- let receipt;try{receipt=JSON.parse(result.stdout);}catch{}
- if(receipt?.error?.code!=='release-resource-busy'){process.exitCode=75;break;}
- if(attempt===19){process.exitCode=75;known=true;break;}
- await setTimeout(250);
-}
+const outcome=await runReleaseWorker(()=>spawnSync(process.execPath,[cli,...argv],{encoding:'utf8',env:{...process.env,PI_WORKSPACE_STATE:state},timeout:180000,maxBuffer:8<<20}));
+const {known,receipt:lastReceipt,result}=outcome;
+process.stdout.write(result.stdout??'');process.stderr.write(result.stderr??'');
+process.exitCode=outcome.exitCode;
+if(result.error||result.signal)console.error(JSON.stringify({ok:false,code:'release-worker-outcome-unknown',retry:false,next:'Reconcile the original release journal before continuation.'}));
 
 // A refusal before any authorization-dependent effect leaves nothing to reconcile; record it so the
 // original custodian's authenticated rerun can continue instead of waiting on a unit that never ran.

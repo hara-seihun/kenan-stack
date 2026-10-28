@@ -25,6 +25,14 @@ export function submitRelease({database,record,request,binding,launch,settlement
    settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
    continuation:'After reconciling the original terminal effect, the authenticated current custodian may settle retained disposal in this background route. Normal custody and physical safety checks still apply; this does not replace the original submission or settlement.'}};
 
+ // A successful retry must return its new settled result, not replay a launch or
+ // expose the pre-continuation capacity refusal as the current settlement.
+ if(row?.state==='terminal-known' && JSON.stringify(originalRequest)===requestText &&
+    JSON.parse(row.terminal_json??'{}').exitCode===0 && settlement.kind==='completed' &&
+    settlement.result?.futureGrowthSettlement?.kind==='retired')
+  return {ok:true,action:'release-completed',completed:true,requestId:row.request_id,
+   workspaceId:record.id,result:settlement.result,releaseSettlement:settlement};
+ let launchedNow=false;
  let continueKnown=false;
  if(row?.state==='terminal-known')continueKnown=observe(row).ceased===true;
  if(!row||continueKnown){
@@ -36,6 +44,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
   }
   row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
   // The durable reservation precedes detachment. A lost launch response is never retried blindly.
+  launchedNow=true;
   let result;
   try {result=launch(name,requestId);}catch(error){result={ok:false,code:'release-launch-outcome-unknown',detail:error.code??error.name};}
   database.prepare('UPDATE workspace_release_submission SET state=?,launch_json=? WHERE workspace_id=? AND request_id=?')
@@ -44,6 +53,6 @@ export function submitRelease({database,record,request,binding,launch,settlement
  }
  return {ok:true,action:'release-submitted',completed:false,state:row.state,requestId:row.request_id,
   workspaceId:record.id,unitName:row.unit_name,originalBinding:JSON.parse(row.binding_json),launch:JSON.parse(row.launch_json??'null'),
-  releaseSettlement:settlement,nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],settleInAuthenticatedBackground:['agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
+  ...(launchedNow?{previousReleaseSettlement:settlement}:{releaseSettlement:settlement}),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],settleInAuthenticatedBackground:['agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
    continuation:'If the recorded unit ended without a completed settlement, reconcile its log and original journal, then use that journal\'s exact settlement command in an authenticated background call.'}};
 }
