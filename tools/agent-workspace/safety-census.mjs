@@ -210,7 +210,13 @@ export function dockerSnapshot(execute = run, { env = process.env, endpointScope
 export function inertCompletedUnit(properties) {
   return properties.get("ActiveState") === "active" && properties.get("SubState") === "exited"
     && properties.get("MainPID") === "0" && properties.get("ControlPID") === "0" && properties.get("ControlGroup") === ""
-    && properties.get("ExecStop") === "" && properties.get("ExecStopPost") === "" && properties.get("TriggeredBy") === "";
+    && emptyExecList(properties, "ExecStop") && emptyExecList(properties, "ExecStopPost") && properties.get("TriggeredBy") === "";
+}
+// systemctl show omits an exec property that has no commands, even when it is requested by name (observed on
+// converge-kenan, October 29: finished converge-heavy wrappers printed no ExecStop line, so they stayed references
+// forever). A manager that prints the requested ControlGroup and TriggeredBy is new enough that absence means empty.
+function emptyExecList(properties, name) {
+  return properties.has(name) ? properties.get(name) === "" : properties.has("ControlGroup") && properties.has("TriggeredBy");
 }
 
 export function parseSystemdUnits(output, manager) {

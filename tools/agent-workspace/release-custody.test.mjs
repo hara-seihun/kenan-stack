@@ -95,8 +95,8 @@ test('one transition shares remote custody, but rechecks every local branch and 
  }finally{process.env.PATH=oldPath;}
 }));
 
-test('tracked Husky prepare owns only ignored internal hooks, not arbitrary ignored evidence',()=>fixture(f=>{
- fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:'husky'}}));
+for(const prepare of ['husky','husky install','husky || true','husky install || :'])test('tracked Husky prepare "'+prepare+'" owns only ignored internal hooks, not arbitrary ignored evidence',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare}}));
  fs.appendFileSync(path.join(f.source,'.gitignore'),'\.husky/_/\n');
  f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','tracked prepare');f.git('-C',f.source,'push','origin','main');
  fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/h'),'generated hooks');
@@ -104,9 +104,9 @@ test('tracked Husky prepare owns only ignored internal hooks, not arbitrary igno
  const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.ok(result.cacheDisposition.paths.includes('.husky/_'));
  assert.equal(fs.existsSync(path.join(f.source,'.husky/_')),false);assert.equal(fs.readFileSync(path.join(f.source,'private-evidence/proof'),'utf8'),'valuable');
 }));
-for(const kind of ['untracked','different-generator'])test('Husky inference refuses '+kind+' prepare source',()=>fixture(f=>{
+for(const kind of ['untracked','different-generator','chained-command'])test('Husky inference refuses '+kind+' prepare source',()=>fixture(f=>{
  fs.appendFileSync(path.join(f.source,'.gitignore'),'.husky/_/\n');f.git('-C',f.source,'commit','-am','ignore generated');
- fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:kind==='untracked'?'husky':'custom-tool'}}));
+ fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:kind==='untracked'?'husky':kind==='chained-command'?'husky && custom-tool':'custom-tool'}}));
  if(kind!=='untracked'){f.git('-C',f.source,'add','package.json');f.git('-C',f.source,'commit','-m','different generator');}f.git('-C',f.source,'push','origin','main');
  fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/proof'),'preserve');
  assert.equal(f.release().physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'.husky/_/proof')),true);

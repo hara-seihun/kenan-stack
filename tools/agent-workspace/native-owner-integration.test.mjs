@@ -164,3 +164,22 @@ test('a failed caller authentication cannot acquire ended-owner custody',()=>fix
  f.bind();f.observe('stopped');const result=workspaceTesting.releaseEndedOwnersCommand(f.db,f.args([['id',f.record.id],['execute',true]]),f.state,{caller:()=>({ok:false,error:{code:'release-caller-unverified'}})});
  assert.equal(result.error.code,'release-caller-unverified');assert.equal(fs.existsSync(f.source),true);assert.equal(nativeOwnerBinding(f.db,f.record.id).agentId,AGENT);
 }));
+
+// Regression (workspace d639034e, October 29): a labelled checkout bound to a sub-agent by its
+// creation receipt moved to the ended parent worker, then to the manager; the next reaper pass
+// re-bound the original sub-agent from the receipt and handed it back down, forever.
+test('custody moved up an ended chain is never re-bound to the original creator',()=>fixture(f=>{
+ const worker='99999999-9999-4999-8999-999999999999',file=path.join(f.root,'native.json');
+ f.receipt(f.record);f.observe('stopped');
+ const value=JSON.parse(fs.readFileSync(file));
+ value.agents[0].parentAgentId=worker;
+ value.agents.push({id:worker,parentAgentId:'manager:converge',channel:'beta',role:'worker',state:'stopped',archived:true});
+ value.agents.push({id:'manager:converge',channel:'beta',role:'manager',state:'running',archived:false});
+ fs.writeFileSync(file,JSON.stringify(value));
+ const owners=[];
+ for(let pass=0;pass<4;pass++){f.reaper();owners.push(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner);}
+ assert.deepEqual(owners,[worker,'manager:converge','manager:converge','manager:converge'],JSON.stringify(owners));
+ assert.equal(nativeOwnerBinding(f.db,f.record.id).state,'unset');
+ const bind=f.run(['bind-native-owners','--id',f.record.id,'--execute','--json']);assert.equal(bind.results[0].outcome,'custody-transferred',JSON.stringify(bind));
+ assert.equal(fs.existsSync(f.source),true);
+}));

@@ -2382,6 +2382,8 @@ test("a finished RemainAfterExit wrapper is not a workspace reference unless som
     ["stopper.service", inert.replace("ExecStop=", "ExecStop={ path=/bin/sh ; argv[]=/bin/sh -c rm ; }"), true],
     ["timer-driven.service", inert.replace("TriggeredBy=", "TriggeredBy=timer-driven.timer"), true],
     ["older-manager.service", "SubState=exited\nMainPID=0", true],
+    // Current systemd omits empty exec lists from show output even when requested.
+    ["omitted-empty-exec.service", inert.replace("ExecStop=\n", "").replace("ExecStopPost=\n", ""), false],
   ];
   const units = workspaceTesting.parseSystemdUnits(cases.map(([id, extra]) => unit(id, extra)).join("\n\n"), "user");
   const references = workspaceTesting.systemdReferences(workspace, { units, available: true }).references.map(({ id }) => id);

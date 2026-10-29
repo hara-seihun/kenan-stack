@@ -1048,7 +1048,9 @@ function repositoryPrepareCachePaths(workspacePath) {
     const pkg = JSON.parse(manifest.stdout);
     // Only the known Husky generator owns this exact internal directory. Read
     // committed source, never an untracked or locally edited prepare script.
-    if (!/^husky(?: install)?$/.test(pkg.scripts?.prepare ?? "")) return [];
+    // Also the common tolerant forms ("husky || true", "husky install || :"), which only
+    // suppress a failure when Git hooks cannot be installed (blitz2-link-liminal-be).
+    if (!/^husky(?: install)?(?:\s*\|\|\s*(?:true|:|exit 0))?$/.test((pkg.scripts?.prepare ?? "").trim())) return [];
     return repositoryOwnedCachePaths(workspacePath, [".husky/_=package.json"]);
   } catch { return []; }
 }
@@ -4387,7 +4389,13 @@ function bindNativeOwnersCommand(database, args, statePath, {authenticate=authen
   // Do not deserialize every historical creation request just to authenticate one small page.
   database.function("workspace_native_id",{deterministic:true},value=>OWNER_AGENT_ID.test(value??"")?1:0);
   const root=one(args,"root")===undefined?null:path.resolve(one(args,"root"));
-  const predicate="state!='released' AND workspace_native_id(owner)=0 AND NOT EXISTS(SELECT 1 FROM workspace_native_owner n WHERE n.workspace_id=workspace.id) AND (? IS NULL OR root=?)";
+  // A creation receipt names the original creator. Once release-ended-owners has moved custody
+  // (to a parent or a requester), that creator is history, not the owner: re-binding it made the
+  // sweep hand the checkout back down to the ended child and up to its parent again, forever
+  // (workspace d639034e, October 29). Records with recorded custody transfer are never re-bound.
+  const custodyTable=database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_parent_custody'").get()!==undefined;
+  const predicate="state!='released' AND workspace_native_id(owner)=0 AND NOT EXISTS(SELECT 1 FROM workspace_native_owner n WHERE n.workspace_id=workspace.id)"+
+    (custodyTable?" AND NOT EXISTS(SELECT 1 FROM workspace_parent_custody c WHERE c.workspace_id=workspace.id)":"")+" AND (? IS NULL OR root=?)";
   const candidates=targeted?1:database.prepare("SELECT count(*) AS count FROM workspace WHERE "+predicate).get(root,root).count;
   let page;
   if(targeted)page=[recordBy(database,selectorFrom(args,"bind-native-owners"))];
@@ -4405,6 +4413,7 @@ function bindNativeOwnersCommand(database, args, statePath, {authenticate=authen
     if (OWNER_AGENT_ID.test(record.owner)) { last=record.id;examined++;results.push({ record: summary, outcome: "native-registered-owner" }); continue; }
     const existing = nativeOwnerBinding(database, record.id);
     if (existing.state === "set") { last=record.id;examined++;results.push({ record: summary, outcome: "already-bound", binding: existing }); continue; }
+    if (custodyTable && database.prepare("SELECT 1 FROM workspace_parent_custody WHERE workspace_id=?").get(record.id)) { last=record.id;examined++;results.push({ record: summary, outcome: "custody-transferred" }); continue; }
     const row = database.prepare("SELECT creation_request FROM workspace WHERE id=?").get(record.id);
     const receipt = row?.creation_request ? admissionReceipts(statePath, record.id, row.creation_request, {deadline}) : { kind: "none", code: "no-creation-request" };
     // Every receipt for a record must authenticate together. Do not split a record's proof.
