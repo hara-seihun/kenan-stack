@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
-import {observeInodeContent,withContentObservation} from './inode-content.mjs';
+import {observeInodeContent,withContentObservation,pruneInodeContent} from './inode-content.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {assertIdleGrowth} from './idle-growth.mjs';
 const H=3600000;
@@ -65,4 +65,15 @@ test('incomplete content hash pauses the cursor without publishing a fake recent
  const paused=allocationSlice(root,device,null,{observeContent:f=>{if(f===file)throw Object.assign(Error('budget'),{code:'content-proof-deadline'});return 0;}});
  assert.equal(paused.partial,true);assert.ok(paused.state.pending.includes(file));assert.equal(paused.state.lastWriteAt,0);
  const resumed=allocationSlice(root,device,paused.state,{observeContent:()=>123});assert.equal(resumed.ok,true);assert.equal(resumed.lastWriteAt,123);
+});
+test('retention drops evidence of deleted or replaced inodes and of old unbound rows, and keeps live evidence',t=>{
+ const {root,file}=fixture(t),db=new DatabaseSync(path.join(root,'proof.sqlite'));t.after(()=>db.close());
+ const gone=path.join(root,'gone'),replaced=path.join(root,'replaced');fs.writeFileSync(gone,'gone');fs.writeFileSync(replaced,'old');
+ withContentObservation(db,{},observe=>{for(const f of [file,gone,replaced])observe(f);return {};});
+ fs.unlinkSync(gone);fs.unlinkSync(replaced);fs.writeFileSync(path.join(root,'spacer'),'x');fs.writeFileSync(replaced,'new');
+ const insert=db.prepare('INSERT INTO workspace_inode_content VALUES(?,?)');
+ insert.run('1:1:1',JSON.stringify({version:1,observedAt:Date.now()-8*24*H}));insert.run('1:2:1',JSON.stringify({version:1,observedAt:Date.now()}));
+ assert.deepEqual(pruneInodeContent(db),{removed:3,kept:2});
+ const live=fs.lstatSync(file,{bigint:true});
+ assert.deepEqual(db.prepare('SELECT identity FROM workspace_inode_content ORDER BY identity').all().map(r=>r.identity),['1:2:1',`${live.dev}:${live.ino}:${live.birthtimeNs}`].sort());
 });

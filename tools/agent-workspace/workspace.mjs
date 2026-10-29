@@ -7,7 +7,7 @@ import {ownerFutureWrites,observeCapacityChildren,capacityOwnerProjection} from 
 import {admitWithRefresh} from './admission-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {assertIdleGrowth,assertIdleObservation} from './idle-growth.mjs';
-import {withContentObservation} from './inode-content.mjs';
+import {withContentObservation,pruneInodeContent} from './inode-content.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {prepareFrozenObjectCustody} from './frozen-object-custody.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
@@ -26,6 +26,7 @@ import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contrac
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
+import { shareMirrorPacks, configuredLocalSources } from "./mirror-pack-sharing.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -2637,6 +2638,20 @@ function stabilizeObjectCustody(workspace, alternates, execute, statePath) {
 
 const closureEnvironment = { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1", GIT_ALTERNATE_OBJECT_DIRECTORIES: "" };
 
+const IMMUTABLE_PACK_FILE = /^pack-[0-9a-f]{40,64}\.(pack|idx|rev|bitmap)$/u;
+
+// Same-filesystem local sources lend their packs to the mirror by hard link
+// (mirror-pack-sharing.mjs), so a local import copies no object bytes.
+function shareLocalMirrorPacks(statePath, mirror, sources) {
+  const shared = shareMirrorPacks({ mirror, sources: [...sources, ...configuredLocalSources(mirror)],
+    exclusive: action => {
+      try { return withResourceLock(statePath, `mirror-pack-share:${mirror}`, action, undefined, { waitMs: 1000 }); }
+      catch (error) { if (error instanceof ResourceBusyError) return null; throw error; }
+    } });
+  if (!shared.ok) process.stderr.write(`agent-workspace: mirror pack sharing skipped for ${mirror}: ${shared.error.code}: ${shared.error.detail}\n`);
+  return shared;
+}
+
 function objectStoreStamp(mirror) {
   const objects = path.join(mirror, "objects");
   if (!existsSync(objects)) return null;
@@ -2647,11 +2662,19 @@ function objectStoreStamp(mirror) {
       digest.update(`${file}\0${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}\n`);
     } catch (error) { if (error.code !== "ENOENT") throw error; digest.update(`${file}\0absent\n`); }
   };
+  // Pack files never change in place. A source sharing them by hard link freshens
+  // their times on every push; that is not a change to the mirror's objects.
+  const addImmutable = file => {
+    try {
+      const s = statSync(file, { bigint: true });
+      digest.update(`${file}\0${s.dev}:${s.ino}:${s.size}\n`);
+    } catch (error) { if (error.code !== "ENOENT") throw error; digest.update(`${file}\0absent\n`); }
+  };
   add(objects);
   for (let byte = 0; byte < 256; byte++) add(path.join(objects, byte.toString(16).padStart(2, "0")));
   for (const directory of ["pack", "info"]) {
     const root = path.join(objects, directory); add(root);
-    if (existsSync(root)) for (const name of readdirSync(root).sort()) add(path.join(root, name));
+    if (existsSync(root)) for (const name of readdirSync(root).sort()) (directory === "pack" && IMMUTABLE_PACK_FILE.test(name) ? addImmutable : add)(path.join(root, name));
   }
   for (const name of ["shallow", "config"]) add(path.join(mirror, name));
   return digest.digest("hex");
@@ -2770,13 +2793,16 @@ function resolveSource(statePath, mirror, repository, upstream, ref, sparsePatte
     const shared = cachedImmutableSource(mirror, repository, ref, sparsePatterns);
     if (shared !== null) return shared;
     if (existsSync(path.join(mirror, "objects", "info", "alternates"))) fail(`shared mirror must own its objects independently: ${mirror}`);
-    if (/^[0-9a-f]{40}$/u.test(ref) && existsSync(mirror)
+    const existed = existsSync(mirror);
+    if (existed) shareLocalMirrorPacks(statePath, mirror, [repository, upstream?.fetch]);
+    if (/^[0-9a-f]{40}$/u.test(ref) && existed
       && hasObjectClosure(mirror, ref, sparsePatterns)) {
       return ensureSourceCustody(mirror, repository, ref, ref, sparsePatterns);
     }
     if (sourcePreparationMode === "foreground") throw new SourcePreparationRequired();
     publishSourcePhase({ phase: "importing", commit: ref });
     prepareMirror(statePath, mirror, repository, upstream);
+    if (!existed) shareLocalMirrorPacks(statePath, mirror, [repository, upstream?.fetch]);
     if (/^[0-9a-f]{4,39}$/u.test(ref)) {
       withResourceLock(statePath, `mirror-origin:${mirror}`, () =>
         run("git", ["--git-dir", mirror, "fetch", "--prune", "--no-tags", "--no-write-fetch-head", "origin"], { timeout: 120_000 }));
@@ -2859,13 +2885,18 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
     resolved = commit.stdout;
   }
   const sourceRef = sourceRefFor(repository, ref);
-  const bases = existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : [];
-  // Negotiate only independently complete ancestry; damaged/unknown custody needs full refetch.
-  // Git skips wanting a commit object it already has, so a present commit with missing trees or blobs is never repaired by negotiation.
+  // Negotiate from independently complete ancestry when there is one, else from the mirror's refs.
+  // Git skips wanting a commit object it already has, so a present commit with missing trees or blobs is repaired only by --refetch.
   const commitPresent = /^[0-9a-f]{40,64}$/u.test(resolved) && command("git", ["--git-dir", mirror, "cat-file", "-e", `${resolved}^{commit}`]).status === 0;
-  const negotiation = bases.length && !commitPresent ? bases.map(tip => `--negotiation-tip=${tip}`) : ["--refetch"];
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
-  run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--update-shallow", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  const fetch = negotiation => run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--update-shallow", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
+  // A present commit with its whole closure needs no transfer (shared local packs land here).
+  // Otherwise fetch incrementally and prove the closure; only a proved gap pays for --refetch,
+  // which copies the commit's entire history.
+  if (!(commitPresent && hasObjectClosure(mirror, resolved, sparsePatterns))) {
+    if (!commitPresent) fetch((existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : []).map(tip => `--negotiation-tip=${tip}`));
+    if (!hasObjectClosure(mirror, resolved, sparsePatterns)) fetch(["--refetch"]);
+  }
   publishSourcePhase({ phase: "verifying", commit: resolved });
   return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
 }
@@ -5571,6 +5602,8 @@ function help() {
   agent-workspace cache-plan --id ID --path PATH --owner OWNER --cache RELATIVE --classification node-dependencies|declared-build-cache --operation-id ID --evidence TEXT --json
   agent-workspace retire-cache --id ID --path PATH --owner OWNER --request FILE --request-sha256 SHA --json
   agent-workspace retire-cache-status (--id ID|--stage STAGING_NAME) --json
+  agent-workspace share-mirror-packs [--mirror MIRROR_GIT_DIR ...] --json
+  agent-workspace prune-inode-content --json
   agent-workspace retire-source-materialization --id ID --path PATH --owner OWNER --request ABS_FILE --request-sha256 SHA --json
   agent-workspace retire-growth ${selectorSyntax("retire-growth")} --owner OWNER --disposition FILE --disposition-sha256 SHA [--json]
   agent-workspace resume-growth ${selectorSyntax("resume-growth")} --owner OWNER --expected-plan-sha256 SHA --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
@@ -5676,6 +5709,18 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
   if (commandName === 'maintain') {
     const selected = selectedArguments(commandName, {id:one(args,'id'),path:one(args,'path')});
     if (!selected.ok) throw Object.assign(new CliError(selected.error.detail), {code:selected.error.code,nextAction:selected.error.nextAction});
+  }
+  if (commandName === "share-mirror-packs") {
+    assertOnly(args, ["mirror", "json"]);
+    const root = path.join(path.dirname(statePath), "mirrors");
+    const mirrors = many(args, "mirror").length ? many(args, "mirror").map(mirror => path.resolve(mirror))
+      : existsSync(root) ? readdirSync(root).filter(name => name.endsWith(".git")).sort().map(name => path.join(root, name)) : [];
+    const results = mirrors.map(mirror => {
+      try { return { mirror, ...withResourceLock(statePath, `mirror:${mirror}`, () => shareLocalMirrorPacks(statePath, mirror, []), undefined, { mode: "shared", waitMs: 5000 }) }; }
+      catch (error) { if (error instanceof ResourceBusyError) return { mirror, ok: false, error: { code: "mirror-busy", detail: error.message } }; throw error; }
+    }).filter(result => !result.ok || !["no-local-source", "not-applicable"].includes(result.value.state));
+    print({ ok: results.every(result => result.ok), freedBytes: results.reduce((total, result) => total + (result.value?.freedBytes ?? 0), 0), mirrors: results }, true);
+    return;
   }
   if (commandName === "source-status" || commandName === "job-status") {
     assertOnly(args, ["job-id", "json"]);
@@ -5810,6 +5855,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
       }, record.groupId);
     }
     else if (commandName === "reconcile") reconcileCommand(database, args, statePath);
+    else if (commandName === "prune-inode-content") { assertOnly(args, ["json"]); print({ ok: true, ...pruneInodeContent(database) }, true); }
     else if (["bind-native-owners","release-ended-owners","reap-ended-owners"].includes(commandName)) {
       const result=commandName==="bind-native-owners"?bindNativeOwnersCommand(database,args,statePath):commandName==="release-ended-owners"?releaseEndedOwnersCommand(database,args,statePath):reapEndedOwnersCommand(database,args,statePath);
       print(result,true);if(!result.ok)process.exitCode=75;

@@ -6,6 +6,10 @@ import {createHash} from 'node:crypto';
 const encode=s=>Object.fromEntries(['dev','ino','birthtimeNs','mtimeNs','ctimeNs','nlink','size','blocks','mode','uid','gid'].map(k=>[k,String(s[k])]));
 const same=(a,b,keys=Object.keys(a))=>keys.every(k=>a[k]===b[k]);
 const payloadKeys=['dev','ino','birthtimeNs','mtimeNs','size','blocks','mode','uid','gid'];
+const identityOf=s=>`${s.dev}:${s.ino}:${s.birthtimeNs}`;
+const identityAt=file=>{try{return identityOf(fs.lstatSync(file,{bigint:true}));}catch(error){if(error.code==='ENOENT'||error.code==='ENOTDIR')return null;throw error;}};
+// Evidence names one path of its inode so retention can tell a live inode from a deleted one.
+const bound=(record,file,s)=>record.path!==undefined&&(record.path===file||identityAt(record.path)===identityOf(s))?record:{...record,path:file};
 const valid=r=>r?.version===1&&r.metadata&&/^[a-f0-9]{64}$/.test(r.sha256)&&Number.isSafeInteger(r.lastPayloadWriteAt)&&r.lastPayloadWriteAt>=0;
 export function observeInodeContent(file,prior,{deadline=Date.now()+1000}={}) {
  const initial=fs.lstatSync(file,{bigint:true});const raw=Math.ceil(Number(initial.ctimeNs)/1e6);
@@ -22,10 +26,10 @@ export function observeInodeContent(file,prior,{deadline=Date.now()+1000}={}) {
   sha256=hash.digest('hex');
   if(!same(metadata,encode(fs.fstatSync(fd,{bigint:true})))||!same(metadata,encode(fs.lstatSync(file,{bigint:true}))))return unknown();
  }finally{fs.closeSync(fd);}
- if(valid(prior)&&same(metadata,prior.metadata)&&sha256===prior.sha256)return {lastWriteAt:prior.lastPayloadWriteAt,record:prior};
+ if(valid(prior)&&same(metadata,prior.metadata)&&sha256===prior.sha256)return {lastWriteAt:prior.lastPayloadWriteAt,record:bound(prior,file,initial)};
  const linkOnly=valid(prior)&&prior.metadata.nlink!==metadata.nlink&&same(metadata,prior.metadata,payloadKeys)&&sha256===prior.sha256;
  const lastPayloadWriteAt=linkOnly?prior.lastPayloadWriteAt:Math.max(raw,Math.ceil(Number(initial.mtimeNs)/1e6));
- const record={version:1,metadata,sha256,lastPayloadWriteAt,observedAt:Date.now(),
+ const record={version:1,path:file,metadata,sha256,lastPayloadWriteAt,observedAt:Date.now(),
   ...(linkOnly?{linkOnlyProof:{previousMetadata:prior.metadata,previousSha256:prior.sha256,previousObservedAt:prior.observedAt,previousLastPayloadWriteAt:prior.lastPayloadWriteAt}}:{})};
  return {lastWriteAt:lastPayloadWriteAt,record};
 }
@@ -67,4 +71,24 @@ export function contentObserver(database,{deadline=Date.now()+1000}={}) {
 export function withContentObservation(database,options,run){
  const observe=contentObserver(database,options);
  try{const result=run(observe);return result&&typeof result==='object'?{...result,writeObservationComplete:result.writeObservationComplete!==false&&observe.complete}:result;}finally{observe.flush();}
+}
+
+// Drop evidence for inodes that no longer exist: the recorded path is gone or names
+// another inode. Evidence written before paths were recorded is kept until it is
+// re-observed (which binds a path) or is older than unboundAgeMs. Dropping evidence
+// is conservative: an unproved inode reads as recently written.
+export function pruneInodeContent(database,{now=Date.now(),unboundAgeMs=7*86400000,batch=4096}={}) {
+ database.exec('CREATE TABLE IF NOT EXISTS workspace_inode_content(identity TEXT PRIMARY KEY, evidence_json TEXT NOT NULL)');
+ const doomed=[];let kept=0;
+ for(const row of database.prepare("SELECT identity, json_extract(evidence_json,'$.path') AS path, json_extract(evidence_json,'$.observedAt') AS observedAt FROM workspace_inode_content").iterate()){
+  const stale=typeof row.path==='string'?identityAt(row.path)!==row.identity:!(Number(row.observedAt)>=now-unboundAgeMs);
+  if(stale)doomed.push(row.identity);else kept++;
+ }
+ const remove=database.prepare('DELETE FROM workspace_inode_content WHERE identity=?');
+ for(let index=0;index<doomed.length;index+=batch){
+  database.exec('BEGIN IMMEDIATE');
+  try{for(const identity of doomed.slice(index,index+batch))remove.run(identity);database.exec('COMMIT');}
+  catch(error){database.exec('ROLLBACK');throw error;}
+ }
+ return {removed:doomed.length,kept};
 }
