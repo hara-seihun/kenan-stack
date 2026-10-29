@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import {nativeCaller, nativeOwnerBinding, admissionReceipts, authenticateToolCalls, receiptBinding} from './native-owner.mjs';
 import {OWNER_AGENT_ID,NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
+import {serverChannel} from './cache-queue.mjs';
 
 const refused = (code, detail) => ({ok:false, error:{code, detail}});
-const server = /^\/srv\/kenan\/[a-z][a-z0-9-]{0,23}\/dist\/server\/main\.js$/;
 
 // A failed native identity observation must not turn into the historical operator route.
 // Neither argv flags nor environment variables select that route.
@@ -16,7 +16,7 @@ export function releaseCaller({caller=nativeCaller, pid=process.pid,
     const binding=caller({onError:error=>{diagnostic=error;}});
     if(binding!==null)return {ok:true, kind:'native', binding};
     for(let current=pid, depth=0;current>1&&depth<64;depth++) {
-      if(cgroup(current).includes('/agent-tool-')||/\/kenan-bg-(?:[a-f0-9]{8}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})-/.test(cgroup(current))||server.test(argv(current)[1]??''))
+      if(cgroup(current).includes('/agent-tool-')||/\/kenan-bg-(?:[a-f0-9]{8}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})-/.test(cgroup(current))||serverChannel(argv(current))!==null)
         return {...refused('release-caller-unverified','The native tool context exists, but its authenticated caller identity is unavailable.'+(diagnostic?` ${diagnostic.code}: ${diagnostic.detail}`:'')),...(diagnostic?{diagnostic}: {})};
       const up=parent(current);
       if(!Number.isSafeInteger(up)||up<1||up===current)

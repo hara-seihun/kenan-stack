@@ -37,3 +37,8 @@ test('missing, foreign and unreadable server ancestry have explicit causes, not 
  }
  const errors=[];assert.equal(nativeCaller({caller:()=>({...binding,callId:'forged|shape'}),onError:e=>errors.push(e)}),null);assert.equal(errors[0].code,'caller-binding-invalid');
 });
+test('a server started with node options before its script (kenan@.service passes --max-old-space-size) is still the caller server',()=>{
+ const live=['/usr/local/bin/node','--max-old-space-size=12288','/srv/kenan/beta/dist/server/main.js','/etc/kenan/beta.json'];
+ assert.deepEqual(callerToolCall({...io,argv:()=>live,scope:scope(query({}))}),binding);
+ assert.equal(releaseCaller({caller:()=>null,pid:10,cgroup:()=>'0::/system.slice/x.service\n',parent:p=>p===10?9:1,argv:p=>p===9?[...live,'']:['bash']}).error.code,'release-caller-unverified');
+});

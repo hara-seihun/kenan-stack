@@ -13,6 +13,8 @@ export const KENAN_STACK_ROOT='/srv/kenan';
 export const KENAN_PG_SOCKET_DIR='/run/kenan/pg';
 const CHANNEL=/^[a-z][a-z0-9-]{0,23}$/;
 const SERVER=/^\/srv\/kenan\/([a-z][a-z0-9-]{0,23})\/dist\/server\/main\.js$/;
+// Node takes its options before the script (the units pass e.g. --max-old-space-size=12288), so the script is the first non-option argument.
+export const serverChannel=args=>args.slice(1).find(arg=>!arg.startsWith('-'))?.match(SERVER)?.[1]??null;
 const literal=value=>"'"+value.replaceAll("'","''")+"'";
 
 export function kenanChannels(stackRoot=KENAN_STACK_ROOT) {
@@ -59,8 +61,8 @@ export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,
   if(!observed.unit.startsWith(`agent-tool-${observed.channel}-`))return fail('caller-scope-channel-mismatch','The scope unit does not match its declared channel.');
   for(let current=pid,depth=0;current>1&&depth<64;depth++){
    const up=parent(current);if(!(up>1))return fail('caller-server-ancestor-missing','No root-owned native server remains in the caller ancestry.');
-   const server=argv(up)[1]?.match(SERVER);
-   if(server&&uid(up)===0)return server[1]===observed.channel?{channel:server[1],callId:observed.callId,agentId:observed.agentId}:fail('caller-server-channel-mismatch','The root-owned server belongs to another channel.');
+   const server=serverChannel(argv(up));
+   if(server!==null&&uid(up)===0)return server===observed.channel?{channel:server,callId:observed.callId,agentId:observed.agentId}:fail('caller-server-channel-mismatch','The root-owned server belongs to another channel.');
    current=up;
   }
  }catch(error){return fail('caller-observation-failed',`Native caller inspection failed (${error.code??error.name}).`);}
