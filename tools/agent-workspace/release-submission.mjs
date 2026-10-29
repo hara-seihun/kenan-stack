@@ -45,20 +45,29 @@ export function submitRelease({database,record,request,binding,launch,settlement
    workspaceId:record.id,result:settlement.result,releaseSettlement:settlement};
  let launchedNow=false;
  let continueKnown=false;
+ // Before continuation launches had their own names, a same-agent continuation reused the
+ // already-accepted background launch of that name and never ran; its row stayed 'submitted'
+ // on an ended unit. That is a known non-launch, so it may continue once the unit ceased.
+ const reusedContinuation=row?.state==='submitted'&&JSON.parse(row.launch_json??'null')?.reused===true&&JSON.parse(row.continuations_json??'[]').length>0;
  if(adoptedContinuation)continueKnown=true;
- else if(row?.state==='terminal-known')continueKnown=observe(row).ceased===true;
+ else if(row?.state==='terminal-known'||reusedContinuation)continueKnown=observe(row).ceased===true;
  if(!row||continueKnown){
   const requestId=row?.request_id??randomUUID(),name=row?.unit_name??'aw-release-'+createHash('sha256').update(record.id+requestText).digest('hex').slice(0,32);
+  // Background launches are idempotent per name, so every continuation launches under its
+  // own name (the original unit_name stays recorded); reusing the name would return the
+  // earlier accepted launch without running anything.
+  let launchName=name;
   if(!row)database.prepare('INSERT INTO workspace_release_submission(workspace_id,request_id,request_json,binding_json,unit_name,state,launch_json) VALUES(?,?,?,?,?,?,NULL)').run(record.id,requestId,requestText,JSON.stringify(binding),name,'launch-unknown');
   else {
    const history=JSON.parse(row.continuations_json??'[]');history.push({priorTerminal:JSON.parse(row.terminal_json??'null')??{state:row.state,ceased:true},binding,request,continuedAt:Date.now(),...(adoptedContinuation?{custodyAdoptedFrom:originalRequest.owner}:{})});
+   launchName=`${name}-c${history.length}`;
    database.prepare("UPDATE workspace_release_submission SET state='launch-unknown',terminal_json=NULL,continuations_json=? WHERE workspace_id=? AND request_id=?").run(JSON.stringify(history),record.id,requestId);
   }
   row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
   // The durable reservation precedes detachment. A lost launch response is never retried blindly.
   launchedNow=true;
   let result;
-  try {result=launch(name,requestId);}catch(error){result={ok:false,code:'release-launch-outcome-unknown',detail:error.code??error.name};}
+  try {result=launch(launchName,requestId);}catch(error){result={ok:false,code:'release-launch-outcome-unknown',detail:error.code??error.name};}
   database.prepare('UPDATE workspace_release_submission SET state=?,launch_json=? WHERE workspace_id=? AND request_id=?')
    .run(result?.started?'submitted':'launch-unknown',JSON.stringify(result),record.id,requestId);
   row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);

@@ -115,3 +115,23 @@ test('a held trigger that names the checkout still refuses the adopter',()=>fixt
  assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,CHILD);
  assert.equal(fs.existsSync(f.source),true);
 },{wakes:[{...HELD,text:'continue the build in $PATH'}]}));
+
+// Background launches are idempotent per name: a continuation that reused the name got the
+// earlier accepted launch back and nothing ran (workspace 33b3fad0, October 29).
+function namedLauncher(){const names=[];return {names,launch:name=>{const reused=names.includes(name);if(!reused)names.push(name);return {started:'unit-'+name,log:'/log/'+name,reused};}};}
+test('every continuation launches under its own background name',()=>submission(s=>{
+ const bg=namedLauncher();
+ const adopted=submitRelease({...s.adopter,launch:bg.launch,observe:()=>({ceased:true})});assert.equal(adopted.launch.reused,false);
+ s.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:2,finishedAt:1}));
+ const again=submitRelease({...s.adopter,launch:bg.launch,binding:{...s.adopter.binding,callId:'call_later'},observe:()=>({ceased:true})});
+ assert.equal(again.launch.reused,false,JSON.stringify(again));assert.equal(new Set(bg.names).size,2);
+ assert.equal(again.unitName,adopted.unitName,'the recorded original unit name is unchanged');
+}));
+test('a continuation stuck on a reused launch continues once its unit ceased',()=>submission(s=>{
+ const bg=namedLauncher();
+ submitRelease({...s.adopter,launch:bg.launch,observe:()=>({ceased:true})});
+ s.database.prepare("UPDATE workspace_release_submission SET state='submitted',launch_json=?").run(JSON.stringify({started:'unit-x',reused:true}));
+ const live=submitRelease({...s.adopter,launch:bg.launch,observe:()=>({ceased:false})});assert.equal(bg.names.length,1);assert.equal(live.state,'submitted');
+ const resumed=submitRelease({...s.adopter,launch:bg.launch,observe:()=>({ceased:true})});
+ assert.equal(bg.names.length,2,JSON.stringify(resumed));assert.equal(resumed.launch.reused,false);
+}));
