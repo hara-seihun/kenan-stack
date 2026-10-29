@@ -68,3 +68,18 @@ test('a capacity continuation never returns the old lock-busy result as its curr
  assert.equal(done.completed,true);assert.equal(done.action,'release-completed');assert.deepEqual(done.result,current.result);
  assert.equal(count(),2);assert.equal(done.requestId,first.requestId);
 }));
+
+// blitz-c-be-5a2e, 2026-10-29: the first release exited 0 but retained the checkout on
+// `.husky/_`; after the classifier learned that output, every repeated release replayed the
+// stored retention as 'release-completed' and never inspected the checkout again.
+test('an exit-0 release that physically retained the checkout continues on repetition instead of replaying',()=>fixture((base,count)=>{
+ const first=submitRelease(base);
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0}));
+ const retained={kind:'completed',result:{futureGrowthSettlement:{kind:'retired'},physicalDisposition:{kind:'retained',reason:'checkout has unclassified ignored output: !! .husky/_/h'}}};
+ const live=submitRelease({...base,settlement:retained,observe:()=>({ceased:false})});
+ assert.equal(live.completed,false);assert.equal(count(),1,'never relaunch while the original unit may still run');
+ const retry=submitRelease({...base,settlement:retained,observe:()=>({ceased:true})});
+ assert.equal(retry.action,'release-submitted');assert.equal(retry.completed,false);assert.equal(count(),2);
+ assert.equal(retry.requestId,first.requestId);assert.deepEqual(retry.previousReleaseSettlement,retained);
+}));
+

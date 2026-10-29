@@ -37,10 +37,14 @@ export function submitRelease({database,record,request,binding,launch,settlement
    continuation:'After reconciling the original terminal effect, the authenticated current custodian may settle retained disposal in this background route. Normal custody and physical safety checks still apply; this does not replace the original submission or settlement.'}};
 
  // A successful retry must return its new settled result, not replay a launch or
- // expose the pre-continuation capacity refusal as the current settlement.
+ // expose the pre-continuation capacity refusal as the current settlement. A run that
+ // exited 0 but physically retained the checkout (for example on output a later release
+ // classifies as cache, like Link's .husky/_ on 2026-10-29) is not a final answer: replaying
+ // it would pin the checkout forever, so a repeated release continues once the unit ceased.
  if(row?.state==='terminal-known' && JSON.stringify(originalRequest)===requestText &&
     JSON.parse(row.terminal_json??'{}').exitCode===0 && settlement.kind==='completed' &&
-    settlement.result?.futureGrowthSettlement?.kind==='retired')
+    settlement.result?.futureGrowthSettlement?.kind==='retired' &&
+    settlement.result?.physicalDisposition?.kind!=='retained')
   return {ok:true,action:'release-completed',completed:true,requestId:row.request_id,
    workspaceId:record.id,result:settlement.result,releaseSettlement:settlement};
  let launchedNow=false;
