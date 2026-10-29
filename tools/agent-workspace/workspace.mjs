@@ -485,7 +485,8 @@ function repositoryOwnedCachePaths(repository, values) {
   });
   if (specifications.length === 0) return [];
   const sources = [...new Set(specifications.map(({ source }) => source))];
-  const tracked = new Set(git(repository, ["ls-files", "-z", "--", ...sources]).split("\0").filter(Boolean));
+  const tracked = new Set();
+  streamRecords("git", ["-C", repository, "ls-files", "-z", "--", ...sources], "\0", name => { if (name) tracked.add(name); });
   const probes = [...new Set(specifications.flatMap(({ output, probes: candidates, source }) =>
     tracked.has(source) && !output.startsWith("**/") ? candidates : []))];
   const ignored = probes.length === 0 ? new Set() : new Set(command("git", [
@@ -1834,8 +1835,10 @@ function sparseSourcePaths(entries, patterns) {
     // Ask checkout itself: ignore-pattern queries disagree on directory reinclusions.
     // Identical path/mode topology with tiny blobs avoids opening any source blob.
     git(scratch, ["-c", "core.sparseCheckout=true", "-c", "core.sparseCheckoutCone=false", "read-tree", "-m", "-u", tree]);
-    return new Set(git(scratch, ["ls-files", "-t", "-z"]).split("\0")
-      .filter(entry => entry.startsWith("H ")).map(entry => entry.slice(2)));
+    // Streamed: a large repository's index listing exceeds any spawnSync buffer (renia: over 16 MiB, ENOBUFS).
+    const selected = new Set();
+    streamRecords("git", ["-C", scratch, "ls-files", "-t", "-z"], "\0", entry => { if (entry.startsWith("H ")) selected.add(entry.slice(2)); });
+    return selected;
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 }
 
@@ -2650,10 +2653,14 @@ function sourceTree(repository, commit, sparsePatterns) {
   }, { env: closureEnvironment });
   const selected = sparseSourcePaths(entries, sparsePatterns);
   const needed = entries.filter(entry => entry.type === "blob" && (selected === null || selected.has(entry.name) || entry.name.endsWith(".gitattributes")));
-  const result = command("git", ["-C", repository, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-    { env: closureEnvironment, input: needed.map(entry => entry.hash).join("\n") + "\n" });
-  const rows = needed.length === 0 ? [] : result.stdout.split("\n");
-  if (result.status !== 0 || rows.length !== needed.length) fail("source capacity estimate unknown: selected source object is unavailable");
+  const rows = [];
+  if (needed.length > 0) {
+    const result = command("git", ["-C", repository, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+      { env: closureEnvironment, input: needed.map(entry => entry.hash).join("\n") + "\n",
+        records: { separator: "\n", onRecord: row => { if (row !== "") rows.push(row); } } });
+    if (result.status !== 0 || result.error) fail("source capacity estimate unknown: selected source object is unavailable");
+  }
+  if (rows.length !== needed.length) fail("source capacity estimate unknown: selected source object is unavailable");
   for (let index = 0; index < needed.length; index++) {
     const match = rows[index].match(/^([0-9a-f]+) blob (\d+)$/u);
     if (match === null || match[1] !== needed[index].hash) fail("source capacity estimate unknown: selected source object is unavailable");
