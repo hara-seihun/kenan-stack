@@ -60,3 +60,13 @@ test('agents, processes, unknown observations and mixed references are never wai
  ])assert.equal(transientToolCallReference(receipt),false,JSON.stringify(receipt));
  assert.equal(transientToolCallReference([referenced(),released]),true);
 });
+
+test('a safety observation timeout is re-observed, then left as a known refusal',async()=>{
+ const {runReleaseWorker}=await import('./release-retry.mjs');
+ const timeout={status:2,stdout:JSON.stringify({ok:false,error:{code:'inspection-timeout',detail:'workspace inspection timed out'}})};
+ const released={status:0,stdout:JSON.stringify({ok:true,action:'released',record:{state:'released'}})};
+ let calls=0;const done=await runReleaseWorker(()=>++calls<3?timeout:released,{sleep:async()=>{},now:()=>0});
+ assert.equal(calls,3);assert.equal(done.exitCode,0);
+ let t=0;const out=await runReleaseWorker(()=>timeout,{sleep:async()=>{t+=2000;},now:()=>t,budgetMs:5000});
+ assert.equal(out.known,true,'a typed timeout is a known non-effect the next continuation may follow');assert.equal(out.exitCode,2);
+});

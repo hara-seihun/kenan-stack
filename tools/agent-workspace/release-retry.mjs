@@ -25,6 +25,12 @@ export function transientToolCallReference(receipt) {
  const settled=item=>item?.physicalDisposition?.kind==='removed'||item?.action==='released'||item?.record?.state==='released';
  return items.some(transient)&&items.every(item=>transient(item)||settled(item));
 }
+// A safety observation that ran out of time established no verdict and changed nothing
+// (a loaded host can exhaust the census budget). Observe again while budget remains.
+export function observationTimeout(receipt) {
+ const items=Array.isArray(receipt)?receipt:[receipt];
+ return items.length>0&&items.every(item=>['inspection-timeout','growth-observation-timeout'].includes(item?.error?.code));
+}
 export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budgetMs=120000,referencePollMs=2000}={}) {
  const deadline=now()+budgetMs;
  for(;;) {
@@ -35,6 +41,9 @@ export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budget
   if(busy && [0,75].includes(result.status)) {
    if(now()>=deadline)return {result,receipt,exitCode:75,known:true};
    await sleep(250);continue;
+  }
+  if(observationTimeout(receipt) && result.status===2 && now()+referencePollMs<deadline) {
+   await sleep(referencePollMs);continue;
   }
   if(transientToolCallReference(receipt) && [0,2,75].includes(result.status) && now()+referencePollMs<deadline) {
    await sleep(referencePollMs);continue;

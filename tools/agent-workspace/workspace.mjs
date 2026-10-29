@@ -151,6 +151,12 @@ function duringInspection(deadline, inspect) {
 function fail(message) {
   throw new CliError(message);
 }
+// An observation deadline ended before any safety verdict, so nothing was changed. Typed,
+// so a --json release reports it on stdout and its background worker records a known,
+// continuable refusal instead of an unreconcilable submission.
+function inspectionTimeout(message) {
+  throw Object.assign(new CliError(message), {code: "inspection-timeout"});
+}
 
 function parseArgs(argv) {
   const positional = [];
@@ -251,7 +257,7 @@ function command(executable, commandArgs, options = {}) {
   }
   if (sourcePreparationMode === "foreground" && result.error?.code === "ETIMEDOUT") throw new SourcePreparationRequired();
   if (inspectionDeadline !== undefined && result.error?.code === "ETIMEDOUT") {
-    fail(`workspace inspection timed out: ${executable} ${commandArgs.join(" ")}; no safety verdict was established`);
+    inspectionTimeout(`workspace inspection timed out: ${executable} ${commandArgs.join(" ")}; no safety verdict was established`);
   }
   if (creationDeadline !== undefined && result.error?.code === "ETIMEDOUT") {
     fail("creation command timed out; repeat the same create command to retry, optionally increasing --creation-timeout-seconds (maximum 86400)");
@@ -679,7 +685,7 @@ function updateState(database, record, state, detail) {
 // worker threads; these bind them to the current inspection deadline.
 function censusBound(action) {
   try { return withCensusDeadline(inspectionDeadline, action); }
-  catch (error) { if (error instanceof CensusFailure) fail(error.message); throw error; }
+  catch (error) { if (error instanceof CensusFailure && /timed out|budget exhausted/.test(error.message)) inspectionTimeout(error.message); if (error instanceof CensusFailure) fail(error.message); throw error; }
 }
 function assertSafetyBudget(phase) { return censusBound(() => census.assertSafetyBudget(phase)); }
 function processSnapshot(...args) { return censusBound(() => census.processSnapshot(...args)); }
@@ -5833,7 +5839,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
