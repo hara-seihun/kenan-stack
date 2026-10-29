@@ -231,9 +231,8 @@ function currentDirectory() {
 function command(executable, commandArgs, options = {}) {
   const remaining = Math.min(maintenanceContext?.journal.deadline ?? Infinity, inspectionDeadline ?? Infinity, creationDeadline ?? Infinity, sourcePreparationDeadline) - Date.now() - (maintenanceContext ? 250 : 0);
   if (sourcePreparationMode === "foreground" && remaining <= 0) throw new SourcePreparationRequired();
-  if (remaining <= 0) fail(creationDeadline === undefined
-    ? "workspace inspection budget exhausted; no safety verdict was established"
-    : "creation budget exhausted; checkout retained; repeat the same create command to resume");
+  if (remaining <= 0 && creationDeadline === undefined) inspectionTimeout("workspace inspection budget exhausted; no safety verdict was established");
+  if (remaining <= 0) fail("creation budget exhausted; checkout retained; repeat the same create command to resume");
   const launch = stdout => spawnSync(executable, commandArgs, {
     // Git operands are resolved before launch; a released caller directory may vanish mid-command.
     cwd: options.cwd ?? homedir(),
@@ -5833,7 +5832,10 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
   }
   try {
     main();
-  } catch (error) {
+  } catch (caught) {
+    // Any census deadline that escapes as a raw CensusFailure is the same typed non-effect.
+    const error = caught instanceof CensusFailure && /timed out|budget exhausted/.test(caught.message)
+      ? Object.assign(new CliError(caught.message), {code: "inspection-timeout"}) : caught;
     if (process.argv.some(value => value === "--json" || value === "--json=true")) {
       if (error instanceof RegistrationMismatchError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
