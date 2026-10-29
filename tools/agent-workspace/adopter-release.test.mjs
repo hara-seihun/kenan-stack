@@ -16,7 +16,7 @@ import {submitRelease} from './release-submission.mjs';
 // ("explicit retained source/runtime custody") because the original settlement named the
 // ended owner, and its foreground submission conflicted with the ended owner's submission.
 const CHILD='22222222-2222-4222-8222-222222222222',REPAIR='88888888-8888-4888-8888-888888888888',PARENT='manager:converge';
-function fixture(action){
+function fixture(action,{wakes=[]}={}){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'adopter-release-')),source=path.join(root,'checkout'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3'),native=path.join(root,'native.json');
  const previous=[process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY,process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS];
  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';process.env.PI_WORKSPACE_TEST_OWNER_LIVENESS=native;
@@ -32,7 +32,7 @@ function fixture(action){
   db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify({intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096}));
   db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));
   bindNativeOwner(db,record.id,{agentId:CHILD,channel:'beta',callId:'call_child'},'caller-scope',{fixture:true});
-  const agents=list=>fs.writeFileSync(native,JSON.stringify({errors:[],agents:list,wakes:[],observations:[],observedAt:Date.now()}));
+  const agents=list=>fs.writeFileSync(native,JSON.stringify({errors:[],agents:list,wakes:wakes.map(w=>({...w,text:w.text.replaceAll('$PATH',source)})),observations:[],observedAt:Date.now()}));
   const authenticated=pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))});
   const args=(entries=[])=>({positional:[],named:new Map(entries.map(([k,v])=>[k,[String(v)]]))});
   // The child commits unique work and releases while it is unpublished: growth retires, the tree is retained.
@@ -41,17 +41,19 @@ function fixture(action){
   assert.equal(first.futureGrowthSettlement?.kind,'retired',JSON.stringify(first));assert.equal(fs.existsSync(source),true);
   git('-C',source,'push','origin','HEAD:refs/heads/agent/fixture');
   // The child ends; the live parent takes custody, then a live repair worker adopts it.
-  agents([{id:CHILD,parentAgentId:PARENT,channel:'beta',role:'worker',state:'stopped',archived:true},{id:PARENT,channel:'beta',role:'manager',state:'running',archived:false}]);
-  assert.equal(workspaceTesting.releaseEndedOwnersCommand(db,args([['id',record.id],['execute',true]]),state,{caller:()=>({ok:true,kind:'operator'})}).results[0].action,'transferred-to-parent');
-  agents([{id:CHILD,parentAgentId:PARENT,channel:'beta',role:'worker',state:'stopped',archived:true},{id:PARENT,channel:'beta',role:'manager',state:'running',archived:false},
+  agents([{id:CHILD,parentAgentId:PARENT,channel:'beta',role:'worker',state:'stopped',archived:true,goalId:'goal-1'},{id:PARENT,channel:'beta',role:'manager',state:'running',archived:false}]);
+  const sweep=workspaceTesting.releaseEndedOwnersCommand(db,args([['id',record.id],['execute',true]]),state,{caller:()=>({ok:true,kind:'operator'})}).results[0];
+  // Periodic operator sweeps keep honoring every held trigger of the ended owner's goal.
+  if(wakes.length)assert.equal(sweep.code,'pending-wake-reference',JSON.stringify(sweep));else assert.equal(sweep.action,'transferred-to-parent');
+  agents([{id:CHILD,parentAgentId:PARENT,channel:'beta',role:'worker',state:'stopped',archived:true,goalId:'goal-1'},{id:PARENT,channel:'beta',role:'manager',state:'running',archived:false},
    {id:REPAIR,parentAgentId:PARENT,channel:'beta',role:'worker',state:'running',archived:false}]);
   const adopted=workspaceTesting.releaseEndedOwnersCommand(db,args([['id',record.id],['execute',true]]),state,{caller:()=>({ok:true,kind:'native',binding:{agentId:REPAIR,channel:'beta',callId:'authentic-repair'}}),authenticate:authenticated});
-  assert.equal(adopted.counts['transferred-to-requester'],1,JSON.stringify(adopted));
-  action({root,source,state,record,db,run,git,first});
+  action({root,source,state,record,db,run,git,first,adopted});
  }finally{db?.close();['PI_WORKSPACE_TEST_EXTERNAL_SAFETY','PI_WORKSPACE_TEST_OWNER_LIVENESS'].forEach((key,i)=>{if(previous[i]===undefined)delete process.env[key];else process.env[key]=previous[i];});fs.rmSync(root,{recursive:true,force:true});}
 }
 
 test('the adopter of ended custody completes the original retired-growth release',()=>fixture(f=>{
+ assert.equal(f.adopted.counts['transferred-to-requester'],1,JSON.stringify(f.adopted));
  const row=f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id);assert.equal(row.owner,REPAIR);
  assert.deepEqual([...workspaceTesting.endedCustodyLineage(f.db,{id:row.id,path:row.path,owner:row.owner,sourceCommit:row.source_commit})].sort(),[CHILD,REPAIR,PARENT].sort());
  const result=f.run(['release','--id',f.record.id,'--json']);
@@ -100,3 +102,16 @@ test('an unknown original launch is never continued by an adopter',()=>submissio
  s.database.prepare("UPDATE workspace_release_submission SET state='launch-unknown'").run();
  const result=submitRelease({...s.adopter,observe:()=>({ceased:true})});assert.equal(result.ok,false);assert.equal(s.launches(),1);
 }));
+
+const HELD={id:'held-1',agentId:PARENT,channel:'beta',status:'pending',held:true,goalId:'goal-1',heldFor:null};
+test('a goal-only held trigger keeps an ended checkout from sweeps but lets an authenticated adopter take custody',()=>fixture(f=>{
+ assert.equal(f.adopted.counts['transferred-to-requester'],1,JSON.stringify(f.adopted));
+ assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,REPAIR);
+ assert.equal(fs.existsSync(f.source),true,'a custody transfer deletes nothing');
+ assert.equal(f.run(['release','--id',f.record.id,'--json']).action,'released');
+},{wakes:[{...HELD,text:'measure deliverable timing tomorrow'}]}));
+test('a held trigger that names the checkout still refuses the adopter',()=>fixture(f=>{
+ assert.equal(f.adopted.results[0].code,'pending-wake-reference',JSON.stringify(f.adopted));
+ assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,CHILD);
+ assert.equal(fs.existsSync(f.source),true);
+},{wakes:[{...HELD,text:'continue the build in $PATH'}]}));
