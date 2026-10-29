@@ -111,6 +111,22 @@ for(const kind of ['untracked','different-generator','chained-command'])test('Hu
  fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/proof'),'preserve');
  assert.equal(f.release().physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'.husky/_/proof')),true);
 }));
+// Link BE/UI shape (October 29: three released Link checkouts retained on `.husky/_`): husky 9
+// prepare `husky || true`, generated `.husky/_/` ignored only by its own `*` .gitignore, a
+// tracked `.husky/pre-commit` beside it, and every branch already pushed.
+const huskyNine=(f,prepare)=>{fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare}}));fs.mkdirSync(path.join(f.source,'.husky'));fs.writeFileSync(path.join(f.source,'.husky/pre-commit'),'npx lint-staged\n');
+ f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','husky 9 prepare');f.git('-C',f.source,'push','origin','main');
+ fs.mkdirSync(path.join(f.source,'.husky/_'));fs.writeFileSync(path.join(f.source,'.husky/_/.gitignore'),'*');for(const hook of ['husky.sh','h','commit-msg'])fs.writeFileSync(path.join(f.source,'.husky/_',hook),'generated hook');};
+for(const prepare of ['husky || true','husky install || true'])test('clean pushed checkout with Husky 9 `'+prepare+'` generated hooks is reclaimed, not retained',()=>fixture(f=>{
+ huskyNine(f,prepare);const result=f.release();
+ assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));assert.ok(result.cacheDisposition.paths.includes('.husky/_'));assert.equal(fs.existsSync(f.source),false);
+}));
+test('Husky 9 inference never removes a tracked .husky/_ directory',()=>fixture(f=>{
+ huskyNine(f,'husky || true');fs.rmSync(path.join(f.source,'.husky/_/.gitignore'));f.git('-C',f.source,'add','.husky/_');f.git('-C',f.source,'commit','-m','track hooks');f.git('-C',f.source,'push','origin','main');
+ const result=f.release();assert.equal(result.cacheDisposition.paths?.includes('.husky/_')??false,false,JSON.stringify(result));
+ if(fs.existsSync(f.source))assert.equal(fs.readFileSync(path.join(f.source,'.husky/_/husky.sh'),'utf8'),'generated hook');
+ else assert.equal(result.physicalDisposition.kind,'removed');
+}));
 test('a detached pushed checkout transfers and releases without attaching a synthetic branch',()=>fixture(f=>{
  const head=f.git('-C',f.source,'rev-parse','HEAD');f.git('-C',f.source,'checkout','--detach',head);
  const record=f.db.prepare('SELECT state FROM workspace WHERE id=?').get(f.record.id);
