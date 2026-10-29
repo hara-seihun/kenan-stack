@@ -215,7 +215,9 @@ test('the actual native CLI releases its own pushed source with identity environ
       assert.equal(record.state,'released',status.stdout);assert.equal(record.releaseSettlement.kind,'completed');assert.equal(record.releaseSettlement.result.physicalDisposition.kind,'removed');
     }else{
       assert.equal(result.status,0,result.stderr+'\n'+result.stdout);
-      assert.equal(submission.action,'released');assert.equal(submission.leaseRelease.kind,'released');
+      // A native foreground call reports its background release once it completed (October 29).
+      if(submission.action==='release-completed'){assert.equal(submission.completed,true);assert.equal(submission.releaseSettlement.result.physicalDisposition.kind,'removed');}
+      else {assert.equal(submission.action,'released');assert.equal(submission.leaseRelease.kind,'released');}
     }
     assert.equal(fs.existsSync(f.source),false);
   });

@@ -28,6 +28,7 @@ import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
 import { shareMirrorPacks, configuredLocalSources } from "./mirror-pack-sharing.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
+import {awaitSubmittedRelease,RELEASE_AWAIT_MS} from './release-await.mjs';
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -4348,6 +4349,8 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
         database.exec('COMMIT');return {refused:results};
       }catch(error){database.exec('ROLLBACK');throw error;}
     }
+    // Custody adoption on behalf of a release request never disposes anything by itself.
+    if (options.transferOnly) return {refused:locked.current.map(record=>({record:endedOwnerSummary(record),action:'none',code:'no-custody-transfer'}))};
     // Ending a reservation does not require admitting new growth. The same terminal
     // release checks source reachability and strict runtime cessation before deletion.
     // Missing paths have no bytes to delete, even when their historical owner is unknown.
@@ -4402,7 +4405,8 @@ function releaseEndedOwnerGroup(database, group, observation, options) {
 // Binds existing records whose registered owner is not a native worker id to the native worker
 // that created them, from authenticated checkout-job admission receipts only. Idempotent.
 function ownerCursor(database, args, scope, targeted) {
-  database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
+  // A targeted request never reads or writes a cursor, so it leaves the schema untouched.
+  if (!targeted) database.exec("CREATE TABLE IF NOT EXISTS reconciliation_cursor (scope TEXT PRIMARY KEY, after_id TEXT NOT NULL)");
   const saved = bool(args,"execute") && !targeted ? database.prepare("SELECT after_id FROM reconciliation_cursor WHERE scope=?").get(scope)?.after_id : undefined;
   const after=one(args,"after",saved??"start");
   const anchor=after==="start"?null:database.prepare("SELECT id,root,path FROM workspace WHERE id=?").get(after);
@@ -4490,7 +4494,7 @@ function bindNativeOwnersCommand(database, args, statePath, {authenticate=authen
     observation: { errors: authentication.errors }, results };
 }
 
-function releaseEndedOwnersCommand(database, args, statePath, authorityDependencies) {
+function releaseEndedOwnersCommand(database, args, statePath, authorityDependencies, {transferOnly=false}={}) {
   assertOnly(args, ["root", "id", "path", "execute", "budget-ms", "max-records", "after", "json"]);
   const budget = numberFlag(args, "budget-ms", 30_000), maxRecords = numberFlag(args, "max-records", 16);
   if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 40_000) fail("--budget-ms must be between 1000 and 40000");
@@ -4522,8 +4526,8 @@ function releaseEndedOwnersCommand(database, args, statePath, authorityDependenc
   const priority=record=>classifyOwner(endedReleaseOwner(database,record),observation).kind==="ended"?0:1;
   // A large scan window can contain more ended owners than one action page. Remember actual
   // attempts, not just the window anchor, so repeatedly retained trees cannot starve its tail.
-  database.exec("CREATE TABLE IF NOT EXISTS workspace_owner_sweep_attempt(sequence INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, workspace_id TEXT NOT NULL, UNIQUE(scope,workspace_id))");
-  const attempts=new Map(database.prepare("SELECT workspace_id,sequence FROM workspace_owner_sweep_attempt WHERE scope=?").all(scope).map(row=>[row.workspace_id,row.sequence]));
+  if(!targeted)database.exec("CREATE TABLE IF NOT EXISTS workspace_owner_sweep_attempt(sequence INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, workspace_id TEXT NOT NULL, UNIQUE(scope,workspace_id))");
+  const attempts=targeted?new Map():new Map(database.prepare("SELECT workspace_id,sequence FROM workspace_owner_sweep_attempt WHERE scope=?").all(scope).map(row=>[row.workspace_id,row.sequence]));
   const page=(explicitWalk?window:window.toSorted((a,b)=>priority(a)-priority(b)||(attempts.get(a.id)??0)-(attempts.get(b.id)??0)||records.indexOf(a)-records.indexOf(b))).slice(0,maxRecords);
   if(window.length&&observation.errors.length===0)scan.save(window.at(-1).id);
   const results = [], visited = new Set();
@@ -4533,7 +4537,7 @@ function releaseEndedOwnersCommand(database, args, statePath, authorityDependenc
     const group = recordsInGroup(database, record);
     for (const member of group) visited.add(member.id);
     try {
-      results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath, requester }));
+      results.push(...releaseEndedOwnerGroup(database, group, observation, { execute, deadline, statePath, requester, transferOnly }));
     } catch (error) {
       results.push(...group.map(member => ({ record: endedOwnerSummary(member), action: "none", code: error instanceof ResourceBusyError ? "resource-busy" : error.code ?? "owner-liveness-release-failed", detail: error.message })));
     }
@@ -5628,10 +5632,86 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
-export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {releaseAuthorityDependencies} = {}) {
-  const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;
+// Whether a submission's background unit has ceased (never a guess: an observation error is "not ceased").
+function releaseUnitCessation(row) {
+  const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
+  const fields=Object.fromEntries(String(observed.stdout??'').trim().split('\n').map(line=>line.split('=')));
+  return {ceased:!observed.error&&observed.status===0&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
+}
+
+// One foreground release attempt. Returns {adopt:refusal} when an authenticated native caller is
+// not the custodian and custody adoption may be tried, {refused:refusal} when it was already
+// tried, and undefined after printing any other outcome itself.
+function releaseForegroundAttempt(database,args,statePath,selected,{deadline,releaseScope,releaseAuthorityDependencies,allowAdoption,adoption}) {
+  // Custody may have just moved: always authorize the current record, never the caller's snapshot.
+  const record=recordBy(database,{id:selected.id});
+  try {
+    return duringInspection(deadline,()=>{
+      const members=recordsInGroup(database,record);
+      const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline,...releaseAuthorityDependencies});
+      if(!authority.ok&&authority.error?.code==='release-owner-mismatch')return allowAdoption?{adopt:authority}:{refused:authority,adoption};
+      if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
+      const foreground=authority.kind==='native'&&releaseScope?.background!==true;
+      const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
+      const submitted=lock(()=>{
+        if(!foreground){releaseCommand(database,args,statePath,{deadline,...releaseAuthorityDependencies});return;}
+        assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
+        const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
+          members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
+        return submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
+          custodyLineage:[...endedCustodyLineage(database,record)],
+          observe:releaseUnitCessation,launch:name=>{
+            const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
+            const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath),env:{KENAN_BG_IDENTITY:'1'}});
+            if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
+            try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
+          }});
+      });
+      if(submitted===undefined)return;
+      const result=submitted.action==='release-submitted'?finishSubmittedRelease(database,record,submitted):submitted;
+      print(adoption?{...result,custodyAdoption:adoption}:result,true);
+      process.exitCode=result.action==='already-released'||result.completed===true?0:result.action==='release-retained'?2:75;
+    });
+  }catch(error){
+    if(!(error instanceof ResourceBusyError))throw error;
+    print({ok:false,error:{code:'release-resource-busy',detail:error.message},completed:false,
+      releaseSettlement:releaseSettlement(database,record.id),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],retry:'Repeat the same request after the recorded lock holder finishes.'},lock:error.detail},true);process.exitCode=75;
+  }
+}
+
+// Observe the submitted background release for a bounded time and report what actually happened.
+function finishSubmittedRelease(database,record,submitted,{budgetMs=RELEASE_AWAIT_MS,sleep,observeUnit=releaseUnitCessation}={}) {
+  const outcome=awaitSubmittedRelease({budgetMs,...(sleep?{sleep}:{}),read:()=>{try{
+    const row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
+    // Unit first, then the record: a unit seen ceased has already written everything it will write.
+    const unitCeased=row?.state==='submitted'?observeUnit(row).ceased===true:false;
+    const current=database.prepare('SELECT state FROM workspace WHERE id=?').get(record.id);
+    return {recordState:current?.state,pathExists:existsSync(record.path),submissionState:row?.state,unitCeased,terminal:row?.terminal_json?JSON.parse(row.terminal_json):null};
+  }catch{return {submissionState:'submitted'};}}});
+  const settlement=releaseSettlement(database,record.id);
+  if(outcome.kind==='completed')return {...submitted,action:'release-completed',completed:true,state:outcome.observed.submissionState,releaseSettlement:settlement};
+  if(outcome.kind==='terminal')return {...submitted,ok:false,action:'release-retained',completed:false,state:'terminal-known',terminal:outcome.observed.terminal,releaseSettlement:settlement,
+    note:`The background release ended without removing the checkout. Read releaseSettlement and the unit log ${submitted.launch?.log??''} for the reason.`};
+  return {...submitted,note:`The release is still running in the background unit (accepted work, not a failure). Its completion raises host event ${submitted.launch?.event??'job:<agent>:'+submitted.unitName}; agent-workspace status --id ${record.id} --json shows the outcome.`};
+}
+
+// The existing guarded transfer (release-ended-owners), limited to custody transfer for one checkout.
+function adoptCustodyForRelease(database,record,statePath,authorityDependencies) {
+  try {
+    const result=releaseEndedOwnersCommand(database,{positional:[],named:new Map([['id',[record.id]],['execute',['true']],['budget-ms',['25000']]])},statePath,authorityDependencies,{transferOnly:true});
+    if(result.ok===false&&result.error)return {transferred:false,action:'none',code:result.error.code,detail:result.error.detail};
+    const item=(result.results??[]).find(entry=>entry.record?.id===record.id);
+    const transferred=item!==undefined&&['transferred-to-requester','transferred-to-parent'].includes(item.action);
+    return {transferred,action:item?.action??'none',...(transferred?{}:{code:item?.code??(result.ok?'owner-not-ended-native-worker':'owner-observation-unavailable')}),
+      ...(item?.custody?{custody:item.custody}:{}),...(result.observation?.errors?.length?{observationErrors:result.observation.errors}:{})};
+  }catch(error){return {transferred:false,action:'none',code:error.code??'custody-adoption-failed',detail:String(error.message).slice(0,500)};}
+}
+
+export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {releaseAuthorityDependencies, releaseScopeOverride} = {}) {
+  // Tests that run inside a native tool call pass releaseScopeOverride:{background:true} so no real background unit starts.
+  const releaseStarted=Date.now(), releaseScope=argv[0]!=='release'?null:releaseScopeOverride!==undefined?releaseScopeOverride:procScope(process.pid);
   const releaseEntryDeadline=argv[0]==='release'?releaseStarted+releaseBudgetMs(releaseScope):undefined;
   if(argv[0]==='execution-cessation') {
     const args=parseArgs(argv.slice(1));assertOnly(args,['holder']);
@@ -5809,40 +5889,34 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     else if (commandName === "reassign") reassignCommand(database, args);
     else if (commandName === "adopt") adoptCommand(database, args, statePath);
     else if(commandName==='release') {
-      const deadline=releaseEntryDeadline, selected=recordBy(database,selectorFrom(args,'release'));
+      const selected=recordBy(database,selectorFrom(args,'release'));
       const group=recordsInGroup(database,selected),record=[...(group.length?group:[selected])].sort((a,b)=>a.id.localeCompare(b.id))[0];
       database.exec('PRAGMA busy_timeout=1000');
-      try {
-        duringInspection(deadline,()=>{
-          const members=recordsInGroup(database,record);
-          const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline,...releaseAuthorityDependencies});
-          if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
-          const foreground=authority.kind==='native'&&releaseScope?.background!==true;
-          const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
-          lock(()=>{
-            if(!foreground)return releaseCommand(database,args,statePath,{deadline,...releaseAuthorityDependencies});
-            assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
-            const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
-              members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
-            const result=submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
-              custodyLineage:[...endedCustodyLineage(database,record)],
-              observe:row=>{
-                const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
-                const fields=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>line.split('=')));
-                return {ceased:!observed.error&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
-              },launch:name=>{
-                const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
-                const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath),env:{KENAN_BG_IDENTITY:'1'}});
-                if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
-                try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
-              }});
-            print(result,true);process.exitCode=result.action==='already-released'||result.completed===true?0:75;
-          });
-        });
-      }catch(error){
-        if(!(error instanceof ResourceBusyError))throw error;
-        print({ok:false,error:{code:'release-resource-busy',detail:error.message},completed:false,
-          releaseSettlement:releaseSettlement(database,record.id),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],retry:'Repeat the same request after the recorded lock holder finishes.'},lock:error.detail},true);process.exitCode=75;
+      const initialMembers=recordsInGroup(database,record);
+      // A completed release is history, not custody: anyone may read that it already happened.
+      // Before October 29 a non-custodian got release-owner-mismatch for a checkout that was
+      // already gone (awareness-list-1bab, released by its creator's background unit).
+      if((initialMembers.length?initialMembers:[record]).every(member=>member.state==='released'&&!existsSync(member.path)))
+        print({ok:true,action:'already-released',completed:true,record,releaseSettlement:releaseSettlement(database,record.id)},true);
+      else {
+        let attempt=releaseForegroundAttempt(database,args,statePath,record,{deadline:releaseEntryDeadline,releaseScope,releaseAuthorityDependencies,allowAdoption:true});
+        if(attempt?.adopt){
+          // The caller is not the custodian. When native lineage proves the custodian ended (and
+          // the caller is its live parent or an authenticated successor), or the custodian is the
+          // caller's parent holding custody transferred from its ended child, take custody through
+          // the existing guarded release-ended-owners transfer, then release. A transfer deletes
+          // nothing; live owners, unknown owners and pending wakes naming the checkout still refuse.
+          const adoption=adoptCustodyForRelease(database,record,statePath,releaseAuthorityDependencies);
+          if(adoption.transferred)attempt=releaseForegroundAttempt(database,args,statePath,record,{deadline:Date.now()+releaseBudgetMs(releaseScope),releaseScope,releaseAuthorityDependencies,allowAdoption:false,adoption});
+          else attempt={refused:attempt.adopt,adoption};
+        }
+        if(attempt?.refused){
+          const refusal={...attempt.refused,...(attempt.adoption?{custodyAdoption:attempt.adoption}:{}),
+            nextAction:{status:['agent-workspace','status','--id',record.id,'--json'],
+              explanation:'Only the checkout custodian releases it. Custody moves automatically when native lineage proves the custodian ended and you are its live parent or successor; a live custodian must release it itself or reassign it.'}};
+          if(bool(args,'json'))print(refusal,true);else process.stderr.write(`agent-workspace: ${refusal.error.code}: ${refusal.error.detail}${attempt.adoption?` (custody adoption: ${attempt.adoption.action??'none'} ${attempt.adoption.code??''})`:''}\n`);
+          process.exitCode=2;
+        }
       }
     }
     else if (["heartbeat", "cancel-creation", "finalize-creation"].includes(commandName)) {
