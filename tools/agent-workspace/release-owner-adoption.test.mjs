@@ -136,3 +136,14 @@ test('the foreground observation of a submitted release reports completion, a ce
   const done=workspaceTesting.finishSubmittedRelease(f.db,f.record,submitted,{...fast,observeUnit:()=>({ceased:false})});
   assert.equal(done.action,'release-completed');assert.equal(done.completed,true);
 }));
+
+test('a waiting foreground release CLI does not retain the checkout it names, but other references still do',()=>{
+  const target='/w/checkout',record=(commandLine,extra={})=>({pid:7,command:'node',commandLine,cwd:'/',executable:'/usr/bin/node',writableFiles:[],...extra});
+  const refs=list=>workspaceTesting.processReferences(target,list);
+  assert.deepEqual(refs([record(['/usr/local/bin/node','/srv/pi/tools/agent-workspace/main','release','--path',target,'--json'])]),[]);
+  assert.deepEqual(refs([record(['node','/srv/pi/.pi-stack-releases/tools/abc/agent-workspace/workspace.mjs','release','--id','x','--path='+target])]),[]);
+  assert.equal(refs([record(['/usr/local/bin/node','/srv/pi/tools/agent-workspace/main','release','--path',target],{cwd:target})]).length,1,'a cwd inside still counts');
+  assert.equal(refs([record(['/usr/local/bin/node','/srv/pi/tools/agent-workspace/main','heartbeat','--path',target])]).length,1,'other commands still count');
+  assert.equal(refs([record(['/usr/local/bin/node','/tmp/main','release','--path',target])]).length,1,'only the agent-workspace CLI is exempt');
+  assert.equal(refs([record(['bash','build.sh',target+'/x'])]).length,1);
+});

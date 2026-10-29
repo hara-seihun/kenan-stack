@@ -743,12 +743,22 @@ function safetySnapshot(database) {
   };
 }
 
+function workspaceReleaseCommand(commandLine) {
+  const [interpreter, script, command] = commandLine;
+  return typeof interpreter === "string" && path.basename(interpreter).startsWith("node") && typeof script === "string" &&
+    ["main", "workspace.mjs"].includes(path.basename(script)) && /(^|\/)agent-workspace\/[^/]+$/u.test(script) && command === "release";
+}
+
 function processReferences(workspacePath, snapshot = processSnapshot()) {
   return snapshot.flatMap((processRecord) => {
     const matches = (processRecord.writableFiles ?? []).filter(file => within(workspacePath, file)).map(file => `write-fd:${file}`);
     if (processRecord.cwd !== null && within(workspacePath, processRecord.cwd)) matches.push(`cwd:${processRecord.cwd}`);
     if (processRecord.executable !== null && within(workspacePath, processRecord.executable)) matches.push(`exe:${processRecord.executable}`);
     if (processRecord.commandLine.some((argument) => argument === workspacePath || argument.includes(`${workspacePath}/`) || argument.includes(`=${workspacePath}`))) matches.push("argument");
+    // A foreground `agent-workspace release --path X` that waits for its background unit names X only as an
+    // argument; it is the requester, not a consumer (October 29: it retained its own checkout). A cwd, executable
+    // or writable descriptor inside the checkout still counts, and so does any other command naming it.
+    if (matches.length === 1 && matches[0] === "argument" && workspaceReleaseCommand(processRecord.commandLine)) return [];
     return matches.length === 0 ? [] : [{ pid: processRecord.pid, command: processRecord.command, matches }];
   });
 }
@@ -5632,7 +5642,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { processReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 // Whether a submission's background unit has ceased (never a guess: an observation error is "not ceased").
 function releaseUnitCessation(row) {
