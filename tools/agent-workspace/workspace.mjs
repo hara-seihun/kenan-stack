@@ -1050,8 +1050,15 @@ function repositoryPrepareCachePaths(workspacePath) {
     // committed source, never an untracked or locally edited prepare script.
     // Also the common tolerant forms ("husky || true", "husky install || :"), which only
     // suppress a failure when Git hooks cannot be installed (blitz2-link-liminal-be).
-    if (!/^husky(?: install)?(?:\s*\|\|\s*(?:true|:|exit 0))?$/.test((pkg.scripts?.prepare ?? "").trim())) return [];
-    return repositoryOwnedCachePaths(workspacePath, [".husky/_=package.json"]);
+    const owned = [];
+    if (/^husky(?: install)?(?:\s*\|\|\s*(?:true|:|exit 0))?$/.test((pkg.scripts?.prepare ?? "").trim())) owned.push(".husky/_=package.json");
+    // swagger-autogen in Link's backend: committed scripts run src/docs/swagger.js, which writes
+    // swagger-output.json, and the integration suites write src/docs/definitions through
+    // swaggerUtils.js. Each output still has to be Git-ignored and its owner tracked at HEAD.
+    const dependencies = {...pkg.dependencies, ...pkg.devDependencies};
+    if (dependencies["swagger-autogen"] !== undefined && Object.values(pkg.scripts ?? {}).some(script => /\bnode\s+(?:\.\/)?src\/docs\/swagger\.js\b/.test(script)))
+      owned.push("src/docs/swagger-output.json=src/docs/swagger.js", "swagger-output.json=src/docs/swagger.js", "src/docs/definitions=src/docs/swaggerUtils.js");
+    return owned.length ? repositoryOwnedCachePaths(workspacePath, owned) : [];
   } catch { return []; }
 }
 function effectiveCachePaths(record) {

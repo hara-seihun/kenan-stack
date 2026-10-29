@@ -132,3 +132,17 @@ test('ordinary clean pushed Converge-shaped detached checkout releases with 1400
  assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));assert.equal(fs.existsSync(f.source),false);
  assert.equal(result.cacheDisposition.paths.length,30);assert.ok(Date.now()-start<150000,'physical release must finish inside its unchanged background bound');
 }));
+
+// Link backend (blitz2-link-liminal-be, 33b3fad0): swagger-autogen outputs are regenerable,
+// but only where committed scripts run the tracked generator and Git ignores the outputs.
+for(const kind of ['generator','no-dependency'])test('swagger-autogen outputs are generated only with the tracked generator ('+kind+')',()=>fixture(f=>{
+ fs.mkdirSync(path.join(f.source,'src/docs'),{recursive:true});
+ fs.writeFileSync(path.join(f.source,'src/docs/swagger.js'),'// generator');fs.writeFileSync(path.join(f.source,'src/docs/swaggerUtils.js'),'// definitions');
+ fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{swagger:'node ./src/docs/swagger.js'},dependencies:kind==='generator'?{'swagger-autogen':'2.23.7'}:{}}));
+ fs.appendFileSync(path.join(f.source,'.gitignore'),'src/docs/swagger-output.json\nsrc/docs/definitions/\n/swagger-output.json\n');
+ f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','swagger');f.git('-C',f.source,'push','origin','main');
+ fs.writeFileSync(path.join(f.source,'src/docs/swagger-output.json'),'{}');fs.mkdirSync(path.join(f.source,'src/docs/definitions'));fs.writeFileSync(path.join(f.source,'src/docs/definitions/A.json'),'{}');
+ const result=f.release();
+ if(kind==='generator'){assert.ok(result.cacheDisposition?.paths?.includes('src/docs/definitions'),JSON.stringify(result));assert.equal(fs.existsSync(path.join(f.source,'src/docs/swagger-output.json')),false);}
+ else {assert.equal(result.physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'src/docs/definitions/A.json')),true);}
+}));
