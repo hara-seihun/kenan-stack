@@ -3827,6 +3827,29 @@ function retainedCustodyResult(record) {
   return {record, action:"none", inspection:{classification:"blocked", reason:"explicit retained source/runtime custody; resume-growth admission required before cleanup or writing", processes:[], containers:[], systemdUnits:[]}};
 }
 
+// Owners whose custody the current owner holds through recorded ended-owner transfers
+// (release-ended-owners to a live parent or an authenticated requester), with the source
+// commit and path unchanged. The current owner is always a member. An adopter therefore
+// continues the original owner's retired ordinary release instead of being refused as if
+// the plan had changed; any other reassignment ends the lineage.
+const ENDED_CUSTODY_KINDS = new Set(["native-ended-child-parent-custody", "native-ended-owner-requester-custody"]);
+function endedCustodyLineage(database, record) {
+  const owners = new Set([record.owner]);
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_reassignment'").get()) return owners;
+  const rows = database.prepare("SELECT * FROM workspace_reassignment WHERE workspace_id=? ORDER BY sequence DESC LIMIT 64").all(record.id);
+  let current = record.owner;
+  for (const row of rows) {
+    let evidence;
+    try { evidence = JSON.parse(row.authorization); } catch { break; }
+    if (row.new_owner !== current || row.path !== record.path || !ENDED_CUSTODY_KINDS.has(evidence?.kind) || evidence.parent !== row.new_owner ||
+        row.old_source_commit !== record.sourceCommit || row.new_source_commit !== record.sourceCommit) break;
+    owners.add(row.old_owner);
+    if (typeof evidence.child === "string") owners.add(evidence.child);
+    current = row.old_owner;
+  }
+  return owners;
+}
+
 function terminalRetentionRelease(database, selected, args, statePath, automatic = false) {
   const owner = required(args, "owner");
   const expectedPlan = required(args, "expected-plan-sha256");
@@ -3835,7 +3858,11 @@ function terminalRetentionRelease(database, selected, args, statePath, automatic
     const record = recordBy(database, {id:selected.id});
     const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
     if (!row || digest(row.plan_json) !== expectedPlan || record.owner !== owner) {
-      growthError("stale-retention-release", "owner or capacity plan changed; read the current binding");
+      // Name the stale part and where its current value is read. The plan digest is
+      // growth-status binding.planSha256; a dispositionSha256 is a different object.
+      const stale = [record.owner !== owner ? `--owner is not the current custodian ${record.owner}` : null,
+        !row ? "no capacity plan is recorded" : digest(row.plan_json) !== expectedPlan ? "--expected-plan-sha256 is not the current capacity plan digest (growth-status binding.planSha256, not a dispositionSha256)" : null].filter(Boolean);
+      growthError("stale-retention-release", `owner or capacity plan changed; read the current binding: ${stale.join("; ")}`);
     }
     if (!automatic && !retainedGrowth(JSON.parse(row.plan_json))) throw Object.assign(new GrowthLifecycleError("future-growth-not-retired", "future growth is not retired"),{nextAction:futureGrowthAction(record)});
     if (existsSync(record.path) && generatedOnlySourceCustody(database, record.id)) growthError("retention-release-source-custody", "separate generated/source materialization retention remains");
@@ -4046,7 +4073,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   // An ordinary release may retire growth while a temporary consumer retains the tree.
   // Retrying that same end-writing intent needs terminal safety, not new growth admission.
   if (records.length === 1 && ["repair-required", "released"].includes(record.state) && record.leaseExpiresAt === 0 &&
-      previous.kind === "completed" && previous.owner === record.owner &&
+      previous.kind === "completed" && endedCustodyLineage(database, record).has(previous.owner) &&
       previous.result?.futureGrowthSettlement?.kind === "retired" &&
       previous.result.futureGrowthSettlement.requestId === previous.requestId &&
       previous.result.record?.path === record.path &&
@@ -5543,7 +5570,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {releaseAuthorityDependencies} = {}) {
   const releaseStarted=Date.now(), releaseScope=argv[0]==='release'?procScope(process.pid):null;
@@ -5728,6 +5755,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
             const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
               members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
             const result=submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
+              custodyLineage:[...endedCustodyLineage(database,record)],
               observe:row=>{
                 const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
                 const fields=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>line.split('=')));

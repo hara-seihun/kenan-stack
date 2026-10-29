@@ -23,7 +23,7 @@ if(known||refusedUnauthenticated){
   const latest=attempts?database.prepare('SELECT receipt_json FROM workspace_release_attempt WHERE workspace_id=? ORDER BY sequence DESC LIMIT 1').get(id):null;
   const unsettled=latest&&JSON.parse(latest.receipt_json).kind==='owned-retention';
   if(row&&refusedUnauthenticated&&row.state==='submitted'){database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=? WHERE workspace_id=? AND request_id=?").run(JSON.stringify({exitCode:2,finishedAt:Date.now(),refused:'release-caller-unverified'}),id,row.request_id);}
-  else if(row&&caller&&!unsettled){const original=JSON.parse(row.binding_json);if(original.agentId===caller.agentId&&original.channel===caller.channel)
+  else if(row&&caller&&!unsettled){const original=JSON.parse(row.continuations_json??'[]').at(-1)?.binding??JSON.parse(row.binding_json);if(original.agentId===caller.agentId&&original.channel===caller.channel)
    database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=? WHERE workspace_id=? AND request_id=?")
     .run(JSON.stringify({exitCode:process.exitCode??0,finishedAt:Date.now(),binding:caller}),id,row.request_id);}
  }finally{database.close();}
