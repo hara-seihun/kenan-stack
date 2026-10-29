@@ -115,7 +115,9 @@ Owned read-only staged directories (including0500 package payloads) are handled 
 
 ## Checks
 
-`node tools/agent-workspace/check.mjs` checks component deployment and partitions the lifecycle fixtures into 24 disjoint index shards. Each fixture runs exactly once; each shard has a 55-second deadline and shares the root check runner's concurrency budget. Fine-grained shards keep Git/SQLite-backed fixture batches bounded without increasing deadlines or dropping custody contracts.
+`node tools/agent-workspace/check.mjs` checks component deployment and partitions the lifecycle fixtures into 128 disjoint index shards. Each fixture runs exactly once; each shard has a 55-second deadline. The suite runs `PI_STACK_CHECK_CONCURRENCY` jobs at once (4 by default), or the root check runner's budget when run from it. To run one shard by hand: `AGENT_WORKSPACE_TEST_SHARD=INDEX/128 node --test tools/agent-workspace/test.mjs`.
+
+Every fixture process that imports `scratch-env.mjs` (the suite's heavy tests, including every `test.mjs` shard) first takes one of a fixed number of host-wide test slots (`test-slot.mjs`: an flock on `/var/tmp/agent-workspace-test-slots/slot-N` held for the process's lifetime; the count is a quarter of the cores, 4 on kenan-server, or `AGENT_WORKSPACE_TEST_SLOTS`). Extra processes wait for a free slot, and their descendants share their parent's. So however the tests are launched (check.mjs, an `xargs -P` loop, several agents at once), at most that many fixture processes and their `workspace create`, source-job and checkout-job children run on the host. On 2026-10-29 an ad hoc `xargs -P 16` over the shards, overlapping a second run, put about 290 agent-workspace processes on 16 cores (load 104); the slots make that impossible. `test-slot.test.mjs` checks the cap.
 
 ## Normal flow
 

@@ -1,3 +1,4 @@
+import './test-slot.mjs';
 import {statfsSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 
