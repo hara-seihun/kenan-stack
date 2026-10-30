@@ -755,17 +755,28 @@ function workspaceReleaseCommand(processRecord) {
   return ["main", "workspace.mjs"].includes(path.basename(resolved)) && path.basename(path.dirname(resolved)) === "agent-workspace";
 }
 
+// The foreground release CLI waiting for its background unit names the checkout only in its arguments, and so
+// do the processes waiting on it (`timeout 250 agent-workspace release --path X`, the agent's `bash -c`). They
+// are the requester, not consumers: a release CLI for this path and its ancestors are exempt when an argument is
+// their only reference. A cwd, executable or writable descriptor inside the checkout still counts, and so does
+// any other command naming it.
 function processReferences(workspacePath, snapshot = processSnapshot()) {
-  return snapshot.flatMap((processRecord) => {
+  const references = snapshot.map((processRecord) => {
     const matches = (processRecord.writableFiles ?? []).filter(file => within(workspacePath, file)).map(file => `write-fd:${file}`);
     if (processRecord.cwd !== null && within(workspacePath, processRecord.cwd)) matches.push(`cwd:${processRecord.cwd}`);
     if (processRecord.executable !== null && within(workspacePath, processRecord.executable)) matches.push(`exe:${processRecord.executable}`);
     if (processRecord.commandLine.some((argument) => argument === workspacePath || argument.includes(`${workspacePath}/`) || argument.includes(`=${workspacePath}`))) matches.push("argument");
-    // A foreground `agent-workspace release --path X` that waits for its background unit names X only as an
-    // argument; it is the requester, not a consumer (October 29: it retained its own checkout). A cwd, executable
-    // or writable descriptor inside the checkout still counts, and so does any other command naming it.
-    if (matches.length === 1 && matches[0] === "argument" && workspaceReleaseCommand(processRecord)) return [];
-    return matches.length === 0 ? [] : [{ pid: processRecord.pid, command: processRecord.command, commandLine: processRecord.commandLine.join(" ").slice(0, 300), matches }];
+    return { processRecord, matches };
+  });
+  const parents = new Map(snapshot.map((processRecord) => [processRecord.pid, processRecord.ppid]));
+  const requesters = new Set();
+  for (const { processRecord, matches } of references) {
+    if (!(matches.length === 1 && matches[0] === "argument" && workspaceReleaseCommand(processRecord))) continue;
+    for (let pid = processRecord.pid; pid > 1 && !requesters.has(pid); pid = parents.get(pid) ?? 0) requesters.add(pid);
+  }
+  return references.flatMap(({ processRecord, matches }) => {
+    if (matches.length === 0 || (requesters.has(processRecord.pid) && matches.length === 1 && matches[0] === "argument")) return [];
+    return [{ pid: processRecord.pid, command: processRecord.command, commandLine: processRecord.commandLine.join(" ").slice(0, 300), matches }];
   });
 }
 

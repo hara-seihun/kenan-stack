@@ -123,7 +123,7 @@ export function processSnapshot(strict = false, workspacePath = null, fdAccess =
           }
         }
       }
-      processes.push({ writableFiles, pid, command: commandLine[0] ?? "unknown", commandLine, cwd, executable });
+      processes.push({ writableFiles, pid, ppid: Number(status.match(/^PPid:\s+(\d+)/mu)?.[1] ?? 0), command: commandLine[0] ?? "unknown", commandLine, cwd, executable });
     } catch (error) {
       if (strict && (!["ENOENT", "ESRCH"].includes(error.code) || existsSync(root))) growthError("growth-writer-unknown", `cannot inspect process ${pid}: ${error.message}`);
       continue;

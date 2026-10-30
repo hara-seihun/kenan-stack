@@ -150,8 +150,8 @@ test('a waiting foreground release CLI does not retain the checkout it names, bu
 
 // October 30 (goal b4181c22): agents run the CLI through the `agent-workspace` symlink on PATH, so the waiting
 // foreground release's argv was `node ~/.local/bin/agent-workspace release --path X` and checkout-guard was retained
-// four times by "1 process" that nobody could find.
-test('a foreground release run through a PATH symlink is the requester; the retained reason names any real reference',()=>{
+// four times by "1 process" that nobody could find; `timeout 250 agent-workspace release ...` retained its checkout the same way.
+test('a foreground release run through a PATH symlink, and the processes waiting on it, are the requester; the retained reason names any real reference',()=>{
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'aw-symlink-cli-')),prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
   process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
   try{
@@ -165,6 +165,12 @@ test('a foreground release run through a PATH symlink is the requester; the reta
     assert.deepEqual(refs([record(['node',path.join(bin,'agent-workspace'),'release','--path',target,'--json'])]),[]);
     assert.deepEqual(refs([record(['node','bin/agent-workspace','release','--path',target],{cwd:root})]),[],'a relative invocation resolves against its cwd');
     assert.equal(refs([record(['node',path.join(bin,'not-the-cli'),'release','--path',target])]).length,1,'another script named on the command line still counts');
+    const cli=record(['node',path.join(bin,'agent-workspace'),'release','--path',target],{pid:11,ppid:10});
+    const waiting=record(['timeout','250','agent-workspace','release','--path',target],{pid:10,ppid:9});
+    const shell=record(['bash','-c','timeout 250 agent-workspace release --path '+target],{pid:9,ppid:1});
+    assert.deepEqual(refs([shell,waiting,cli]),[],'the processes waiting on the release CLI are the requester too');
+    assert.deepEqual(refs([{...shell,cwd:target},waiting,cli]).map(reference=>reference.pid),[9],'a waiting ancestor whose cwd is inside still counts');
+    assert.deepEqual(refs([waiting,record(['timeout','250','agent-workspace','heartbeat','--path',target],{pid:12,ppid:1})]).map(reference=>reference.pid),[10,12],'without a release CLI below it, a wrapper still counts');
     const consumer=record(['bash','build.sh',target+'/x'],{pid:4242});
     const inspection=workspaceTesting.inspectRecord({id:'r',path:target,state:'active',leaseExpiresAt:0,checkoutType:'worktree'},
       {ignoreLease:true,safety:{processes:[consumer],docker:{containers:[],available:true},systemd:{units:[],available:true}}});
