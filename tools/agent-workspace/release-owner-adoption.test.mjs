@@ -147,3 +147,31 @@ test('a waiting foreground release CLI does not retain the checkout it names, bu
   assert.equal(refs([record(['/usr/local/bin/node','/tmp/main','release','--path',target])]).length,1,'only the agent-workspace CLI is exempt');
   assert.equal(refs([record(['bash','build.sh',target+'/x'])]).length,1);
 });
+
+// October 30 (goal b4181c22): agents run the CLI through the `agent-workspace` symlink on PATH, so the waiting
+// foreground release's argv was `node ~/.local/bin/agent-workspace release --path X` and checkout-guard was retained
+// four times by "1 process" that nobody could find.
+test('a foreground release run through a PATH symlink is the requester; the retained reason names any real reference',()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'aw-symlink-cli-')),prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
+  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
+  try{
+    const target=path.join(root,'checkout');fs.mkdirSync(target);
+    const tool=path.join(root,'tools','agent-workspace');fs.mkdirSync(tool,{recursive:true});fs.writeFileSync(path.join(tool,'workspace.mjs'),'');
+    fs.symlinkSync('workspace.mjs',path.join(tool,'main'));
+    const bin=path.join(root,'bin');fs.mkdirSync(bin);fs.symlinkSync(path.join(tool,'main'),path.join(bin,'agent-workspace'));
+    fs.writeFileSync(path.join(root,'other.mjs'),'');fs.symlinkSync(path.join(root,'other.mjs'),path.join(bin,'not-the-cli'));
+    const record=(commandLine,extra={})=>({pid:7,command:'node',commandLine,cwd:'/',executable:'/usr/bin/node',writableFiles:[],...extra});
+    const refs=list=>workspaceTesting.processReferences(target,list);
+    assert.deepEqual(refs([record(['node',path.join(bin,'agent-workspace'),'release','--path',target,'--json'])]),[]);
+    assert.deepEqual(refs([record(['node','bin/agent-workspace','release','--path',target],{cwd:root})]),[],'a relative invocation resolves against its cwd');
+    assert.equal(refs([record(['node',path.join(bin,'not-the-cli'),'release','--path',target])]).length,1,'another script named on the command line still counts');
+    const consumer=record(['bash','build.sh',target+'/x'],{pid:4242});
+    const inspection=workspaceTesting.inspectRecord({id:'r',path:target,state:'active',leaseExpiresAt:0,checkoutType:'worktree'},
+      {ignoreLease:true,safety:{processes:[consumer],docker:{containers:[],available:true},systemd:{units:[],available:true}}});
+    assert.equal(inspection.classification,'referenced',inspection.reason);
+    assert.match(inspection.reason,/process 4242 \(bash build\.sh .*checkout\/x\) by argument/);
+  }finally{
+    if(prior===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=prior;
+    fs.rmSync(root,{recursive:true,force:true});
+  }
+});

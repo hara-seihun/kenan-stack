@@ -743,10 +743,16 @@ function safetySnapshot(database) {
   };
 }
 
-function workspaceReleaseCommand(commandLine) {
-  const [interpreter, script, command] = commandLine;
-  return typeof interpreter === "string" && path.basename(interpreter).startsWith("node") && typeof script === "string" &&
-    ["main", "workspace.mjs"].includes(path.basename(script)) && /(^|\/)agent-workspace\/[^/]+$/u.test(script) && command === "release";
+// The CLI is recognised by the file node runs, not by the name it was invoked under: agents run it through
+// the `agent-workspace` symlink on PATH (October 30: that argv retained checkout-guard), operators through
+// /srv/.../agent-workspace/main, and both resolve to agent-workspace/workspace.mjs.
+function workspaceReleaseCommand(processRecord) {
+  const [interpreter, script, command] = processRecord.commandLine;
+  if (typeof interpreter !== "string" || !path.basename(interpreter).startsWith("node") || typeof script !== "string" || command !== "release") return false;
+  const invoked = path.resolve(processRecord.cwd ?? "/", script);
+  let resolved = invoked;
+  try { resolved = realpathSync(invoked); } catch {}
+  return ["main", "workspace.mjs"].includes(path.basename(resolved)) && path.basename(path.dirname(resolved)) === "agent-workspace";
 }
 
 function processReferences(workspacePath, snapshot = processSnapshot()) {
@@ -758,9 +764,19 @@ function processReferences(workspacePath, snapshot = processSnapshot()) {
     // A foreground `agent-workspace release --path X` that waits for its background unit names X only as an
     // argument; it is the requester, not a consumer (October 29: it retained its own checkout). A cwd, executable
     // or writable descriptor inside the checkout still counts, and so does any other command naming it.
-    if (matches.length === 1 && matches[0] === "argument" && workspaceReleaseCommand(processRecord.commandLine)) return [];
-    return matches.length === 0 ? [] : [{ pid: processRecord.pid, command: processRecord.command, matches }];
+    if (matches.length === 1 && matches[0] === "argument" && workspaceReleaseCommand(processRecord)) return [];
+    return matches.length === 0 ? [] : [{ pid: processRecord.pid, command: processRecord.command, commandLine: processRecord.commandLine.join(" ").slice(0, 300), matches }];
   });
+}
+
+// The retained-checkout reason names every reference so the person reading it can act without a second census.
+function referenceNames(processes, containers, units) {
+  const names = [
+    ...processes.map((reference) => `process ${reference.pid} (${reference.commandLine ?? reference.command}) by ${reference.matches.join(", ")}`),
+    ...containers.map((reference) => `container ${reference.name}`),
+    ...units.map((reference) => `${reference.manager} systemd unit ${reference.id}`),
+  ];
+  return names.length === 0 ? "" : `: ${names.join("; ")}`;
 }
 
 function dockerReferences(workspacePath, snapshot = dockerSnapshot()) {
@@ -1187,7 +1203,7 @@ function inspectRecord(record, options = {}) {
   if (processes.length > 0 || docker.references.length > 0 || systemd.references.length > 0) {
     return {
       classification: "referenced",
-      reason: `${processes.length} process, ${docker.references.length} container, and ${systemd.references.length} systemd references remain`,
+      reason: `${processes.length} process, ${docker.references.length} container, and ${systemd.references.length} systemd references remain${referenceNames(processes, docker.references, systemd.references)}`,
       processes,
       containers: docker.references,
       systemdUnits: systemd.references,
