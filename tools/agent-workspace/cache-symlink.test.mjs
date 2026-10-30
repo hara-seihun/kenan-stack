@@ -38,7 +38,7 @@ test('declared ignored owned link is unlinked after exact lexical and real-targe
   assert.equal(fs.statSync(f.external).ino,before.ino);assert.equal(fs.statSync(path.join(f.external,'payload')).ino,payload.ino);assert.equal(fs.readFileSync(path.join(f.external,'payload'),'utf8'),'external original bytes');
 }));
 
-for(const kind of ['unknown','tracked','not-ignored','stale','future','errors','references','borrowers','malformed','replaced-link','replaced-parent','changed-ignore','dangling','loop'])
+for(const kind of ['unknown','tracked','not-ignored','stale','future','errors','references','attributed-real-target','pidless-real-target','borrowers','malformed','replaced-link','replaced-parent','changed-ignore','dangling','loop'])
  test(`cache symlink removal preserves ${kind} custody`,()=>fixture(f=>{
   let calls=0;
   const context={...f.context};
@@ -51,7 +51,9 @@ for(const kind of ['unknown','tracked','not-ignored','stale','future','errors','
     if(kind==='stale')safety.observedAt=Date.now()-61000;
     if(kind==='future')safety.observedAt=Date.now()+61000;
     if(kind==='errors')safety.errors=['unknown runtime'];
-    if(kind==='references')safety.references=[{root:f.external,pid:42,kind:'real-target-read-fd'}];
+    if(kind==='references')safety.references=[{root:f.target,pid:42,kind:'alias-argument'}];
+    if(kind==='attributed-real-target')safety.references=[{root:f.external,pid:42,kind:'real-target-read-fd'},{root:f.target,pid:42,kind:'alias-argument'}];
+    if(kind==='pidless-real-target')safety.references=[{root:f.external,kind:'queued-stack-custody'}];
     if(kind==='borrowers')safety.retainedBorrowers=[{path:f.external}];
     if(kind==='malformed')return {};
     if(kind==='replaced-link'){fs.unlinkSync(f.target);fs.symlinkSync(f.external+'/payload',f.target);}
@@ -62,6 +64,20 @@ for(const kind of ['unknown','tracked','not-ignored','stale','future','errors','
   if(kind==='loop'){fs.unlinkSync(f.target);fs.symlinkSync('node_modules',f.target);}
   assert.equal(unlinkDeclaredCacheSymlink(context),false);unchanged(f);
  }));
+
+test('a reader of the shared real target alone does not retain the alias; its bytes and inode survive',()=>fixture(f=>{
+  const payload=fs.statSync(path.join(f.external,'payload'));
+  const references=[{root:f.external,pid:42,command:'bun test',matches:['fd:'+path.join(f.external,'payload')]}];
+  assert.equal(unlinkDeclaredCacheSymlink({...f.context,observe:()=>({...f.clear(),references})}),true);
+  assert.equal(fs.existsSync(f.target),false);
+  assert.equal(fs.statSync(path.join(f.external,'payload')).ino,payload.ino);assert.equal(fs.readFileSync(path.join(f.external,'payload'),'utf8'),'external original bytes');
+}));
+
+test('a real target inside the checkout keeps every reference strict',()=>fixture(f=>{
+  const inside=path.join(f.root,'vendor-deps');fs.mkdirSync(inside);fs.unlinkSync(f.target);fs.symlinkSync(inside,f.target);
+  assert.equal(unlinkDeclaredCacheSymlink({...f.context,observe:()=>({...f.clear(),references:[{root:inside,pid:42}]})}),false);
+  assert.equal(fs.lstatSync(f.target).isSymbolicLink(),true);
+}));
 
 test('foreign-owned cache symlink is retained without observing or changing its target',()=>fixture(f=>{
   execFileSync('sudo',['-n','chown','-h','65534:65534',f.target]);
@@ -112,7 +128,7 @@ test('unknown ignored and tracked symlinks remain protected by the release Git c
   assert.deepEqual(w.stripCaches(record,path.join(f.base,'registry.sqlite3'),()=>{},()=>f.clear()),[]);unchanged(f);
 }));
 
-test('native all-FD observer protects a real target opened read-only through the declared symlink',async()=>{
+test('native all-FD observer: a real-target reader retains the alias only when attributed to it',async()=>{
   const base=fs.mkdtempSync(path.join(tmpdir(),'cache-link-native-')),root=path.join(base,'source'),external=path.join(base,'canonical');
   fs.mkdirSync(root);fs.mkdirSync(external);fs.writeFileSync(path.join(external,'payload'),'external');const target=path.join(root,'node_modules');fs.symlinkSync(external,target);
   // Open then erase the spelling from argv: /proc resolves this read FD to canonical.
@@ -122,8 +138,18 @@ test('native all-FD observer protects a real target opened read-only through the
     const entry=new URL('./workspace.mjs',import.meta.url).pathname;
     const refs=JSON.parse(execFileSync('sudo',['-n',process.execPath,entry,'materialization-process-snapshot','--path',target,'--path',external],{encoding:'utf8',timeout:15000}));
     assert.ok(refs.some(r=>r.pid===child.pid&&r.root===external&&r.matches.some(m=>m.includes('payload'))),JSON.stringify(refs));
-    assert.equal(unlinkDeclaredCacheSymlink({root,target,declarations:['node_modules'],tracked:()=>false,ignored:()=>true,observe:()=>({errors:[],references:refs,retainedBorrowers:[],observedAt:Date.now()}),invalidateCapacity:()=>assert.fail('referenced link cannot invalidate allocation')}),false);
-    assert.equal(fs.lstatSync(target).isSymbolicLink(),true);
+    // The same descriptor plus the alias spelling in this process's arguments is attributed.
+    const attributed=spawn(process.execPath,['-e',`setInterval(()=>{},1000)`,target],{stdio:'ignore'});
+    try {
+      await new Promise(resolve=>setTimeout(resolve,200));
+      const named=JSON.parse(execFileSync('sudo',['-n',process.execPath,entry,'materialization-process-snapshot','--path',target,'--path',external],{encoding:'utf8',timeout:15000}));
+      assert.ok(named.some(r=>r.pid===attributed.pid&&r.root===target),JSON.stringify(named));
+      assert.equal(unlinkDeclaredCacheSymlink({root,target,declarations:['node_modules'],tracked:()=>false,ignored:()=>true,observe:()=>({errors:[],references:named,retainedBorrowers:[],observedAt:Date.now()}),invalidateCapacity:()=>assert.fail('referenced link cannot invalidate allocation')}),false);
+      assert.equal(fs.lstatSync(target).isSymbolicLink(),true);
+    } finally {attributed.kill('SIGKILL');await once(attributed,'exit');}
+    // An unattributed reader keeps its descriptor; unlinking the alias never touches the target.
+    assert.equal(unlinkDeclaredCacheSymlink({root,target,declarations:['node_modules'],tracked:()=>false,ignored:()=>true,observe:()=>({errors:[],references:refs,retainedBorrowers:[],observedAt:Date.now()}),invalidateCapacity:()=>{}}),true);
+    assert.equal(fs.existsSync(target),false);assert.equal(fs.readFileSync(path.join(external,'payload'),'utf8'),'external');
   } finally {child.kill('SIGKILL');await once(child,'exit');fs.rmSync(base,{recursive:true,force:true});}
 });
 

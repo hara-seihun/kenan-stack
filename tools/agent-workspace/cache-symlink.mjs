@@ -26,15 +26,33 @@ export function unlinkDeclaredCacheSymlink(context) {
   };
   const before = snapshot();
   if (!before || context.tracked(target) || !context.ignored(relative)) return false;
+  // Checkout-level references were inspected just before caches are stripped; the
+  // alias spelling attributes a reader of the real target to this checkout.
   const safety = context.observe([...new Set([target, before.resolved])]);
   if (!safety || !Array.isArray(safety.errors) || !Array.isArray(safety.references) || !Array.isArray(safety.retainedBorrowers) ||
       !Number.isSafeInteger(safety.observedAt) || safety.observedAt > Date.now() || Date.now() - safety.observedAt > 60000 ||
-      safety.errors.length || safety.references.length || safety.retainedBorrowers.length) return false;
+      safety.errors.length || aliasBlockingReferences(safety.references, {root, target, resolved:before.resolved}).length ||
+      safety.retainedBorrowers.length) return false;
   // Do not unlink a replacement or a path reached through a replaced ancestor.
   if (context.tracked(target) || !context.ignored(relative) || JSON.stringify(snapshot()) !== JSON.stringify(before)) return false;
   context.invalidateCapacity();
   fs.unlinkSync(target);
   return true;
+}
+
+// Unlinking an alias never touches its real target: open descriptors, mappings and cwds
+// in that tree stay valid, and Node and Bun load later modules by real path. A process
+// whose only observed reference is the shared real target (another agent's test run in
+// the canonical node_modules, for example) therefore does not depend on this alias, and
+// counting it left every checkout that links a busy shared tree repair-required.
+// Such a reference still blocks when the same process also references the alias, when
+// the target lies inside the checkout, or when it carries no process id. Release has
+// already refused a checkout that any process references by cwd, argument or descriptor.
+export function aliasBlockingReferences(references, {root, target, resolved}) {
+  if (!Array.isArray(references)) throw new Error('references required');
+  const inside = resolved === root || resolved.startsWith(root + path.sep);
+  const attributed = new Set(references.filter(ref => Number.isSafeInteger(ref?.pid) && ref.root !== resolved).map(ref => ref.pid));
+  return references.filter(ref => inside || !Number.isSafeInteger(ref?.pid) || ref.root !== resolved || attributed.has(ref.pid));
 }
 
 // Installed consumers of a canonical dependency tree do not borrow every other
