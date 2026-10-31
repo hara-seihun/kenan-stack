@@ -393,12 +393,15 @@ function initializeRegistry(database) {
   }
 }
 
+// How long one registry statement waits for another process's write lock. Under host saturation a
+// writer can hold it for seconds; one second turned ordinary releases into 'database is locked'.
+const REGISTRY_BUSY_MS = 15000;
 function openRegistry(statePath = DEFAULT_STATE, deadline) {
   mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
   const database = new DatabaseSync(statePath);
   registryPaths.set(database, statePath);
   try {
-    database.exec(`PRAGMA busy_timeout = ${deadline===undefined?5000:Math.max(0,Math.min(1000,deadline-Date.now()))}`);
+    database.exec(`PRAGMA busy_timeout = ${deadline===undefined?REGISTRY_BUSY_MS:Math.max(0,Math.min(REGISTRY_BUSY_MS,deadline-Date.now()))}`);
     if (registrySchemaVersion(database) !== REGISTRY_SCHEMA_VERSION || !hasPendingIndex(database) || !hasCapacityLedger(database) || !hasCapacityMeasurements(database) || !hasReassignmentLedger(database) || !database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_growth_policy'").get() ||
       database.prepare("PRAGMA journal_mode").get().journal_mode !== "wal") {
       withResourceLock(statePath, "registry-schema", () => initializeRegistry(database),deadline);
@@ -6043,7 +6046,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     else if(commandName==='release') {
       const selected=recordBy(database,selectorFrom(args,'release'));
       const group=recordsInGroup(database,selected),record=[...(group.length?group:[selected])].sort((a,b)=>a.id.localeCompare(b.id))[0];
-      database.exec('PRAGMA busy_timeout=1000');
+      database.exec(`PRAGMA busy_timeout=${Math.max(1000,Math.min(REGISTRY_BUSY_MS,releaseEntryDeadline-Date.now()))}`);
       const initialMembers=recordsInGroup(database,record);
       // A completed release is history, not custody: anyone may read that it already happened.
       // Before October 29 a non-custodian got release-owner-mismatch for a checkout that was

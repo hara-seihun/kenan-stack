@@ -31,6 +31,11 @@ export function observationTimeout(receipt) {
  const items=Array.isArray(receipt)?receipt:[receipt];
  return items.length>0&&items.every(item=>['inspection-timeout','growth-observation-timeout'].includes(item?.error?.code));
 }
+// SQLite refused the registry lock past its busy timeout (a saturated host, 2026-10-30). The CLI
+// exits 1 with this message and no receipt; the next attempt reinspects everything from the journal.
+export function registryBusy(result,receipt) {
+ return receipt===null&&result.status===1&&/database (?:table )?is locked/.test(String(result.stderr??''));
+}
 export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budgetMs=120000,referencePollMs=2000}={}) {
  const deadline=now()+budgetMs;
  for(;;) {
@@ -41,6 +46,9 @@ export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budget
   if(busy && [0,75].includes(result.status)) {
    if(now()>=deadline)return {result,receipt,exitCode:75,known:true};
    await sleep(250);continue;
+  }
+  if(registryBusy(result,receipt) && now()+1000<deadline) {
+   await sleep(1000);continue;
   }
   if(observationTimeout(receipt) && result.status===2 && now()+referencePollMs<deadline) {
    await sleep(referencePollMs);continue;

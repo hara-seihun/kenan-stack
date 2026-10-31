@@ -54,7 +54,10 @@ export function submitRelease({database,record,request,binding,launch,settlement
  // on an ended unit. That is a known non-launch, so it may continue once the unit ceased.
  const reusedContinuation=row?.state==='submitted'&&JSON.parse(row.launch_json??'null')?.reused===true&&JSON.parse(row.continuations_json??'[]').length>0;
  if(adoptedContinuation)continueKnown=true;
- else if(row?.state==='terminal-known'||reusedContinuation)continueKnown=observe(row).ceased===true;
+ // A launched unit that ended without recording a terminal result (it died on an error with no
+ // receipt, such as 'database is locked' on 2026-10-30) left nothing to replay: once the unit
+ // ceased, a repeated release continues. Release resumes any owned retention it left itself.
+ else if(['terminal-known','submitted'].includes(row?.state)||reusedContinuation)continueKnown=observe(row).ceased===true;
  if(!row||continueKnown){
   const requestId=row?.request_id??randomUUID(),name=row?.unit_name??'aw-release-'+createHash('sha256').update(record.id+requestText).digest('hex').slice(0,32);
   // Background launches are idempotent per name, so every continuation launches under its

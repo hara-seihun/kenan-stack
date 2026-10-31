@@ -17,7 +17,7 @@ if(result.error||result.signal)console.error(JSON.stringify({ok:false,code:'rele
 const refusedUnauthenticated=lastReceipt?.error?.code==='release-caller-unverified'&&process.exitCode===2;
 if(known||refusedUnauthenticated){
  const database=new DatabaseSync(state);try{
-  database.exec('PRAGMA busy_timeout=1000');
+  database.exec('PRAGMA busy_timeout=15000');
   const id=argv[argv.indexOf('--id')+1],row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(id),caller=nativeCaller();
   const attempts=database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_release_attempt'").get();
   const latest=attempts?database.prepare('SELECT receipt_json FROM workspace_release_attempt WHERE workspace_id=? ORDER BY sequence DESC LIMIT 1').get(id):null;

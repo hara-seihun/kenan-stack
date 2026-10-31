@@ -70,3 +70,11 @@ test('a safety observation timeout is re-observed, then left as a known refusal'
  let t=0;const out=await runReleaseWorker(()=>timeout,{sleep:async()=>{t+=2000;},now:()=>t,budgetMs:5000});
  assert.equal(out.known,true,'a typed timeout is a known non-effect the next continuation may follow');assert.equal(out.exitCode,2);
 });
+
+// 2026-10-30, tmp-bash-spill: on a saturated host the background release died with only
+// "agent-workspace: database is locked" and the checkout stayed. The worker now tries again.
+test('a registry lock timeout is retried and returns the next attempt',async()=>{
+ const values=[{stdout:'',stderr:'agent-workspace: database is locked\n',status:1},child(settled)];let sleeps=0;
+ const result=await runReleaseWorker(()=>values.shift(),{sleep:async()=>{sleeps++;}});
+ assert.equal(sleeps,1);assert.equal(result.exitCode,0);assert.deepEqual(result.receipt,settled);
+});

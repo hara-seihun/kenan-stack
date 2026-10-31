@@ -20,7 +20,7 @@ test('a known protected refusal continues the same request only after the origin
  const first=submitRelease(base);base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:2,finishedAt:1}));
  const live=submitRelease({...base,observe:()=>({ceased:false})});assert.equal(count(),1);assert.equal(live.requestId,first.requestId);
  const resumed=submitRelease({...base,binding:{...base.binding,callId:'authentic continuation'},observe:()=>({ceased:true})});assert.equal(count(),2);assert.equal(resumed.requestId,first.requestId);assert.equal(resumed.unitName,first.unitName);assert.deepEqual(resumed.originalBinding,base.binding);
- const duplicate=submitRelease({...base,observe:()=>({ceased:true})});assert.equal(count(),2);assert.equal(duplicate.requestId,first.requestId);
+ const duplicate=submitRelease({...base,observe:()=>({ceased:false})});assert.equal(count(),2);assert.equal(duplicate.requestId,first.requestId);
 }));
 test('an unknown original effect is never relaunched even if its unit is gone',()=>fixture((base,count)=>{
  const first=submitRelease({...base,launch:()=>({code:'response-lost'})});assert.equal(first.state,'launch-unknown');
@@ -83,3 +83,12 @@ test('an exit-0 release that physically retained the checkout continues on repet
  assert.equal(retry.requestId,first.requestId);assert.deepEqual(retry.previousReleaseSettlement,retained);
 }));
 
+
+// 2026-10-30, tmp-bash-spill: the background unit died on 'database is locked' without recording a
+// terminal result, and every repeated release replayed the old submission instead of trying again.
+test('a launched release whose unit ended without a terminal record continues on repetition',()=>fixture((base,count)=>{
+ const first=submitRelease(base);assert.equal(first.state,'submitted');
+ const live=submitRelease({...base,observe:()=>({ceased:false})});assert.equal(count(),1);assert.equal(live.completed,false);
+ const retry=submitRelease({...base,observe:()=>({ceased:true})});
+ assert.equal(count(),2);assert.equal(retry.action,'release-submitted');assert.equal(retry.requestId,first.requestId);
+}));
