@@ -1159,7 +1159,9 @@ test("capacity caches survive retained source inspection and invalidate only bef
     const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "cache-lifecycle", "--repo", f.source,
       "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", "128", "--json"], f.env));
     writeFileSync(path.join(created.path,".git/info/exclude"),"node_modules/\n");
+    // An unpublished commit keeps the checkout (release archives mere uncommitted edits).
     writeFileSync(path.join(created.path, "file.txt"), "dirty retained source\n");
+    git(created.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qam", "unpublished");
     run(["measure-capacity", "--id", created.id, "--json"], f.env);
     const db = new DatabaseSync(f.env.PI_WORKSPACE_STATE);
     const cached = () => db.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(created.id);
@@ -1178,7 +1180,7 @@ test("capacity caches survive retained source inspection and invalidate only bef
     assert.equal(existsSync(created.path), true);
     assert.deepEqual(cached(), generatedMeasurement);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "dirty retained source\n");
-    git(created.path,"checkout","--","file.txt");
+    git(created.path,"reset","-q","--hard","HEAD~1");
     const growth=JSON.parse(run(["growth-status", "--id", created.id, "--path", created.path, "--json"], f.env));
     const cleaned=JSON.parse(run(["release", "--id", created.id, "--end-retention", "--owner", created.owner, "--expected-plan-sha256", growth.binding.planSha256, "--json"], f.env));
     assert.equal(cached(), undefined,JSON.stringify(cleaned));
@@ -1869,8 +1871,10 @@ test("budgeted admission rejects unknown source imports, filters and unspecified
     writeFileSync(path.join(f.source, ".gitattributes"), "*.txt working-tree-encoding=UTF-16\n");
     git(f.source, "add", ".gitattributes");
     git(f.source, "commit", "-m", "unknown encoding transform");
+    // A new destination: a repeat of the same request reuses its pinned (pre-attribute) commit (ref-pin.mjs).
+    const attributeBase = base.map(arg => arg === "unknown" ? "unknown-attribute" : arg);
     for (const selection of [[], ["--sparse-pattern", "never-matches"]]) {
-      assert.throws(() => run([...base, ...budget, ...selection], f.env), /estimate unknown.*attribute/);
+      assert.throws(() => run([...attributeBase, ...budget, ...selection], f.env), /estimate unknown.*attribute/);
     }
     assert.deepEqual(JSON.parse(run(["status", "--json"], f.env)).records, []);
     assert.equal(existsSync(path.join(f.workspaces, "unknown")), false);
@@ -2753,10 +2757,10 @@ test("a registered linked worktree prevents release of its parent clone", () => 
     assert.equal(readFileSync(path.join(childPath, "unique.txt"), "utf8"), "unfinished child work\n");
     assert.equal(existsSync(parent.path), true);
 
+    // Releasing the child archives its uncommitted file, then removes it; the parent follows.
     const childRelease = JSON.parse(run(["release", "--id", child.id, "--json"], f.env));
-    assert.equal(childRelease.inspection.classification, "repair-required");
-    rmSync(path.join(childPath, "unique.txt"));
-    assert.equal(JSON.parse(run(["release", "--id", child.id, "--json"], f.env)).action, "released");
+    assert.equal(childRelease.action, "released", JSON.stringify(childRelease.inspection));
+    assert.equal(execFileSync("tar", ["--zstd", "-xOf", childRelease.workingTreeArchive, "unique.txt"], { encoding: "utf8" }), "unfinished child work\n");
     assert.equal(JSON.parse(run(["release", "--id", parent.id, "--json"], f.env)).action, "released");
   } finally { f.close(); }
 });

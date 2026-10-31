@@ -113,7 +113,7 @@ test('every installed channel is observed against one absolute deadline and fail
  const seen=[];
  const ok=currentStackQueueReferences(['/source'],{resourceKind:'physical-checkout',deadline:Date.now()+10000,channels,caller,user,execute:(name,args)=>{
   assert.equal(name,'psql');assert.deepEqual(args.slice(args.indexOf('--host'),args.indexOf('--host')+6),['--host','/run/kenan/pg','--username','kenan','--dbname',args[args.indexOf('--dbname')+1]]);
-  const db=args[args.indexOf('--dbname')+1];seen.push(db);const sql=args.at(-1);assert.match(sql,/statement_timeout='4000ms'/);assert.match(sql,/BEGIN READ ONLY/);
+  const db=args[args.indexOf('--dbname')+1];seen.push(db);const sql=args.at(-1);assert.match(sql,/statement_timeout='[0-9]+ms'/);assert.match(sql,/BEGIN READ ONLY/);
   assert.equal(sql.includes("p->>'callId'='exact-call'"),db==='kenan_production');
   return {status:0,stdout:JSON.stringify({self:db==='kenan_production'?1:0,references:db==='kenan_beta'?[{kind:'tool_call',id:'running',state:'running',resourceClass:'reserved-tool-call'}]:[]})};}});
  assert.deepEqual(ok.errors,[]);assert.deepEqual(seen,['kenan_beta','kenan_production']);assert.equal(ok.references[0].channel,'beta');assert.equal(ok.observations[1].callerToolCalls,1);assert.equal(ok.observations[0].callerIdentity.code,'CALLER_CHANNEL_DIFFERENT');
@@ -153,4 +153,34 @@ test('retained queue verdict records the authenticated caller separately from a 
  const foreign={kind:'tool_call',id:'foreign-running-call',channel:'beta'};
  const result=workspaceTesting.stackQueueInspection({errors:[],references:[foreign],observations:[observation]});
  assert.deepEqual(result.currentStackReferences,[foreign]);assert.deepEqual(result.currentStackQueueObservations,[observation]);
+});
+
+test('a source view that times out under load falls back to live tool calls plus recent cached worker intent',()=>{
+ // 2026-10-31: the source view read ~190 MB of live workers' messages and passed its fixed 4 s
+ // statement timeout on a loaded host, so every reconcile kept every checkout blocked.
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'queue-intent-'));
+ try{
+  const workerIntentCache=path.join(dir,'intent.json'),channels=()=>['beta'],caller=()=>null,user=()=>'kenan';
+  const worker={kind:'agent',id:'w1',state:'running',resourceClass:'source-intent'},tool={kind:'tool_call',id:'t1',state:'running',resourceClass:'reserved-tool-call'};
+  let t=1_000_000;const now=()=>t;
+  const timeouts=[];
+  const first=currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+30000,channels,caller,user,workerIntentCache,now,execute:(_n,args,options)=>{
+   timeouts.push(Number(args.at(-1).match(/statement_timeout='(\d+)ms'/)[1]));assert.ok(options.timeout<=16500);
+   return {status:0,stdout:JSON.stringify({self:0,references:[worker]})};}});
+  assert.deepEqual(first.errors,[]);assert.equal(first.observations[0].workerIntent,'live');
+  assert.ok(timeouts[0]>4000&&timeouts[0]<=15000,String(timeouts[0]));
+  const loaded=(args)=>args.at(-1).includes("WHERE TRUE AND a.role='worker'")
+   ?{status:3,stdout:'',stderr:'psql:<stdin>:1: ERROR:  canceling statement due to statement timeout'}
+   :{status:0,stdout:JSON.stringify({self:0,references:[tool]})};
+  t+=10*60*1000;
+  const fallback=currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+30000,channels,caller,user,workerIntentCache,now,execute:(_n,args)=>loaded(args)});
+  assert.deepEqual(fallback.errors,[]);
+  assert.deepEqual(fallback.references.map(r=>r.id).sort(),['t1','w1']);
+  assert.equal(fallback.observations[0].workerIntent.kind,'cached');
+  t+=6*60*1000;
+  const stale=currentStackQueueReferences(['/source'],{resourceKind:'source',deadline:Date.now()+30000,channels,caller,user,workerIntentCache,now,execute:(_n,args)=>loaded(args)});
+  assert.equal(stale.errors.length,1);assert.match(stale.errors[0],/statement timeout.*no worker observation/);
+  const other=currentStackQueueReferences(['/elsewhere'],{resourceKind:'source',deadline:Date.now()+30000,channels,caller,user,workerIntentCache,now:()=>1_000_000,execute:(_n,args)=>loaded(args)});
+  assert.equal(other.errors.length,1,'another path has no cached worker intent');
+ }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });

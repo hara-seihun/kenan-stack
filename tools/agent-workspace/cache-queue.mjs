@@ -69,7 +69,11 @@ export function callerToolCall({pid=process.pid,argv=procArgv,parent=procParent,
  return fail('caller-ancestry-limit','The caller ancestry exceeded 64 processes.');
 }
 
-export function queueReferenceSql(root,selfArgs,resourceKind){
+// statementTimeoutMs: the read-only view may run as long as its caller's deadline allows (it read
+// ~190 MB of live workers' messages and took 1.2 s idle, over 4 s on a loaded host: 2026-10-31).
+// workers=false observes only running tool calls (cheap, index-backed) for the cached fallback.
+export function queueReferenceSql(root,selfArgs,resourceKind,{statementTimeoutMs=4000,workers=true}={}){
+ if(!Number.isSafeInteger(statementTimeoutMs)||statementTimeoutMs<100)throw new Error('statement timeout must be at least 100 ms');
  if(!['source','physical-checkout','generated-cache'].includes(resourceKind))throw new Error('explicit source or generated-cache resource kind required');
  const roots=Array.isArray(root)?root:[root];
  if(selfArgs!==null&&!identity(selfArgs))throw new Error('invalid caller tool identity');
@@ -84,20 +88,39 @@ export function queueReferenceSql(root,selfArgs,resourceKind){
  const serializedMatchForRoot=(body,root)=>`strpos((${body})::text,${literal(JSON.stringify(root).slice(1,-1))})>0 AND ${jsonRootMatch(body,root)}`;
 
  const source=resourceKind==='source';
- return `BEGIN READ ONLY; SET LOCAL statement_timeout='4000ms';
+ return `BEGIN READ ONLY; SET LOCAL statement_timeout='${statementTimeoutMs}ms';
  WITH running AS MATERIALIZED (SELECT m.id,m.conversation_id,m.parts,(${selfCall}) AS self FROM message m WHERE m.role='tool' AND m.state='streaming'),
  unique_self AS MATERIALIZED (SELECT id FROM running WHERE self AND (SELECT count(*) FROM running WHERE self)=1),
  self AS MATERIALIZED (SELECT DISTINCT conversation_id FROM running WHERE id IN (SELECT id FROM unique_self)),
  tools AS (SELECT 'tool_call' AS kind,r.id::text AS id,'running' AS state,'reserved-tool-call' AS "resourceClass",p->>'name' AS "toolName",p->'args'->>'path' AS "targetPath",${matchedRoots("p->'args'")} AS "matchedRoots"
   FROM running r CROSS JOIN LATERAL jsonb_array_elements(r.parts) p WHERE r.id NOT IN (SELECT id FROM unique_self) AND p->>'type'='tool' AND (${serializedMatch("p->'args'")}) AND (${jsonMatch("p->'args'")})),
  workers AS (SELECT 'agent' AS kind,a.id,a.state,'source-intent' AS "resourceClass",NULL::text AS "toolName",NULL::text AS "targetPath",NULL::json AS "matchedRoots"
-  FROM agent a WHERE ${source?'TRUE':'FALSE'} AND a.role='worker' AND NOT a.archived AND a.state<>'stopped' AND a.conversation_id NOT IN (SELECT conversation_id FROM self)
+  FROM agent a WHERE ${source&&workers?'TRUE':'FALSE'} AND a.role='worker' AND NOT a.archived AND a.state<>'stopped' AND a.conversation_id NOT IN (SELECT conversation_id FROM self)
   AND EXISTS (SELECT 1 FROM message m WHERE m.conversation_id=a.conversation_id AND ((${textMatch('m.text')}) OR ((${serializedMatch('m.parts')}) AND (${jsonMatch('m.parts')}))))),
  matching AS (SELECT * FROM tools UNION ALL SELECT * FROM workers)
  SELECT json_build_object('self',(SELECT count(*) FROM unique_self),'references',coalesce((SELECT json_agg(r) FROM (SELECT * FROM matching LIMIT 65) r),'[]'::json)); ROLLBACK;`;
 }
 
-export function currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadline,channels=kenanChannels,caller=callerToolCall,execute=boundedCommand,user=()=>userInfo().username}={}){
+// Live-worker intent (the expensive part of a source observation) from the last successful
+// observation of the same roots by the same caller. When the full view times out on a loaded
+// host, running tool calls are still observed live and worker intent comes from this cache if
+// it is at most WORKER_INTENT_TTL_MS old; otherwise the observation fails as before.
+export const WORKER_INTENT_TTL_MS=15*60*1000;
+export const defaultWorkerIntentCache=()=>path.join(path.dirname(process.env.PI_WORKSPACE_STATE??path.join(process.env.HOME??'/','.local','state','pi-workspaces','registry.sqlite3')),'queue-worker-intent.json');
+const intentKey=(channel,roots,self)=>JSON.stringify([channel,[...roots].sort(),self?.agentId??null]);
+function readIntentCache(file){try{const value=JSON.parse(fs.readFileSync(file,'utf8'));return value&&typeof value==='object'&&!Array.isArray(value)?value:{};}catch{return {};}}
+function writeIntentCache(file,key,references,now){
+ try{
+  const cache=readIntentCache(file);
+  for(const [k,v] of Object.entries(cache))if(!(now-v?.observedAt<=WORKER_INTENT_TTL_MS))delete cache[k];
+  cache[key]={observedAt:now,references};
+  fs.mkdirSync(path.dirname(file),{recursive:true});
+  const temporary=`${file}.tmp-${process.pid}`;fs.writeFileSync(temporary,JSON.stringify(cache));fs.renameSync(temporary,file);
+ }catch{}
+}
+const timedOut=result=>result.error?.code==='ETIMEDOUT'||/statement timeout/.test(String(result.stderr??''));
+
+export function currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadline,channels=kenanChannels,caller=callerToolCall,execute=boundedCommand,user=()=>userInfo().username,workerIntentCache=defaultWorkerIntentCache(),now=Date.now}={}){
  try{
   if(!Number.isSafeInteger(deadline))throw new Error('explicit absolute queue observation deadline required');
   if(!['source','physical-checkout','generated-cache'].includes(resourceKind))throw new Error('explicit source or generated-cache resource kind required');
@@ -106,17 +129,39 @@ export function currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadl
   const inventory=channels(),self=caller(),role=user();
   if(!/^[a-z_][a-z0-9_-]{0,31}$/.test(role))throw new Error('invalid observer database role');
   const references=[],observations=[];
-  for(const channel of inventory){
+  for(const [index,channel] of inventory.entries()){
    if(!CHANNEL.test(channel))throw new Error('invalid Kenan Stack channel: '+channel);
    const remaining=deadline-Date.now();if(remaining<=0)throw new Error('Kenan Stack queue observation deadline exhausted before '+channel);
    const selfArgs=self?.channel===channel?{callId:self.callId,agentId:self.agentId}:null;
-   const result=execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,'--dbname',channelDatabase(channel),'--set=ON_ERROR_STOP=1','--command',queueReferenceSql(roots,selfArgs,resourceKind)],{encoding:'utf8',timeout:Math.min(6000,remaining),maxBuffer:262144,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
-   if(result.status!==0||result.error)throw new Error('Kenan Stack queue unavailable: '+channel+': '+String(result.error?.code??result.stderr??result.status).slice(0,1500));
+   // Each remaining channel gets an equal share of the deadline (at most 15 s), less time for psql to start and answer.
+   const share=Math.floor(remaining/(inventory.length-index));
+   const query=(workers,budget)=>execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,'--dbname',channelDatabase(channel),'--set=ON_ERROR_STOP=1','--command',
+     queueReferenceSql(roots,selfArgs,resourceKind,{statementTimeoutMs:Math.max(100,Math.min(15000,budget-1500)),workers})],
+     {encoding:'utf8',timeout:Math.max(1,Math.min(16500,budget,deadline-Date.now())),maxBuffer:262144,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
+   const parse=result=>{
+    const observed=JSON.parse(result.stdout),rows=observed?.references;
+    if(!Array.isArray(rows)||rows.length>=65||!Number.isSafeInteger(observed.self)||rows.some(r=>!r||typeof r.id!=='string'||!['tool_call','agent'].includes(r.kind)||typeof r.state!=='string'))throw new Error('Kenan Stack queue observation incomplete: '+channel);
+    return {observed,rows};
+   };
+   const key=intentKey(channel,roots,self);
+   let result=query(true,share),workerIntent='live',observed,rows;
+   if((result.status!==0||result.error)&&resourceKind==='source'&&timedOut(result)){
+    const cached=readIntentCache(workerIntentCache)[key];
+    const age=now()-cached?.observedAt;
+    if(!(age>=0&&age<=WORKER_INTENT_TTL_MS)||!Array.isArray(cached.references))throw new Error('Kenan Stack queue unavailable: '+channel+': '+String(result.error?.code??result.stderr??result.status).slice(0,1500)+' (no worker observation of these paths in the last 15 minutes to fall back on)');
+    const toolsOnly=query(false,deadline-Date.now());
+    if(toolsOnly.status!==0||toolsOnly.error)throw new Error('Kenan Stack queue unavailable: '+channel+': '+String(toolsOnly.error?.code??toolsOnly.stderr??toolsOnly.status).slice(0,1500));
+    ({observed,rows}=parse(toolsOnly));
+    rows=[...rows.filter(r=>r.kind!=='agent'),...cached.references];
+    workerIntent={kind:'cached',ageMs:age};
+   } else {
+    if(result.status!==0||result.error)throw new Error('Kenan Stack queue unavailable: '+channel+': '+String(result.error?.code??result.stderr??result.status).slice(0,1500));
+    ({observed,rows}=parse(result));
+    if(resourceKind==='source')writeIntentCache(workerIntentCache,key,rows.filter(r=>r.kind==='agent'),now());
+   }
    if(Date.now()>=deadline)throw new Error('Kenan Stack queue observation deadline exhausted after '+channel);
-   const observed=JSON.parse(result.stdout),rows=observed?.references;
-   if(!Array.isArray(rows)||rows.length>=65||!Number.isSafeInteger(observed.self)||rows.some(r=>!r||typeof r.id!=='string'||!['tool_call','agent'].includes(r.kind)||typeof r.state!=='string'))throw new Error('Kenan Stack queue observation incomplete: '+channel);
    references.push(...rows.filter(r=>resourceKind!=='generated-cache'||!isSourceOnlyRead(r,cacheRoots)).map(r=>({...r,channel,roots})));
-   observations.push({channel,roots,count:rows.length,callerToolCalls:observed.self,callerIdentity:self?.channel===channel?{state:'authenticated-system-scope',agentId:self.agentId,callId:self.callId}:self?{state:'not-exempted',code:'CALLER_CHANNEL_DIFFERENT',callerChannel:self.channel,nextAction:'This authenticated caller belongs to another channel; its identity grants no exemption here.'}:{state:'not-exempted',code:'CALLER_IDENTITY_UNAVAILABLE',nextAction:'Use a current locally deployed native runtime with root scope identity; all unmatched streaming tools remain protected.'}});
+   observations.push({channel,roots,count:rows.length,workerIntent,callerToolCalls:observed.self,callerIdentity:self?.channel===channel?{state:'authenticated-system-scope',agentId:self.agentId,callId:self.callId}:self?{state:'not-exempted',code:'CALLER_CHANNEL_DIFFERENT',callerChannel:self.channel,nextAction:'This authenticated caller belongs to another channel; its identity grants no exemption here.'}:{state:'not-exempted',code:'CALLER_IDENTITY_UNAVAILABLE',nextAction:'Use a current locally deployed native runtime with root scope identity; all unmatched streaming tools remain protected.'}});
   }
   return {errors:[],references,observations,resourceKind,observedAt:Date.now()};
  }catch(error){return {errors:[String(error.message)],references:[],observations:[],observedAt:Date.now()};}
