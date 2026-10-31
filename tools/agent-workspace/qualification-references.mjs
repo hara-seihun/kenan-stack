@@ -3,7 +3,8 @@
 // process/streaming-tool guards see nothing for a request that is prepared but not yet
 // dispatched, so release/reconcile consults this census as well. Every verdict comes
 // from exact records; no verdict depends on age. Anything missing, malformed or
-// contradictory protects (fail closed) and is reported as an error.
+// contradictory protects (fail closed) and is reported as an error. An absent
+// optional merge queue has no trains; independent request custody still applies.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -95,7 +96,10 @@ export function qualificationReferences(roots = null, options = {}) {
 
   const queue = readJson(budget, directories.queueStateFile);
   let batches = [];
-  if (queue.missing) errors.push(`${directories.queueStateFile}: merge-queue state missing; train custody cannot be established`);
+  // The merge queue is optional and can be retired independently of retained
+  // qualification requests. Absence means no train custody, not an unreadable
+  // census. Existing malformed or inaccessible queue records still fail closed.
+  if (queue.missing) { /* No queue is installed. */ }
   else if (queue.error) errors.push(queue.error);
   else if (!isObject(queue.value) || !Array.isArray(queue.value.batches)) errors.push(`${directories.queueStateFile}: merge-queue state has no batches array`);
   else {

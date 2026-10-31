@@ -128,14 +128,20 @@ test("missing receipts and a missing dispatch grant protect; a grant without set
   assert.deepEqual(states, { [A]: "undispatched", [B]: "dispatched-unsettled" });
 });
 
-test("missing queue state or request directory is an error that protects all paths", () => {
+test("a retired queue does not retain unrelated paths or discard active request custody", () => {
   const f = fixture();
   f.addRequest(A);
   fs.rmSync(f.directories.queueStateFile);
   let result = census(f);
-  assert.equal(result.complete, false);
-  assert.match(result.errors[0], /state missing/u);
-  assert.equal(protects(result, "/x/y"), true);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.errors, []);
+  assert.equal(protects(result, "/x/y"), false);
+  assert.equal(protects(result, `${CLONES}/prepared-${A}`), true);
+  f.complete(A);
+  result = census(f);
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.references, []);
+  assert.equal(protects(result, `${CLONES}/prepared-${A}`), false);
   fs.rmSync(f.directories.requestsDir, { recursive: true });
   result = census(f);
   assert.equal(result.complete, true);
@@ -206,7 +212,7 @@ test("a current request also protects its carried root workspace before dispatch
 test("a host with only release locks and historical residue has no installed qualification component",()=>{
  const data=fs.mkdtempSync(path.join(os.tmpdir(),'qualification-uninstalled-'));try{
  fs.mkdirSync(path.join(data,'locks'));fs.mkdirSync(path.join(data,'old-scout'));const result=qualificationReferences(null,{dataRoot:data});assert.deepEqual(result.errors,[]);assert.equal(result.complete,true);assert.equal(result.references.length,0);assert.equal(result.observations[0].state,'not-installed');
- fs.mkdirSync(path.join(data,'qualification-authority-requests'));assert.equal(qualificationReferences(null,{dataRoot:data}).complete,false,'one existing authority source plus a missing peer is damaged, not uninstalled');
+ fs.mkdirSync(path.join(data,'qualification-authority-requests'));assert.equal(qualificationReferences(null,{dataRoot:data}).complete,true,'an empty request directory does not require the optional retired queue');
  }finally{fs.rmSync(data,{recursive:true,force:true});}
 });
 
@@ -235,4 +241,13 @@ test('changed retained closure, identity, path, or publication authority refuses
 });
 test('a publish request is never completed by a retained staging closure',()=>{
  const f=retainedFixture(),request=f.request(A);f.write(path.join(f.directories.requestsDir,A+'.json'),request);assert.equal(census(f).complete,false);
+});
+
+ test("an existing malformed queue still fails closed", () => {
+  const f = fixture();
+  f.write(f.directories.queueStateFile, "{broken");
+  const result = census(f);
+  assert.equal(result.complete, false);
+  assert.match(result.errors.join("\n"), /malformed JSON/u);
+  assert.equal(protects(result, "/unrelated/path"), true);
 });
