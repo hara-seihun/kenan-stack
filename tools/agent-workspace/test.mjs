@@ -2528,6 +2528,28 @@ test("creates and releases a clean review checkout", () => {
   }
 });
 
+test("release removes a published checkout that borrows objects from a non-mirror store, without importing them", () => {
+  // 2026-10-31: research clones borrow objects straight from their research remote, whose
+  // history is far larger than the checkout. Release used to try to import that history into
+  // a mirror before removing anything, refused with CUSTODY_IMPORT_EXCEEDS_RECLAIM and kept
+  // the checkout. A checkout whose work is all published loses nothing when removed.
+  const f = fixture();
+  try {
+    const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "borrower",
+      "--repo", f.remote, "--min-free-gib", "0", "--json"], f.env));
+    writeFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), `${path.join(f.remote, "objects")}\n`);
+    execFileSync("git", ["-C", f.remote, "hash-object", "-w", "--stdin"], { input: Buffer.alloc(8 * 1024 * 1024, 7) });
+    const mirrors = path.join(path.dirname(f.env.PI_WORKSPACE_STATE), "mirrors");
+    const mirrorsBefore = readdirSync(mirrors).sort();
+    const released = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.equal(existsSync(created.path), false);
+    assert.deepEqual(readdirSync(mirrors).sort(), mirrorsBefore);
+  } finally {
+    f.close();
+  }
+});
+
 test("repairs reference-clone maintenance during an active lease without pruning work", () => {
   const f = fixture();
   try {

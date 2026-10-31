@@ -1,3 +1,4 @@
+import './scratch-env.mjs';
 import {test} from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {execFileSync} from 'node:child_process';
 import {qualifyCustodyImport,exclusiveAllocatedBytes,guardedCustodyImport} from './custody-import-budget.mjs';
 test('tiny checkout cannot import whole history; unknown and peak/headroom refuse with zero credit',()=>{

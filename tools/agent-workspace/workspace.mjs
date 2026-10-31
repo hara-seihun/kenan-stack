@@ -1474,16 +1474,33 @@ function reconcileRecords(database, selected, options) {
         const current = recordsInGroup(database, recordBy(database, { id: selectedRecord.id }));
         const queuedProtection=stackQueueInspection(stackQueueSafety(current.map(record=>record.path),options.safety,options.terminalSourceTransfer===true?"physical-checkout":"source",options.deadline));
         if(queuedProtection!==null) return current.map(record=>({record,inspection:queuedProtection,action:"none"}));
-        if(options.execute) for(const record of current) {
-          if(!generatedOnlySourceCustody(database,record.id)&&!recordRetainsCustody(database,record.id)&&!retainedParent(database,record.path)) assertNoAmplifyingCleanupImport(record.path,options.statePath);
-        }
-        const maintenance = duringInspection(options.deadline, () => new Map(current.map((record) => [record.id, generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database, record.path) ? "retained-custody" : maintainReferenceClone(record.path, options.execute, options.statePath)])));
-        const reconciled = current.length > 1 ? groupReconciliation(database, current, options)
+        const retainsCustody = (record) => generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database, record.path);
+        const maintain = (records) => duringInspection(options.deadline, () => new Map(records.map((record) => [record.id, retainsCustody(record) ? "retained-custody" : maintainReferenceClone(record.path, options.execute, options.statePath)])));
+        const reconcile = () => current.length > 1 ? groupReconciliation(database, current, options)
           : current.length === 1 ? [reconcileRecord(database, current[0], options)] : [];
+        if (!options.execute) {
+          const maintenance = maintain(current);
+          return reconcile().map((result) => ({ ...result, gitMaintenance: maintenance.get(result.record.id) }));
+        }
+        // Object custody (importing borrowed objects into an independent mirror) only matters
+        // for a checkout that stays. Removing a checkout whose work is published loses nothing,
+        // so reconcile first and stabilise custody only for the checkouts that remain.
+        const reconciled = reconcile();
+        const removed = new Set(reconciled.filter((result) => result.action === "released" || result.action === "forgot-missing").map((result) => result.record.id));
+        const kept = current.filter((record) => !removed.has(record.id) && existsSync(record.path));
+        let maintenance;
+        try {
+          for (const record of kept) if (!retainsCustody(record)) assertNoAmplifyingCleanupImport(record.path, options.statePath);
+          maintenance = maintain(kept);
+        } catch (error) {
+          if (error instanceof ResourceBusyError) throw error;
+          const blocked = new Map(blockedReconciliation(database, kept, error, true).map((result) => [result.record.id, result]));
+          return reconciled.map((result) => blocked.get(result.record.id) ?? { ...result, record: recordBy(database, { id: result.record.id }), gitMaintenance: removed.has(result.record.id) ? "removed" : null });
+        }
         return reconciled.map((result) => ({
           ...result,
-          record: options.execute ? recordBy(database, { id: result.record.id }) : result.record,
-          gitMaintenance: maintenance.get(result.record.id),
+          record: recordBy(database, { id: result.record.id }),
+          gitMaintenance: removed.has(result.record.id) ? "removed" : maintenance.get(result.record.id) ?? null,
         }));
       }, selectedRecord.groupId, options.deadline));
     } catch (error) {
