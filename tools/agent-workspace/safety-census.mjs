@@ -488,7 +488,7 @@ function recordGitDependencies(record, execute) {
   const alternatesPath = path.join(objectDirectory, "info", "alternates");
   let contents;
   try { contents = readFileSync(alternatesPath, "utf8"); }
-  catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") return null; throw error; }
+  catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") return { alternates, linkedWorktrees }; throw error; }
   for (const alternate of contents.split("\n").filter(Boolean)) {
     alternates.push({ recordId: record.id, workspacePath: record.path, objectDirectory: path.resolve(objectDirectory, alternate) });
   }

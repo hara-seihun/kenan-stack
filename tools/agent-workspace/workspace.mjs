@@ -737,7 +737,7 @@ function gitDependencySnapshot(database) {
 // Observation caches beside the registry; each entry is reused only after its
 // file identities are revalidated (see safety-census.mjs).
 function observationCache(database, name) {
-  const statePath = database.location();
+  const statePath = typeof database.location === "function" ? database.location() : null;
   return statePath === null ? undefined : path.join(path.dirname(statePath), name);
 }
 

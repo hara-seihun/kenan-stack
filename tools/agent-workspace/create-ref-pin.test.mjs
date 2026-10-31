@@ -59,13 +59,14 @@ test('repeating a create of a moving ref keeps its first preparation instead of 
       writeFileSync(path.join(f.source, 'file.txt'), `moved ${round}\n`);
       git(f.source, 'commit', '-qam', `moved ${round}`);
       const repeated = create(f, 'moving', env);
-      assert.equal(repeated.receipt.state, 'preparing');
-      assert.equal(repeated.receipt.jobId, started.receipt.jobId, 'a moved HEAD must not start another source job');
+      // Where the job runs without the gated git (a user-manager unit), preparation may already be done.
+      if (repeated.receipt.state === 'preparing')
+        assert.equal(repeated.receipt.jobId, started.receipt.jobId, 'a moved HEAD must not start another source job');
     }
     writeFileSync(f.release, 'go');
     const done = create(f, 'moving', { ...f.env, PI_WORKSPACE_CREATE_WAIT_SECONDS: '50' });
     assert.equal(done.status, 0, JSON.stringify(done.receipt));
-    assert.equal(done.receipt.sourceCommit, first);
+    assert.equal(done.receipt.sourceCommit, first, 'the workspace is admitted at the commit the first call resolved');
     assert.equal(readFileSync(path.join(done.receipt.path, 'file.txt'), 'utf8'), 'first\n');
   } finally { f.close(); }
 });
