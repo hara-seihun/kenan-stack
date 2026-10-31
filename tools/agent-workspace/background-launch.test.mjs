@@ -166,10 +166,11 @@ test('a definitely refused submission can retry, returning the log actually used
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
-test('completed successful jobs do not remain active merely to retain retry evidence',()=>{
+// Ended units, failed ones included, are unloaded: 1,265 retained failed units made every daemon-reload 3x slower (2026-10-31).
+test('ended jobs neither stay active nor stay loaded in the system manager',()=>{
  const source=fs.readFileSync(new URL('./background-launch.mjs',import.meta.url),'utf8');
  assert.equal(source.includes('--property=RemainAfterExit=yes'),false);
- assert.equal(source.includes("'--collect'"),false);
+ assert.equal(source.includes("'--collect'"),true);
  assert.equal(source.includes('--property=Type=exec'),true);
 });
 test('background receipts live under a state directory that is not a retired pi path, and a missing parent is an error, not a created tree',async()=>{

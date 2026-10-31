@@ -24,7 +24,10 @@ export function backgroundSpec(input,binding,uid,gid){
  return {unit,description};
 }
 // A three-second kill used to discard the D-Bus reason during manager reloads.
-// Type=exec waits only for exec, not command completion; retain failed units for readback.
+// Type=exec waits only for exec, not command completion. Units are collected when they end (--collect): the job's log end
+// line and its job:AGENT:NAME event carry the outcome. Retaining failed units left 1,265 dead ones loaded in PID 1 by
+// 2026-10-31, which tripled every daemon-reload (1.6 s to 4.5 s, PID 1 blocked meanwhile) and stalled every agent's
+// tool-call scope behind back-to-back reloads (a 20 s timeout on a plain grep).
 export function submitBackground(command,args,{execute=run}={}){return execute(command,args,{timeout:15000});}
 export function launchIdentity(input){
  const argv=[...input.argv];
@@ -242,7 +245,7 @@ export function serve(instance){
 // systemd failed it at step CHDIR and the job ended without one (2026-10-31, two aw-release jobs).
 // All background jobs share user-agents-kenanbg.slice (Kenan Stack deploy/priority), weighted as one agent command, so
 // they can't crowd out the agents' own shells (2026-10-30: 17 jobs as separate siblings left each shell 0.05 CPU).
-const argsFor=(spec,uid,gid)=>input=>['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--property=WorkingDirectory=-${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')&&!x.startsWith('KENAN_BG_JOB=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1',...(input.argv[1]==='--run'?['--setenv='+jobMarker(spec.unit,input.argv[3])]:[]),'--',...input.argv];
+const argsFor=(spec,uid,gid)=>input=>['--system','--quiet','--collect','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--property=WorkingDirectory=-${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')&&!x.startsWith('KENAN_BG_JOB=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1',...(input.argv[1]==='--run'?['--setenv='+jobMarker(spec.unit,input.argv[3])]:[]),'--',...input.argv];
 export function main(){
  if(process.argv[2]==='serve')return serve(process.argv[3]);
  if(process.getuid()!==0)throw Error('background_root_required');
