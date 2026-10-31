@@ -243,3 +243,17 @@ test('reassign reports every missing binding and the authorization evidence sour
   });
   assert.deepEqual(f.snapshot(),before);
 }));
+
+test('a caller whose tool-call row lands a moment late is still authenticated',()=>fixture(f=>{
+  let calls=0;
+  const late=pairs=>++calls<3?{errors:[],confirmed:new Map()}:authenticate(pairs);
+  const result=authorizeWorkspaceRelease(f.db,[f.record],f.state,authority(PARENT,{authenticate:late}));
+  assert.equal(result.ok,true);assert.equal(calls,3);
+}));
+
+test('a tool call that never appears is refused after the bounded wait',()=>fixture(f=>{
+  const never=()=>({errors:[],confirmed:new Map()});
+  const started=Date.now();
+  const result=authorizeWorkspaceRelease(f.db,[f.record],f.state,authority(PARENT,{authenticate:never,confirmWaitMs:600}));
+  assert.equal(result.error.code,'release-caller-unverified');assert.ok(Date.now()-started>=500);
+}));

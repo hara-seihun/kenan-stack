@@ -44,15 +44,23 @@ function ownerOf(database,record,statePath,deadline,authenticate) {
 // This observation is read-only. In particular it never binds an admission receipt, drops a
 // lease, starts a release journal or changes the checkout on a rejected request.
 export function authorizeWorkspaceRelease(database,records,statePath,{caller=releaseCaller,authenticate=authenticateToolCalls,
-  deadline=Date.now()+30000}={}) {
+  deadline=Date.now()+30000,confirmWaitMs=10000}={}) {
   const self=caller();
   if(!self.ok)return self;
   if(self.kind==='operator')return {ok:true,kind:'operator'};
   if(self.kind!=='native'||!NATIVE_CUSTODIAN_ID.test(self.binding?.agentId??''))
     return refused('release-caller-unverified','An authenticated native caller is required.');
   const binding=self.binding;
-  const authentication=authenticate([binding],{deadline});
-  const channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
+  let authentication=authenticate([binding],{deadline});
+  let channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
+  // The stack stores the message holding this tool call while the command already runs; on a loaded host the row can land
+  // after a quick command looks for it (2026-10-31: a release 1 s into its call found 0 channels and kept the checkout held).
+  // An unconfirmed call is looked up again for up to 10 s before it counts as unauthenticated.
+  for(const settle=Math.min(deadline,Date.now()+confirmWaitMs);!authentication.errors.length&&channels.length===0&&Date.now()<settle;) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,250);
+    authentication=authenticate([binding],{deadline});
+    channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
+  }
   if(authentication.errors.length||channels.length!==1||channels[0]!==binding.channel) {
     const code=authentication.errors.length?'caller-tool-store-unavailable':channels.length===0?'caller-tool-unconfirmed':channels.length>1?'caller-tool-channel-ambiguous':'caller-tool-channel-mismatch';
     // Keep the first bounded error line, not SQL context, quoted values or the private identity.
