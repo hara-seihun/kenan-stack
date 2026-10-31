@@ -4629,6 +4629,14 @@ function releaseEndedOwnersCommand(database, args, statePath, authorityDependenc
     if (authority.kind === 'native' && OWNER_AGENT_ID.test(authority.binding.agentId)) requester = authority.binding;
   }
   let records = targeted ? [recordBy(database, selectorFrom(args, "release-ended-owners"))] : listRecords(database, one(args, "root"));
+  // A checkout whose native owner was never bound (only its admission receipt names the creator) was
+  // invisible here while release itself already named that creator as custodian (kenan-bg-fast,
+  // 2026-10-30). Bind the one targeted record first, so an ended creator's custody can move.
+  if (targeted && execute && !OWNER_AGENT_ID.test(canonicalNativeOwner(database, records[0]))) {
+    bindNativeOwnersCommand(database, {positional:[], named:new Map([["id",[records[0].id]],["execute",["true"]],["budget-ms",[String(Math.max(1000, Math.min(15_000, deadline - Date.now() - 1000)))]]])}, statePath,
+      authorityDependencies?.authenticate ? {authenticate:authorityDependencies.authenticate} : {});
+    records = [recordBy(database, {id:records[0].id})];
+  }
   records = records.filter(record => ENDED_OWNER_STATES.includes(record.state) && (OWNER_AGENT_ID.test(canonicalNativeOwner(database, record)) || (requester && OWNER_AGENT_ID.test(endedReleaseOwner(database, record))) || !existsSync(record.path)));
   const scope = `owner-liveness:${one(args, "root") === undefined ? "*" : path.resolve(one(args, "root"))}`;
   const cursor=ownerCursor(database,args,scope,targeted), explicitWalk=one(args,"after")!==undefined;

@@ -183,3 +183,11 @@ test('custody moved up an ended chain is never re-bound to the original creator'
  const bind=f.run(['bind-native-owners','--id',f.record.id,'--execute','--json']);assert.equal(bind.results[0].outcome,'custody-transferred',JSON.stringify(bind));
  assert.equal(fs.existsSync(f.source),true);
 }));
+
+// kenan-bg-fast, 2026-10-30: release named the ended creator (from its admission receipt) as custodian,
+// but a targeted release-ended-owners saw no candidate until someone ran bind-native-owners by hand.
+test('a targeted ended-owner release binds an unbound creator from its receipt, then releases',()=>fixture(f=>{
+ f.receipt(f.record);f.observe('stopped');
+ const result=workspaceTesting.releaseEndedOwnersCommand(f.db,f.args([['id',f.record.id],['execute',true],['json',true]]),f.state,{caller:()=>({ok:true,kind:'operator'}),authenticate:f.authenticated});
+ assert.equal(result.candidates,1,JSON.stringify(result));assert.equal(result.results[0].record.state,'released',JSON.stringify(result));assert.equal(fs.existsSync(f.source),false);
+}));
