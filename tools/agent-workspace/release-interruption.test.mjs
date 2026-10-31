@@ -5,22 +5,29 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync,spawn} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import {DatabaseSync} from 'node:sqlite';
 const modulePath=process.env.WORKSPACE_RELEASE_MODULE||fileURLToPath(new URL('./workspace.mjs',import.meta.url));
 const {main}=await import(modulePath);
+// These fixtures interrupt the synchronous operator release engine, not the native
+// foreground submitter (which deliberately survives its caller in a background unit).
+// Inject only the authenticated-caller observation at the existing API boundary.
+// Native authorization and submission are covered by their own suites.
+const releaseOptions={releaseAuthorityDependencies:{caller:()=>({ok:true,kind:'operator'})}};
 async function fixture(action){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'release-interruption-')),source=path.join(root,'source'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3');
  const prior=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';let db;
  const git=(...args)=>execFileSync('/usr/bin/git',args,{encoding:'utf8',timeout:3000,stdio:['ignore','pipe','pipe']}).trim();
- const run=args=>{let text='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{text+=x;return true;};try{main(args,state);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(text);};
+ const run=args=>{let text='';const write=process.stdout.write,exit=process.exitCode;process.stdout.write=x=>{text+=x;return true;};try{main(args,state,releaseOptions);}finally{process.stdout.write=write;process.exitCode=exit;}return JSON.parse(text);};
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(source,'proof'),'preserved');git('-C',source,'add','.');git('-C',source,'commit','-m','fixture');git('-C',source,'push','origin','HEAD:refs/heads/main');const head=git('-C',source,'rev-parse','HEAD');
   const record=run(['register','--path',source,'--owner','release-fixture','--source-commit',head,'--json']);db=new DatabaseSync(state);
+  const runner=path.join(root,'operator-release.mjs');
+  fs.writeFileSync(runner,`import {main} from ${JSON.stringify(pathToFileURL(modulePath).href)};\nmain(process.argv.slice(2),process.env.PI_WORKSPACE_STATE,{releaseAuthorityDependencies:{caller:()=>({ok:true,kind:'operator'})}});\n`);
   const bin=path.join(root,'bin'),marker=path.join(root,'entered');fs.mkdirSync(bin);fs.writeFileSync(path.join(bin,'git'),'#!/bin/sh\ncase " $* " in *" status "*) echo entered > "$FAULT_MARKER"; sleep 5;; esac\nexec /usr/bin/git "$@"\n',{mode:0o755});
   const fault=async(signal='TERM')=>{
    fs.rmSync(marker,{force:true});
-   const child=spawn(process.execPath,[modulePath,'release','--id',record.id,'--preserve-runtime','--json'],{detached:true,env:{...process.env,NODE_TEST_CONTEXT:'child-v8',PI_WORKSPACE_STATE:state,FAULT_MARKER:marker,PATH:`${bin}:${process.env.PATH}`}});
+   const child=spawn(process.execPath,[runner,'release','--id',record.id,'--preserve-runtime','--json'],{detached:true,env:{...process.env,NODE_TEST_CONTEXT:'child-v8',PI_WORKSPACE_STATE:state,FAULT_MARKER:marker,PATH:`${bin}:${process.env.PATH}`}});
    let stdout='',stderr='';child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);
    const exited=new Promise(resolve=>child.once('close',(status,signal)=>resolve({status,signal,stdout,stderr})));
    const readyBy=Date.now()+10000;
