@@ -105,6 +105,9 @@ test('ordinary release preserves a foreign queued consumer and then completes by
   const protectedAgain=f.release();assert.equal(protectedAgain.ok,false);assert.equal(fs.existsSync(f.source),true);assert.ok(protectedAgain.inspection.currentStackReferences.some(r=>r.kind==='qualification_request'));
   put('producer-admission/'+id+'.completed.json',{state:'completed',identity:request.pipeline});
   const done=f.release();assert.equal(done.action,'released',JSON.stringify(done));assert.equal(done.ordinaryReleaseContinuation.requestId,first.releaseSettlement.requestId);assert.equal(fs.existsSync(f.source),false);
+  assert.equal(done.releaseSettlement.result.physicalDisposition.kind,'removed');
+  assert.notEqual(done.releaseSettlement.requestId,first.releaseSettlement.requestId);
+  assert.equal(f.release().releaseSettlement.result.physicalDisposition.kind,'removed');
  }finally{if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT;else process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT=previous;}
 }));
 

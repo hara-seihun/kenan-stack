@@ -4233,6 +4233,19 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
       !generatedOnlySourceCustody(database, record.id)) {
     const terminalArgs = {positional:[], named:new Map([["owner",[record.owner]], ["expected-plan-sha256",[digest(planRow.plan_json)]]])};
     const result = terminalRetentionRelease(database, record, terminalArgs, statePath);
+    if (result.ok && result.record.state === "released") {
+      // Keep the original retained verdict immutable, but record this linked physical
+      // completion so foreground observers do not return the old retention as current.
+      const requestId = randomUUID();
+      const completed = {...result, physicalDisposition:{kind:"removed"},
+        ordinaryReleaseContinuation:{requestId:previous.requestId, basis:"original ordinary release retired future growth"}};
+      const receipt = {kind:"completed", requestId, workspaceId:record.id, owner:record.owner,
+        completedAt:Date.now(), result:completed};
+      database.prepare("INSERT INTO workspace_release_attempt(request_id,workspace_id,request_json,receipt_json) VALUES(?,?,?,?)")
+        .run(requestId, record.id, JSON.stringify({record, continuationOf:previous.requestId}), JSON.stringify(receipt));
+      print({...completed, releaseSettlement:receipt}, bool(args,"json"));
+      return;
+    }
     print({...result, ordinaryReleaseContinuation:{requestId:previous.requestId, basis:"original ordinary release retired future growth"}}, bool(args,"json"));
     if (!result.ok) process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
