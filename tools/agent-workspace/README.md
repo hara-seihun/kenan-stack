@@ -61,6 +61,22 @@ tree differs from every remote commit stays retained.
 
 Focused checks: `node --test tools/agent-workspace/release-reachability.test.mjs tools/agent-workspace/release-custody.test.mjs`.
 
+## Uncommitted files on release
+
+An explicit `release` of a single checkout whose commits are all published no longer keeps
+the checkout for edited or untracked files. It copies every changed and untracked (not
+ignored) file into `released-work/<checkout>-<id>-<time>.tar.zst` next to the registry
+(`~/.local/state/pi-workspaces/released-work/` on kenan-server), with `RELEASED-WORK.json`
+inside naming the checkout, its HEAD, the files and the deleted paths, then removes the
+checkout. The release result and the record's detail name the archive. To get the work back,
+clone the remote at that HEAD and `tar --zstd -xf ARCHIVE -C CHECKOUT`. More than 1 GiB of
+uncommitted files, unpublished commits, groups and the ended-owner sweep keep the checkout as
+before. Cause: rf-long-tail (2026-10-31) had ten edited files, all redone on Seinari main, and
+release kept it forever. When a kept checkout's object maintenance fails, it keeps its own
+reason (for example "working tree has changes") instead of showing the custody-import refusal.
+Regressions: the two tests named "release archives uncommitted files…" and "reconcile keeps a
+dirty checkout…" in `test.mjs`.
+
 ## Authenticated ordinary release custody
 
 Ordinary `release`, including `--end-retention` and grouped releases, authenticates the current native tool caller against its root-created scope and exact tool call in the native store before any release journal, lease, state or filesystem transition. Every selected group member must belong to that caller. A registered native UUID is authoritative; otherwise the stored native binding or a byte-exact checkout admission receipt authenticated in the native store determines custody. Unknown or conflicting custody refuses without mutation. Neither the free `--owner` label nor an authorization string grants another agent release rights.

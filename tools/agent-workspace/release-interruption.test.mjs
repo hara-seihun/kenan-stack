@@ -52,8 +52,9 @@ for(const signal of ['TERM','KILL'])test(`actual ${signal} during release retain
 test('interrupted release cannot change its preserved runtime policy',()=>fixture(async f=>{
  await f.fault();const before=f.status();assert.throws(()=>f.run(['release','--id',f.record.id,'--json']),/retained request binding changed/);assert.deepEqual(f.status().releaseSettlement,before.releaseSettlement);assert.equal(fs.existsSync(f.source),true);
 }));
-test('fresh source edits after interruption remain retained by the same owner/request',()=>fixture(async f=>{
- await f.fault();const before=f.status();fs.writeFileSync(path.join(f.source,'proof'),'new dirty source');const result=f.release();assert.equal(result.releaseSettlement.requestId,before.releaseSettlement.requestId);assert.equal(result.record.state,'repair-required');assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.releaseSettlement.kind,'completed');assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'new dirty source');
+test('fresh source edits after interruption are archived and released by the same owner/request',()=>fixture(async f=>{
+ await f.fault();const before=f.status();fs.writeFileSync(path.join(f.source,'proof'),'new dirty source');const result=f.release();assert.equal(result.releaseSettlement.requestId,before.releaseSettlement.requestId);assert.equal(result.action,'released');assert.equal(result.physicalDisposition.kind,'removed');assert.equal(result.releaseSettlement.kind,'completed');assert.equal(fs.existsSync(f.source),false);
+ assert.equal(execFileSync('tar',['--zstd','-xOf',result.workingTreeArchive,'proof'],{encoding:'utf8'}),'new dirty source');
 }));
 test('normal successful release persists its terminal receipt before output',()=>fixture(async f=>{
  const result=f.release();assert.equal(result.releaseSettlement.kind,'completed');assert.equal(f.status().releaseSettlement.result.action,'released');assert.equal(f.status().releaseSettlement.result.physicalDisposition.kind,'removed');

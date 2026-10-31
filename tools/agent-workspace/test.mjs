@@ -2592,6 +2592,56 @@ test("release removes a checkout whose branch was published as a squashed commit
   }
 });
 
+test("release archives uncommitted files of a published checkout and removes it", () => {
+  // 2026-10-31: rf-long-tail's commits were all on main, but ten edited files (all redone on main)
+  // kept the checkout forever. An explicit release now copies changed and untracked files into a
+  // released-work archive with a manifest, then removes the checkout.
+  const f = fixture();
+  try {
+    const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "dirty-published",
+      "--repo", f.remote, "--min-free-gib", "0", "--json"], f.env));
+    writeFileSync(path.join(created.path, "file.txt"), "edited but superseded\n");
+    mkdirSync(path.join(created.path, "notes", "deep"), { recursive: true });
+    writeFileSync(path.join(created.path, "notes", "deep", "scratch.md"), "untracked note\n");
+    const released = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.equal(existsSync(created.path), false);
+    assert.ok(released.workingTreeArchive.startsWith(path.join(path.dirname(f.env.PI_WORKSPACE_STATE), "released-work") + path.sep));
+    const out = mkdtempSync(path.join(tmpdir(), "released-work-"));
+    try {
+      execFileSync("tar", ["--zstd", "-xf", released.workingTreeArchive, "-C", out]);
+      assert.equal(readFileSync(path.join(out, "file.txt"), "utf8"), "edited but superseded\n");
+      assert.equal(readFileSync(path.join(out, "notes", "deep", "scratch.md"), "utf8"), "untracked note\n");
+      const manifest = JSON.parse(readFileSync(path.join(out, "RELEASED-WORK.json"), "utf8"));
+      assert.equal(manifest.workspaceId, created.id);
+      assert.deepEqual(manifest.files, ["file.txt", "notes/deep/scratch.md"]);
+      assert.equal(manifest.head, git(f.remote, "rev-parse", "main").trim());
+    } finally { rmSync(out, { recursive: true, force: true }); }
+  } finally {
+    f.close();
+  }
+});
+
+test("reconcile keeps a dirty checkout that borrows objects with its own reason, not the custody guard's", () => {
+  // 2026-10-31: a kept checkout's reason was overwritten by CUSTODY_IMPORT_EXCEEDS_RECLAIM, which
+  // hid that it was kept for edited files.
+  const f = fixture();
+  try {
+    const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "dirty-borrower",
+      "--repo", f.remote, "--lease-seconds", "0", "--min-free-gib", "0", "--json"], f.env));
+    writeFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), `${path.join(f.remote, "objects")}\n`);
+    execFileSync("git", ["-C", f.remote, "hash-object", "-w", "--stdin"], { input: Buffer.alloc(8 * 1024 * 1024, 7) });
+    writeFileSync(path.join(created.path, "file.txt"), "unpublished edit\n");
+    const results = JSON.parse(run(["reconcile", "--root", f.workspaces, "--after", "start", "--execute", "--json"], f.env));
+    const result = results.find((item) => item.record.id === created.id);
+    assert.match(result.inspection.reason, /working tree has changes/);
+    assert.equal(result.record.state, "repair-required");
+    assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "unpublished edit\n");
+  } finally {
+    f.close();
+  }
+});
+
 test("repairs reference-clone maintenance during an active lease without pruning work", () => {
   const f = fixture();
   try {

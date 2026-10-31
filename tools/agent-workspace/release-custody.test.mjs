@@ -12,9 +12,14 @@ function fixture(action){
   action({root,source,remote,state,record,db,git,run,commit,release});
  }finally{db?.close();if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;fs.rmSync(root,{recursive:true,force:true});}
 }
-for(const kind of ['unpublished','dirty'])test('ordinary release preserves generated cache with '+kind+' source custody',()=>fixture(f=>{
- if(kind==='unpublished')f.commit();else fs.writeFileSync(path.join(f.source,'proof'),'dirty unique work');
- const result=f.release();assert.equal(result.record.state,'repair-required',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.leaseRelease.kind,'released');assert.equal(result.cacheDisposition.kind,'none-selected');assert.equal(result.action,'none');assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),kind==='unpublished'?'new unique work':'dirty unique work');
+test('ordinary release preserves generated cache with unpublished source custody',()=>fixture(f=>{
+ f.commit();
+ const result=f.release();assert.equal(result.record.state,'repair-required',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.leaseRelease.kind,'released');assert.equal(result.cacheDisposition.kind,'none-selected');assert.equal(result.action,'none');assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'new unique work');
+}));
+test('ordinary release archives dirty source of a published checkout, then removes it',()=>fixture(f=>{
+ fs.writeFileSync(path.join(f.source,'proof'),'dirty unique work');
+ const result=f.release();assert.equal(result.record.state,'released',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');assert.equal(fs.existsSync(f.source),false);
+ assert.equal(execFileSync('tar',['--zstd','-xOf',result.workingTreeArchive,'proof'],{encoding:'utf8'}),'dirty unique work');
 }));
 test('published exact branch with stale tracking refs is verified read-only before source/cache disposal',()=>fixture(f=>{
  const head=f.commit();f.git('-C',f.source,'push','file://'+f.remote,'HEAD:refs/heads/main');assert.notEqual(f.git('-C',f.source,'rev-parse','refs/remotes/origin/main'),head);

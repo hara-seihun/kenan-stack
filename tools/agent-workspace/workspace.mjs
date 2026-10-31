@@ -21,6 +21,7 @@ import {withStdoutFile, foldRecords} from './stdout-records.mjs';
 import {hasUncoveredCommits, observedRemoteHeads, publishedTreesCover} from './release-reachability.mjs';
 import {classifyLocalMerges,disposedMergesCoverRelease,recordMergeDisposal} from './local-merge-disposal.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
+import {workingTreeChanges as listWorkingTreeChanges, archiveWorkingTree, WORKING_TREE_ARCHIVE_MAX_BYTES} from './working-tree-archive.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
 import {boundedCommand} from './bounded-command.mjs';
 import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contract.mjs';
@@ -940,10 +941,27 @@ function gitStatusExcludingNested(record, args, nestedWorkspaces = []) {
   return git(record.path, [...args, "--", ".", ...exclusions]);
 }
 
-function gitDisposition(record, nestedWorkspaces = [], remoteCustody) {
+function nestedExclusions(record, nestedWorkspaces) {
+  return nestedWorkspaces.flatMap((workspace) => {
+    const relative = path.relative(record.path, workspace);
+    return [`:(exclude,top,literal)${relative}`, `:(exclude,top,glob)${relative}/**`];
+  });
+}
+
+// archiveChanges: an explicit release of one checkout copies uncommitted files into a
+// released-work archive (working-tree-archive.mjs) instead of keeping the whole checkout for them.
+function gitDisposition(record, nestedWorkspaces = [], remoteCustody, archiveChanges = false) {
   const lines = gitStatusExcludingNested(record, ["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=normal"], nestedWorkspaces).split("\n");
   const changed = lines.filter((line) => line && !line.startsWith("!! "));
-  if (changed.length > 0) return { safe: false, sourceRetention: true, reason: `working tree has changes: ${changed.slice(0, 8).join(" | ")}` };
+  let workingTreeChanges = null;
+  if (changed.length > 0) {
+    if (!archiveChanges) return { safe: false, sourceRetention: true, reason: `working tree has changes: ${changed.slice(0, 8).join(" | ")}` };
+    workingTreeChanges = listWorkingTreeChanges(record.path, [".", ...nestedExclusions(record, nestedWorkspaces)]);
+    if (workingTreeChanges.bytes > WORKING_TREE_ARCHIVE_MAX_BYTES)
+      return { safe: false, sourceRetention: true, reason: `working tree has ${workingTreeChanges.bytes} bytes of uncommitted files, more than release archives (${WORKING_TREE_ARCHIVE_MAX_BYTES}); commit, publish or delete them: ${changed.slice(0, 8).join(" | ")}` };
+  }
+  const archived = (result) => workingTreeChanges === null || !result.safe ? result
+    : { ...result, workingTreeChanges, reason: `${result.reason}; ${workingTreeChanges.files.length} uncommitted file(s) and ${workingTreeChanges.deleted.length} deletion(s) are archived before removal` };
   const nestedRelativePaths = nestedWorkspaces.map((workspace) => path.relative(record.path, workspace));
   const ignored = lines
     .filter((line) => line.startsWith("!! "))
@@ -983,8 +1001,8 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody) {
     if (uncovered() && !recordedMergesCover() && !publishedTrees()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
   if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
-  if (head === record.durableSourceCommit) return { safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head };
-  return { safe: true, sourceRetention: false, reason: "every local branch commit exists on a remote ref or in durable source ancestry", head };
+  if (head === record.durableSourceCommit) return archived({ safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head });
+  return archived({ safe: true, sourceRetention: false, reason: "every local branch commit exists on a remote ref or in durable source ancestry", head });
 }
 
 function gcDestination(statePath, record, suffix) {
@@ -1249,11 +1267,12 @@ function inspectRecord(record, options = {}) {
       systemdUnits: systemd.references,
     };
   }
-  const disposition = duringInspection(options.deadline, () => gitDisposition(record, options.nestedWorkspaces, options.safety?.remoteCustody));
+  const disposition = duringInspection(options.deadline, () => gitDisposition(record, options.nestedWorkspaces, options.safety?.remoteCustody, options.archiveWorkingTree === true));
   return {
     classification: disposition.safe ? "reclaimable" : "repair-required",
     reason: disposition.reason,
     sourceRetention: disposition.sourceRetention,
+    ...(disposition.workingTreeChanges ? { workingTreeChanges: disposition.workingTreeChanges } : {}),
     processes,
     containers: docker.references,
     systemdUnits: systemd.references,
@@ -1264,7 +1283,7 @@ function inspectRecord(record, options = {}) {
 function reconcileRecord(database, record, options) {
   if (generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database,record.path)) return retainedCustodyResult(record);
   let safety = options.safety;
-  let inspection = inspectRecord(record, { ignoreLease: options.ignoreLease, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
+  let inspection = inspectRecord(record, { ignoreLease: options.ignoreLease, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true, archiveWorkingTree: options.archiveWorkingTree === true });
   if (inspection.classification === "active") return { record, inspection, action: "none" };
   if (inspection.currentStackQueueProtected) return {record,inspection,action:"none"};
   if(inspection.sourceRetention===true){
@@ -1285,14 +1304,14 @@ function reconcileRecord(database, record, options) {
   let removedCaches = [];
   if (options.execute) {
     safety = freshThreadSafety(database, safety);
-    inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
+    inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true, archiveWorkingTree: options.archiveWorkingTree === true });
     if (inspection.classification === "referenced" || inspection.classification === "blocked") {
       updateState(database, record, inspection.classification, inspection.reason);
       return { record, inspection, action: "none" };
     }
     if(inspection.sourceRetention===true){updateState(database,record,"repair-required",inspection.reason);return {record,inspection,action:"none",removedCaches:[]};}
     removedCaches = stripCaches(record, options.statePath, () => database.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(record.id), roots => cacheSymlinkSafety(database, record, roots));
-    inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
+    inspection = inspectRecord(record, { ignoreLease: true, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true, archiveWorkingTree: options.archiveWorkingTree === true });
   }
   if (inspection.classification === "repair-required") {
     if (options.execute) updateState(database, record, "repair-required", inspection.reason);
@@ -1302,17 +1321,25 @@ function reconcileRecord(database, record, options) {
   if (!options.execute) return { record, inspection, action: "would-release" };
   const current = recordBy(database, { id: record.id });
   if (!options.ignoreLease && current.leaseExpiresAt > Date.now()) return { record: current, inspection: inspectRecord(current), action: "lease-renewed" };
-  const latest = inspectRecord(current, { ignoreLease: true, safety: freshThreadSafety(database, safety), deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true });
+  const latest = inspectRecord(current, { ignoreLease: true, safety: freshThreadSafety(database, safety), deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true, archiveWorkingTree: options.archiveWorkingTree === true });
   if (latest.classification !== "reclaimable") {
     updateState(database, current, latest.classification, latest.reason);
     return { record: current, inspection: latest, removedCaches, action: "none" };
   }
   assertUnfrozenCustody(current.path);
-  updateState(database, current, "reclaiming", latest.reason);
+  let workingTreeArchive = null;
+  if (latest.workingTreeChanges) {
+    workingTreeArchive = archiveWorkingTree({ root: current.path, directory: path.join(path.dirname(options.statePath), "released-work"),
+      name: `${path.basename(current.path)}-${current.id.slice(0, 8)}`, changes: latest.workingTreeChanges,
+      manifest: { workspaceId: current.id, path: current.path, owner: current.owner, head: latest.head, releasedAt: new Date().toISOString(),
+        restore: `git clone the checkout's remote at head, then: tar --zstd -xf THIS_FILE -C CHECKOUT and delete the listed deleted paths` } });
+  }
+  const reason = workingTreeArchive ? `${latest.reason}; uncommitted files archived to ${workingTreeArchive}` : inspection.reason;
+  updateState(database, current, "reclaiming", reason);
   removeWorkspace(current, options.statePath);
   removeEmptyWorkspaceContainer(current);
-  updateState(database, current, "released", inspection.reason);
-  return { record: current, inspection, removedCaches, action: "released" };
+  updateState(database, current, "released", reason);
+  return { record: current, inspection: workingTreeArchive ? latest : inspection, removedCaches, action: "released", ...(workingTreeArchive ? { workingTreeArchive } : {}) };
 }
 
 function recordsInGroup(database, record) {
@@ -1498,8 +1525,13 @@ function reconcileRecords(database, selected, options) {
           maintenance = maintain(kept);
         } catch (error) {
           if (error instanceof ResourceBusyError) throw error;
-          const blocked = new Map(blockedReconciliation(database, kept, error, true).map((result) => [result.record.id, result]));
-          return reconciled.map((result) => blocked.get(result.record.id) ?? { ...result, record: recordBy(database, { id: result.record.id }), gitMaintenance: removed.has(result.record.id) ? "removed" : null });
+          // A checkout kept for its own reason (uncommitted or unpublished work, a running process)
+          // keeps that reason: object maintenance failing says nothing about why it stays
+          // (2026-10-31: rf-long-tail's edited files showed up as CUSTODY_IMPORT_EXCEEDS_RECLAIM).
+          const keptForOwnReason = new Set(reconciled.filter((result) => result.inspection?.classification !== "reclaimable").map((result) => result.record.id));
+          const blocked = new Map(blockedReconciliation(database, kept.filter((record) => !keptForOwnReason.has(record.id)), error, true).map((result) => [result.record.id, result]));
+          const skipped = { kind: "skipped", reason: String(error.message).slice(0, 500) };
+          return reconciled.map((result) => blocked.get(result.record.id) ?? { ...result, record: recordBy(database, { id: result.record.id }), gitMaintenance: removed.has(result.record.id) ? "removed" : skipped });
         }
         return reconciled.map((result) => ({
           ...result,
@@ -4322,7 +4354,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
     process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
   }
-  const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth);
+  const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth, Infinity, false, records.length === 1);
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
   if (settled.some(item => item.inspection?.classification === "blocked")) process.exitCode = BLOCKED_RELEASE_EXIT;
 }
@@ -4330,7 +4362,9 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
 // The ordinary release transition shared by an owner's explicit release and by the
 // owner-liveness release of an authentically ended native owner. Only the future-growth
 // settlement (and its owner evidence) differs; every safety observation is identical.
-function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false) {
+// archiveWorkingTree: only an explicit release of a single checkout archives its uncommitted files;
+// the ended-owner release and groups keep a dirty checkout as before.
+function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false, archiveWorkingTree = false) {
   const requestId = beginOrdinaryRelease(database, records, args);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
   const deadline=Math.min(inspectionDeadline??Date.now()+35_000, outerDeadline);
@@ -4347,6 +4381,7 @@ function ordinaryRelease(database, records, args, statePath, settle, outerDeadli
       statePath,
       safety: safetySnapshot(database),
       terminalSourceTransfer:!protectSourceIntent,
+      archiveWorkingTree,
     })).map(leaseReleaseDisposition);
   } catch (error) {
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);

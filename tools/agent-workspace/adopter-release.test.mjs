@@ -96,7 +96,9 @@ test('adopted custody continues the ended owner submission once its unit ceased'
  assert.deepEqual(adopted.originalBinding,s.original.binding,'the original binding is immutable');
  const row=s.database.prepare('SELECT * FROM workspace_release_submission').get();
  const history=JSON.parse(row.continuations_json);assert.equal(history.at(-1).custodyAdoptedFrom,CHILD);assert.deepEqual(history.at(-1).binding,s.adopter.binding);
- const again=submitRelease({...s.adopter,observe:()=>({ceased:true})});assert.equal(again.requestId,adopted.requestId);assert.equal(s.launches(),2,'a repeated adopter call never launches twice');
+ // While the adopter's own unit runs, a repeated call never launches twice. (Once that unit has
+ // ceased without a terminal result, a repeat continues it: release-submission.mjs, 2026-10-30.)
+ const again=submitRelease({...s.adopter,observe:()=>({ceased:false})});assert.equal(again.requestId,adopted.requestId);assert.equal(s.launches(),2,'a repeated adopter call never launches twice');
 }));
 test('an unknown original launch is never continued by an adopter',()=>submission(s=>{
  s.database.prepare("UPDATE workspace_release_submission SET state='launch-unknown'").run();
