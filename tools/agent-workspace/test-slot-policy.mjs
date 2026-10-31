@@ -7,3 +7,5 @@ export function testSlotCount(env = process.env) {
   return count;
 }
 
+
+export const boundedCheckConcurrency = (budget, env = process.env) => Math.min(budget, testSlotCount(env));

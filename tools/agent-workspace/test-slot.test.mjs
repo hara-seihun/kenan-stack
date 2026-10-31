@@ -36,8 +36,8 @@ test("an invalid slot count is a typed error", async () => {
   assert.equal(testSlotCount({ AGENT_WORKSPACE_TEST_SLOTS: "3" }), 3);
 });
 
-import { workspaceCheckConcurrency } from './check.mjs';
+import { boundedCheckConcurrency } from './test-slot-policy.mjs';
 test('normal runner does not queue fixture processes inside their execution deadlines', () => {
-  assert.equal(workspaceCheckConcurrency({PI_STACK_CHECK_CONCURRENCY:'4',AGENT_WORKSPACE_TEST_SLOTS:'1'}),1);
-  assert.equal(workspaceCheckConcurrency({PI_STACK_CHECK_CONCURRENCY:'2',AGENT_WORKSPACE_TEST_SLOTS:'4'}),2);
+  assert.equal(boundedCheckConcurrency(4,{AGENT_WORKSPACE_TEST_SLOTS:'1'}),1);
+  assert.equal(boundedCheckConcurrency(2,{AGENT_WORKSPACE_TEST_SLOTS:'4'}),2);
 });
