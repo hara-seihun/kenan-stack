@@ -11,6 +11,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { MessageChannel, Worker, isMainThread, receiveMessageOnPort, workerData } from "node:worker_threads";
 import { GrowthLifecycleError, growthError } from "./growth-lifecycle.mjs";
+import { coldIdentity } from "./cold-storage.mjs";
 
 export class CensusFailure extends Error {}
 
@@ -440,33 +441,56 @@ function linkedCommonDirectory(workspacePath) {
   return { kind: "resolved", directory: path.resolve(adminDirectory, common) };
 }
 
-export function gitDependencyCensus(rows, execute = run) {
+// A checkout moved to the Storage Box can't change, so its dependencies are read through the
+// SMB mount once and reused while its symlink stays the same (cacheFile beside the registry).
+export function gitDependencyCensus(rows, execute = run, { cacheFile } = {}) {
   const alternates = [];
   const linkedWorktrees = [];
+  let cache = {};
+  if (cacheFile) try { cache = JSON.parse(readFileSync(cacheFile, "utf8")); } catch {}
+  const nextCache = {};
   for (const record of rows) {
-    assertSafetyBudget("dependency");
-    if (!existsSync(record.path)) continue;
-    let commonDirectory = path.join(record.path, ".git");
-    if (record.checkoutType === "worktree") {
-      const linked = linkedCommonDirectory(record.path);
-      if (linked.kind === "orphaned") continue;
-      if (linked.kind === "resolved") commonDirectory = linked.directory;
-      else {
-        const common = execute("git", ["-C", record.path, "rev-parse", "--git-common-dir"]);
-        if (common.status !== 0 && existsSync(path.join(record.path, ".git")) && orphanedWorktree(record.path)) continue;
-        if (common.status !== 0) throw new CensusFailure(`cannot inspect linked worktree ${record.path}: ${common.stderr || common.error?.message || `exit ${common.status}`}`);
-        commonDirectory = path.resolve(record.path, common.stdout);
-      }
-      linkedWorktrees.push({ recordId: record.id, workspacePath: record.path, commonDirectory });
+    const cold = coldIdentity(record.path);
+    const cached = cold === null ? undefined : cache[record.path];
+    const found = cached?.identity === cold && cached.recordId === record.id ? cached
+      : recordGitDependencies(record, execute) ?? { alternates: [], linkedWorktrees: [] };
+    alternates.push(...found.alternates);
+    linkedWorktrees.push(...found.linkedWorktrees);
+    if (cold !== null) nextCache[record.path] = { ...found, identity: cold, recordId: record.id };
+  }
+  if (cacheFile && JSON.stringify(nextCache) !== JSON.stringify(cache)) {
+    const temporary = `${cacheFile}.${process.pid}`;
+    writeFileSync(temporary, JSON.stringify(nextCache), { mode: 0o600 });
+    renameSync(temporary, cacheFile);
+  }
+  return { alternates, linkedWorktrees };
+}
+
+function recordGitDependencies(record, execute) {
+  const alternates = [];
+  const linkedWorktrees = [];
+  assertSafetyBudget("dependency");
+  if (!existsSync(record.path)) return null;
+  let commonDirectory = path.join(record.path, ".git");
+  if (record.checkoutType === "worktree") {
+    const linked = linkedCommonDirectory(record.path);
+    if (linked.kind === "orphaned") return null;
+    if (linked.kind === "resolved") commonDirectory = linked.directory;
+    else {
+      const common = execute("git", ["-C", record.path, "rev-parse", "--git-common-dir"]);
+      if (common.status !== 0 && existsSync(path.join(record.path, ".git")) && orphanedWorktree(record.path)) return null;
+      if (common.status !== 0) throw new CensusFailure(`cannot inspect linked worktree ${record.path}: ${common.stderr || common.error?.message || `exit ${common.status}`}`);
+      commonDirectory = path.resolve(record.path, common.stdout);
     }
-    const objectDirectory = path.join(commonDirectory, "objects");
-    const alternatesPath = path.join(objectDirectory, "info", "alternates");
-    let contents;
-    try { contents = readFileSync(alternatesPath, "utf8"); }
-    catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") continue; throw error; }
-    for (const alternate of contents.split("\n").filter(Boolean)) {
-      alternates.push({ recordId: record.id, workspacePath: record.path, objectDirectory: path.resolve(objectDirectory, alternate) });
-    }
+    linkedWorktrees.push({ recordId: record.id, workspacePath: record.path, commonDirectory });
+  }
+  const objectDirectory = path.join(commonDirectory, "objects");
+  const alternatesPath = path.join(objectDirectory, "info", "alternates");
+  let contents;
+  try { contents = readFileSync(alternatesPath, "utf8"); }
+  catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") return null; throw error; }
+  for (const alternate of contents.split("\n").filter(Boolean)) {
+    alternates.push({ recordId: record.id, workspacePath: record.path, objectDirectory: path.resolve(objectDirectory, alternate) });
   }
   return { alternates, linkedWorktrees };
 }
@@ -581,7 +605,7 @@ const CENSUSES = {
   systemdUser: () => systemdManagerSnapshot("user"),
   systemdSystem: () => systemdManagerSnapshot("system"),
   threads: ({ paths, cacheFile }) => threadSnapshot(paths, { cacheFile }),
-  gitDependencies: ({ rows }) => gitDependencyCensus(rows),
+  gitDependencies: ({ rows, cacheFile }) => gitDependencyCensus(rows, run, { cacheFile }),
   installed: ({ roots, cacheFile }) => installedReferenceSnapshot(roots, { cacheFile }),
 };
 

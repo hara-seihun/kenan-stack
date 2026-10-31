@@ -12,6 +12,7 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, linkSync, mkdirSync, lstatSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
+import { underColdStorage } from "./cold-storage.mjs";
 
 const PACK = /^(pack-[0-9a-f]{40,64})\.idx$/u;
 // Git looks a pack up through its index, so the index is linked last and removed first.
@@ -254,6 +255,6 @@ export function shareMirrorPacks({ mirror, sources, exclusive }) {
 export function configuredLocalSources(mirror) {
   const listed = git(["--git-dir", mirror, "config", "--local", "--get-regexp", "^remote\\..*\\.url$"]);
   if (listed.status !== 0) return [];
-  return listed.stdout.split("\n").map(line => line.slice(line.indexOf(" ") + 1)).filter(url => path.isAbsolute(url) && existsSync(url));
+  return listed.stdout.split("\n").map(line => line.slice(line.indexOf(" ") + 1)).filter(url => path.isAbsolute(url) && !underColdStorage(url) && existsSync(url));
 }
 

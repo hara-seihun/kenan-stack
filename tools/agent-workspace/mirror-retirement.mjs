@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
 import path from "node:path";
+import { underColdStorage } from "./cold-storage.mjs";
 
 const { GIT_DIR, GIT_OBJECT_DIRECTORY, GIT_WORK_TREE, ...inherited } = process.env;
 const gitEnvironment = { ...inherited, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" };
@@ -145,6 +146,8 @@ export function coldBorrowedObjectDirectories(ownersDirectory, cacheFile) {
 // moving large files to LFS), and every object the mirror holds for old checkouts
 // is dead weight once nothing borrows it.
 export function sourcesRewritten(mirror, sources) {
+  // A source moved to the box is read-only (it can't have been rewritten since) and is never read.
+  if (sources.some(underColdStorage)) return false;
   const local = sources.filter(url => path.isAbsolute(url) && existsSync(url));
   if (local.length === 0 || local.length !== sources.length) return false;
   const refs = spawnSync("git", ["--git-dir", mirror, "for-each-ref", "--format=%(objectname)", "refs/pi-workspace/"], { encoding: "utf8", env: gitEnvironment, maxBuffer: 1 << 26 });
@@ -204,7 +207,7 @@ export function classifyMirrors({ mirrorRoot, activeRepositories, checkouts, col
     if (coldBorrowed === null) return { ...base, retire: false, reason: "cold-borrowers-unknown" };
     if (liveWorktrees(mirror).length > 0) return { ...base, retire: false, reason: "linked-worktree" };
     if (sources.some(url => active.has(url))) return { ...base, retire: false, reason: "active-workspace" };
-    const localGone = sources.length > 0 && sources.every(url => path.isAbsolute(url) && !existsSync(url));
+    const localGone = sources.length > 0 && sources.every(url => path.isAbsolute(url) && !underColdStorage(url) && !existsSync(url));
     if (localGone) return { ...base, retire: true, reason: "source-gone" };
     if (sourcesRewritten(mirror, sources)) return { ...base, retire: true, reason: "source-rewritten" };
     if (now - lastActivity > unusedDays * 86_400_000) return { ...base, retire: true, reason: "unused" };

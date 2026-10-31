@@ -28,6 +28,7 @@ import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
 import { refPinPath, pinnedSourceCommit, clearRefPin } from "./ref-pin.mjs";
+import { movedToColdStorage } from "./cold-storage.mjs";
 import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
 import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
@@ -730,7 +731,7 @@ function workspaceTopology(database) {
 }
 function gitDependencySnapshot(database) {
   const rows = workspaceTopology(database);
-  return censusBound(() => census.gitDependencyCensus(rows));
+  return censusBound(() => census.gitDependencyCensus(rows, undefined, { cacheFile: observationCache(database, "cold-git-dependencies.v1.json") }));
 }
 
 // Observation caches beside the registry; each entry is reused only after its
@@ -745,7 +746,7 @@ function safetySnapshot(database) {
     process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
   const threadsObserved = !isolated || Boolean(process.env.PI_THREAD_DATABASE);
   const tasks = {
-    gitDependencies: { rows: workspaceTopology(database) },
+    gitDependencies: { rows: workspaceTopology(database), cacheFile: observationCache(database, "cold-git-dependencies.v1.json") },
     ...(threadsObserved ? { threads: { paths: census.ownerThreadDatabases(), cacheFile: observationCache(database, "thread-references.v1.json") } } : {}),
     ...(isolated ? {} : {
       process: {}, docker: {}, systemdUser: {}, systemdSystem: {},
@@ -1450,6 +1451,15 @@ function reconcileRecords(database, selected, options) {
       continue;
     }
     inspectedGroups += 1;
+    if (records.some((record) => movedToColdStorage(record.path))) {
+      results.push(...records.map((record) => ({ record, inspection: {
+        classification: "cold", reason: "moved to the Storage Box by kenan-cold; read-only, so not inspected",
+        processes: [], containers: [], systemdUnits: [],
+      }, action: "none" })));
+      after = selectedRecord.id;
+      options.onProgress?.(after);
+      continue;
+    }
     if (records.some((record) => record.state === "creating")) {
       results.push(...records.map((record) => ({ record, inspection: {
         classification: "blocked", reason: "workspace creation is pending; repeat its original create command",
@@ -2212,14 +2222,6 @@ function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device,
 // The bytes a plan charges in full unless a current allocated-block sample credits its
 // growth. Zero means the ledger never reads a measurement for it: retired future growth,
 // or a plan with no growth and no pending construction. The sampler uses the same rule.
-// kenan-cold moves a checkout untouched for days to the Storage Box and leaves a symlink to it.
-// It holds no blocks on the reserved filesystem and cannot grow there until `kenan-cold restore`
-// turns it back into a directory, which then gets measured like any new root.
-function movedOffDevice(workspacePath, device) {
-  try { return lstatSync(workspacePath).isSymbolicLink() && String(statSync(workspacePath).dev) !== device; }
-  catch { return false; }
-}
-
 function measuredBudgetBytes(plan, state) {
   if (retainedGrowth(plan)) return 0;
   return plan.growthBytes + (state === "creating" ? plan.constructionBytes : 0);
@@ -2305,7 +2307,7 @@ function capacityReservations(database, device, reservedPath, measure, observati
       try{restored=(JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json??'{}').restoreAt??0)>settled.get(row.path);}catch{restored=true;}
       const terminal = row.state!=='creating' && settled.has(row.path) && !restored;
       const ownerForecast = capacityOwnerProjection(row, owners.get(row.id), ownerObservation, children, now);
-      const budget = terminal || ownerForecast.zero || movedOffDevice(row.path, device) ? 0 : measuredBudgetBytes(plan, row.state);
+      const budget = terminal || ownerForecast.zero || movedToColdStorage(row.path) ? 0 : measuredBudgetBytes(plan, row.state);
       const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
@@ -5490,7 +5492,7 @@ function measureCapacityCommand(database, args, statePath) {
   for (const row of rows) {
     if(releasedMissing.has(row.id)) continue;
     const plan = JSON.parse(row.plan_json);
-    if (selected === null && movedOffDevice(row.path, row.device_id)) { skipped["moved-off-device"] = (skipped["moved-off-device"] ?? 0) + 1; continue; }
+    if (selected === null && movedToColdStorage(row.path)) { skipped["cold-storage"] = (skipped["cold-storage"] ?? 0) + 1; continue; }
     const budget = measuredBudgetBytes(plan, row.state);
     if (selected === null && budget === 0) { skipped[retainedGrowth(plan) ? "retired-future-growth" : "zero-liability"] += 1; continue; }
     const cached = cachedWorkspaceAllocation(database, row.id, row.path, row.device_id, started);
@@ -5986,7 +5988,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     try { rows = database.prepare("SELECT path, root, repository, state FROM workspace").all(); } finally { database.close(); }
     // Every existing checkout the registry knows, anything else in its roots, research
     // checkouts (their user can enter the mirrors folder), and checkouts moved to the cold tier.
-    const checkouts = new Set([...rows.map(row => row.path).filter(existsSync),
+    const checkouts = new Set([...rows.map(row => row.path).filter(file => !movedToColdStorage(file) && existsSync(file)),
       ...checkoutsUnder([...new Set(rows.map(row => row.root))], 1),
       ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([directory]) => directory).filter(Boolean), 1),
       ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([, directory]) => directory).filter(Boolean), 2)]);
