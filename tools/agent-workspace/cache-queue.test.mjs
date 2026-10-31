@@ -24,7 +24,7 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   let n=0;const uuid=()=>`00000000-0000-4000-8000-${String(++n).padStart(12,'0')}`;
   let sql=schema;
   const conversation={};
-  for(const [id,role,state,archived] of [['caller','worker','running',false],['live','worker','running',false],['idle','worker','idle',false],['stopped','worker','stopped',false],['archived','worker','running',true],['manager','manager','running',false]]){
+  for(const [id,role,state,archived] of [['caller','worker','running',false],['live','worker','running',false],['idle','worker','idle',false],['stopped','worker','stopped',false],['archived','worker','running',true],['manager','manager','running',false],['result-only','worker','running',false]]){
    conversation[id]=uuid();sql+=`INSERT INTO agent VALUES(${literal(id)},${literal(role)},${literal(conversation[id])},${literal(state)},${archived});\n`;
   }
   const tool=(name,args,result=null)=>[{type:'tool',callId:'call-'+n,name,args,result,isError:false}];
@@ -44,6 +44,8 @@ test('actual PostgreSQL observer separates running tool calls, live worker inten
   message(ids['stopped-text'],'stopped','assistant','done',[],source);
   message(ids['archived-text'],'archived','assistant','done',[],source);
   message(ids['manager-text'],'manager','assistant','done',[],source);
+  // A path that only shows up in a tool's output (a listing, a log) is not that worker's intent.
+  message(uuid(),'result-only','tool','done',tool('bash',{command:'ls /fixture'},JSON.stringify(`${source}/file`)));
   const query=sql=>pg('psql',['-X','-qAt','--host',root,'--username','fixture','--dbname','postgres','--set=ON_ERROR_STOP=1','--command',sql]);
   query(sql);
   const observe=(kind,self)=>JSON.parse(query(queueReferenceSql(source,self,kind)));

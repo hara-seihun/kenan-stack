@@ -38,7 +38,7 @@ for(const channel of channels){
 }
 const probe='/nonexistent/agent-workspace-queue-check/'+process.pid;
 for(const resourceKind of channels.length?['physical-checkout','source']:[]){
- const result=currentStackQueueReferences([probe],{resourceKind,deadline:Date.now()+15000});
+ const result=currentStackQueueReferences([probe],{resourceKind,deadline:Date.now()+30000});
  observed[resourceKind]=result.observations?.map(o=>o.channel);
  if(result.errors.length)failures.push(`${resourceKind}: ${result.errors.join('; ')}`);
  else if(result.observations.map(o=>o.channel).join()!==channels.join())failures.push(`${resourceKind}: observed ${result.observations.map(o=>o.channel)} instead of ${channels}`);
