@@ -56,3 +56,22 @@ export function observedRemoteHeads(command, repository, {timeout = 4000} = {}) 
   }
   return {ok: true, durable: [...new Set(durable)], observations};
 }
+
+// A publisher may squash a branch into one new commit (Seinari's research publisher merges
+// "Publish N admitted ... commits"), so the local commits never become reachable from a
+// remote head. A local tip whose exact tree is the tree of a commit on a remote head has
+// nothing unpublished: every file it holds is already there. Each uncovered tip is checked
+// against at most `maxCommits` of the newest remote commits it doesn't contain.
+export function publishedTreesCover(git, candidates, durable, {maxCommits = 4096} = {}) {
+  if (!durable.length) return false;
+  for (const tip of new Set(candidates)) {
+    if (!hasUncoveredCommits(git, [tip], durable)) continue;
+    const tree = git(['rev-parse', '--verify', `${tip}^{tree}`]);
+    if (!/^[a-f0-9]{40,64}$/u.test(tree)) throw new Error('malformed tree identity');
+    const trees = git(['rev-list', `--max-count=${maxCommits}`, '--format=%T', '--no-commit-header', '--stdin'], {
+      input: [...new Set(durable), `^${tip}`].join('\n') + '\n',
+    });
+    if (!trees.split('\n').includes(tree)) return false;
+  }
+  return true;
+}

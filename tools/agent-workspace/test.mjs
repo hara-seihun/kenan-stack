@@ -2550,6 +2550,48 @@ test("release removes a published checkout that borrows objects from a non-mirro
   }
 });
 
+test("release removes a checkout whose branch was published as a squashed commit with the same tree, and keeps one whose tree differs", () => {
+  // 2026-10-31: Seinari's research publisher squashes a branch into one new commit on main, so
+  // the checkout's own commits never become reachable from a remote head.
+  const f = fixture();
+  try {
+    const squash = (from, message, extra) => {
+      git(f.source, "fetch", "--no-tags", from, "HEAD");
+      git(f.source, "merge", "--squash", "FETCH_HEAD");
+      if (extra) { writeFileSync(path.join(f.source, "extra.txt"), extra); git(f.source, "add", "extra.txt"); }
+      git(f.source, "commit", "-m", message);
+      git(f.source, "push", "origin", "main");
+    };
+    const work = (name) => {
+      const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", name, "--repo", f.remote, "--min-free-gib", "0", "--json"], f.env));
+      git(created.path, "config", "user.name", "Test");
+      git(created.path, "config", "user.email", "test@example.invalid");
+      for (const step of ["one", "two"]) {
+        writeFileSync(path.join(created.path, `${name}.txt`), `${step}\n`);
+        git(created.path, "add", ".");
+        git(created.path, "commit", "-m", `${name} ${step}`);
+      }
+      return created;
+    };
+    const published = work("published");
+    squash(published.path, "Publish published");
+    git(published.path, "fetch", "origin");
+    const released = JSON.parse(run(["release", "--id", published.id, "--json"], f.env));
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.equal(existsSync(published.path), false);
+
+    const changed = work("changed");
+    squash(changed.path, "Publish changed with an extra file", "extra\n");
+    git(changed.path, "fetch", "origin");
+    const kept = JSON.parse(run(["release", "--id", changed.id, "--json"], f.env));
+    assert.notEqual(kept.action, "released");
+    assert.equal(kept.inspection.reason, "checkout has commits absent from remote refs or durable source ancestry");
+    assert.equal(existsSync(changed.path), true);
+  } finally {
+    f.close();
+  }
+});
+
 test("repairs reference-clone maintenance during an active lease without pruning work", () => {
   const f = fixture();
   try {

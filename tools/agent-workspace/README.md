@@ -51,6 +51,14 @@ covers nothing. Revision input is stdin, not an argument per tip. Failed/late Gi
 and malformed output never establish safe source custody. Source refs, configuration,
 working files, leases, foreign records and deletion guards are unchanged.
 
+A branch that was published as a squashed commit also counts as published: when a
+local tip's commits aren't reachable from any remote head, but its exact tree is the
+tree of one of the newest 4,096 remote commits it doesn't contain, nothing in it is
+unpublished. Seinari's research publisher squashes each branch into one commit
+merged into main, so its checkouts' own commits never become reachable (2026-10-31:
+saxpy-replay-speed was kept as unpublished although its tree was on main). A tip whose
+tree differs from every remote commit stays retained.
+
 Focused checks: `node --test tools/agent-workspace/release-reachability.test.mjs tools/agent-workspace/release-custody.test.mjs`.
 
 ## Authenticated ordinary release custody

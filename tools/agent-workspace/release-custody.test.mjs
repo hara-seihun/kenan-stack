@@ -17,11 +17,11 @@ for(const kind of ['unpublished','dirty'])test('ordinary release preserves gener
  const result=f.release();assert.equal(result.record.state,'repair-required',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.leaseRelease.kind,'released');assert.equal(result.cacheDisposition.kind,'none-selected');assert.equal(result.action,'none');assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),kind==='unpublished'?'new unique work':'dirty unique work');
 }));
 test('published exact branch with stale tracking refs is verified read-only before source/cache disposal',()=>fixture(f=>{
- const head=f.commit();f.git('-C',f.source,'push',f.remote,'HEAD:refs/heads/main');assert.notEqual(f.git('-C',f.source,'rev-parse','refs/remotes/origin/main'),head);
+ const head=f.commit();f.git('-C',f.source,'push','file://'+f.remote,'HEAD:refs/heads/main');assert.notEqual(f.git('-C',f.source,'rev-parse','refs/remotes/origin/main'),head);
  const result=f.release();assert.equal(result.record.state,'released',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');assert.equal(result.cacheDisposition.kind,'detached-for-retirement');assert.deepEqual(result.cacheDisposition.paths,['node_modules']);assert.equal(result.cacheDisposition.physicalReclaim,'not-measured');
 }));
 test('a commit pushed under a different remote branch name is durable even with stale local refs',()=>fixture(f=>{
- const head=f.commit();f.git('-C',f.source,'push',f.remote,'HEAD:refs/heads/kenan/leaf-'+head.slice(0,8));assert.equal(f.git('-C',f.source,'for-each-ref','--format=%(refname)','refs/remotes').includes('leaf'),false);
+ const head=f.commit();f.git('-C',f.source,'push','file://'+f.remote,'HEAD:refs/heads/kenan/leaf-'+head.slice(0,8));assert.equal(f.git('-C',f.source,'for-each-ref','--format=%(refname)','refs/remotes').includes('leaf'),false);
  const result=f.release();assert.equal(result.record.state,'released',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');
 }));
 test('a remote tip absent locally covers nothing: unique local work stays retained',()=>fixture(f=>{
@@ -75,7 +75,7 @@ test('ordinary release preserves an undispatched qualification and paired train 
 }));
 
 test('one transition shares remote custody, but rechecks every local branch and never caches across snapshots',()=>fixture(f=>{
- const head=f.commit();f.git('-C',f.source,'push',f.remote,'HEAD:refs/heads/published-elsewhere');
+ const head=f.commit();f.git('-C',f.source,'push','file://'+f.remote,'HEAD:refs/heads/published-elsewhere');
  const bin=path.join(f.root,'count-bin'),log=path.join(f.root,'remote-calls');fs.mkdirSync(bin);
  const native=execFileSync('which',['git'],{encoding:'utf8'}).trim(),oldPath=process.env.PATH;
  fs.writeFileSync(path.join(bin,'git'),'#!/bin/sh\nif [ "$3" = "ls-remote" ]; then echo read >> '+JSON.stringify(log)+'; fi\nexec '+JSON.stringify(native)+' "$@"\n',{mode:0o755});

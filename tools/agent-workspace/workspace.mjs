@@ -18,7 +18,7 @@ import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mj
 import {executionCommand, executionRows, executionCessation} from './execution-capacity.mjs';
 import {historyImportBytes, commandFailureDetail} from './import-sizing.mjs';
 import {withStdoutFile, foldRecords} from './stdout-records.mjs';
-import {hasUncoveredCommits, observedRemoteHeads} from './release-reachability.mjs';
+import {hasUncoveredCommits, observedRemoteHeads, publishedTreesCover} from './release-reachability.mjs';
 import {classifyLocalMerges,disposedMergesCoverRelease,recordMergeDisposal} from './local-merge-disposal.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
@@ -976,7 +976,11 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody) {
     if (observed.ok) remoteCustody?.set(record.path, observed);
     if (!observed.ok && observed.code !== "remote-custody-absent") return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable: ${observed.detail}; checkout and generated caches retained`, head};
     if (observed.ok) durable.push(...observed.durable);
-    if (uncovered() && !recordedMergesCover()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
+    const publishedTrees = () => {
+      try { return publishedTreesCover((args, options) => git(record.path, args, options), candidates, durable); }
+      catch { return false; }
+    };
+    if (uncovered() && !recordedMergesCover() && !publishedTrees()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
   if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
   if (head === record.durableSourceCommit) return { safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head };
