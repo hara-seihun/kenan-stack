@@ -57,11 +57,12 @@ test('a scan starved of CPU by other work still completes and is not frozen',{ti
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
+// The release runs in this process, never as a real background unit of the agent running the tests.
 function releaseFixture(action){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'release-exit-')),source=path.join(root,'source'),remote=path.join(root,'remote.git'),state=path.join(root,'registry.sqlite3');
  const previous=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
  const git=(...a)=>execFileSync('git',a,{encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']}).trim();
- const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.exitCode=undefined;process.stdout.write=x=>{out+=x;return true;};let status;try{main(args,state);status=process.exitCode??0;}finally{process.stdout.write=write;process.exitCode=exit;}return {status,output:JSON.parse(out)};};
+ const run=args=>{let out='';const write=process.stdout.write,exit=process.exitCode;process.exitCode=undefined;process.stdout.write=x=>{out+=x;return true;};let status;try{main(args,state,{releaseScopeOverride:{background:true}});status=process.exitCode??0;}finally{process.stdout.write=write;process.exitCode=exit;}return {status,output:JSON.parse(out)};};
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');
   fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');
