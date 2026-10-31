@@ -1861,11 +1861,11 @@ test("budgeted admission rejects unknown source imports, filters and unspecified
       [...base, ...budget, "--min-free-gib", "0"], [...base, ...budget, "--strategy", "worktree"],
       [...base, ...budget.map(arg => arg === "1" ? "0" : arg)]]) assert.throws(() => run(args, f.env));
     assert.throws(() => run([...base.map(arg => arg === f.source ? `file://${f.remote}` : arg), ...budget], f.env), /estimate unknown/);
-    git(f.source, "config", "filter.fake.smudge", "cat");
+    writeFileSync(path.join(f.source, ".git/info/attributes"), "* filter=fake\n");
     for (const selection of [[], ["--sparse-pattern", "never-matches"]]) {
-      assert.throws(() => run([...base, ...budget, ...selection], f.env), /estimate unknown.*filters/);
+      assert.throws(() => run([...base, ...budget, ...selection], f.env), /estimate unknown.*filter/);
     }
-    git(f.source, "config", "--unset", "filter.fake.smudge");
+    rmSync(path.join(f.source, ".git/info/attributes"));
     writeFileSync(path.join(f.source, ".gitattributes"), "*.txt working-tree-encoding=UTF-16\n");
     git(f.source, "add", ".gitattributes");
     git(f.source, "commit", "-m", "unknown encoding transform");
@@ -4110,7 +4110,11 @@ test("qualified ancestral custody prices and fetches only receiver delta", () =>
     assert.equal(git(received.path, "status", "--porcelain"), "");
     assert.equal(readFileSync(path.join(received.path, "receiver.txt"), "utf8"), "receiver delta\n");
     const operations = readFileSync(guarded.PI_WORKSPACE_TEST_GIT_LOG, "utf8").trim().split("\n").map(JSON.parse);
-    assert.ok(operations.some(args => args.includes("fetch") && args.some(arg => arg.startsWith("--negotiation-tip="))));
+    // A local shared pack may already supply the entire receiver closure. If
+    // transfer is necessary it must negotiate from the qualified base; either
+    // route must publish the exact receiver, never perform a full refetch.
+    assert.ok(operations.filter(args => args.includes("fetch")).every(args => args.some(arg => arg.startsWith("--negotiation-tip="))));
+    assert.ok(operations.some(args => args.includes("update-ref") && args.includes(receiver) && args.some(arg => arg.startsWith("refs/pi-workspace/sources/"))));
     const blob = git(f.source, "rev-parse", `${base}:large-base.bin`);
     // Use a separate independent loose mirror for the negative control.
     const damaged = path.join(f.root, "damaged.git");

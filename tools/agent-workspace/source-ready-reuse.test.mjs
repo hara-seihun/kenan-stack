@@ -49,7 +49,7 @@ test('READY closure refresh refuses missing objects, alternate custody, changed 
   const input={repository:f.repository,mirror:f.mirror,sparsePatterns:[]},value={sourceCommit:f.sourceCommit,plan:{sourceCommit:f.sourceCommit},stamp:'old'};
   assert.ok(w.revalidatePreparedSource(value,input,f.sourceCommit));
   assert.equal(w.revalidatePreparedSource(value,input,'b'.repeat(40)),null);
-  f.git(f.repository,'config','filter.bad.smudge','cat');assert.throws(()=>w.revalidatePreparedSource(value,input,f.sourceCommit),/checkout filters/);f.git(f.repository,'config','--unset','filter.bad.smudge');
+  const attributes=path.join(f.repository,'.git/info/attributes');fs.writeFileSync(attributes,'* filter=bad\n');assert.throws(()=>w.revalidatePreparedSource(value,input,f.sourceCommit),/checkout filter/);fs.unlinkSync(attributes);
   fs.writeFileSync(path.join(f.mirror,'objects/info/alternates'),path.join(f.repository,'.git/objects')+'\n');assert.equal(w.revalidatePreparedSource(value,input,f.sourceCommit),null);fs.unlinkSync(path.join(f.mirror,'objects/info/alternates'));
   const tree=f.git(f.mirror,'rev-parse','HEAD^{tree}'),object=path.join(f.mirror,'objects',tree.slice(0,2),tree.slice(2)),originalObject=fs.readFileSync(object);
   fs.chmodSync(object,0o600);fs.writeFileSync(object,'corrupt tree object');fs.rmSync(path.join(f.mirror,'pi-workspace-closure'),{recursive:true,force:true});
