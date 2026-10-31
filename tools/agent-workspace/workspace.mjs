@@ -27,6 +27,7 @@ import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contrac
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
+import { refPinPath, pinnedSourceCommit, clearRefPin } from "./ref-pin.mjs";
 import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
 import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
@@ -125,6 +126,24 @@ function creationTimeout(args) {
   const seconds = numberFlag(args, "creation-timeout-seconds", DEFAULT_CREATION_TIMEOUT_SECONDS);
   if (seconds < 1 || seconds > 86400) fail("--creation-timeout-seconds must be between 1 and 86400");
   return seconds * 1000;
+}
+
+// How long one create call keeps repeating itself while its source or checkout job runs.
+// PI_WORKSPACE_CREATE_WAIT_SECONDS=0 restores the single-attempt behaviour (tests use it).
+function createWaitMs() {
+  const value = process.env.PI_WORKSPACE_CREATE_WAIT_SECONDS ?? "150";
+  const seconds = Number(value);
+  if (!/^\d+$/u.test(value) || seconds > 3600) fail("PI_WORKSPACE_CREATE_WAIT_SECONDS must be an integer from 0 to 3600");
+  return seconds * 1000;
+}
+
+// The result file a pending create receipt is waiting on, or null when the receipt is not a pending job.
+function pendingJobResult(stdout) {
+  let receipt;
+  try { receipt = JSON.parse(stdout); } catch { return null; }
+  if (receipt?.state === "preparing" && typeof receipt.resultPath === "string") return receipt.resultPath;
+  if (receipt?.state === "creating" && typeof receipt.progressPath === "string") return path.join(path.dirname(receipt.progressPath), "result.json");
+  return null;
 }
 
 class CliError extends Error {}
@@ -2193,6 +2212,14 @@ function cachedWorkspaceAllocation(database, workspaceId, workspacePath, device,
 // The bytes a plan charges in full unless a current allocated-block sample credits its
 // growth. Zero means the ledger never reads a measurement for it: retired future growth,
 // or a plan with no growth and no pending construction. The sampler uses the same rule.
+// kenan-cold moves a checkout untouched for days to the Storage Box and leaves a symlink to it.
+// It holds no blocks on the reserved filesystem and cannot grow there until `kenan-cold restore`
+// turns it back into a directory, which then gets measured like any new root.
+function movedOffDevice(workspacePath, device) {
+  try { return lstatSync(workspacePath).isSymbolicLink() && String(statSync(workspacePath).dev) !== device; }
+  catch { return false; }
+}
+
 function measuredBudgetBytes(plan, state) {
   if (retainedGrowth(plan)) return 0;
   return plan.growthBytes + (state === "creating" ? plan.constructionBytes : 0);
@@ -2278,7 +2305,7 @@ function capacityReservations(database, device, reservedPath, measure, observati
       try{restored=(JSON.parse(database.prepare('SELECT state_json FROM workspace_growth_policy WHERE workspace_id=?').get(row.id)?.state_json??'{}').restoreAt??0)>settled.get(row.path);}catch{restored=true;}
       const terminal = row.state!=='creating' && settled.has(row.path) && !restored;
       const ownerForecast = capacityOwnerProjection(row, owners.get(row.id), ownerObservation, children, now);
-      const budget = terminal || ownerForecast.zero ? 0 : measuredBudgetBytes(plan, row.state);
+      const budget = terminal || ownerForecast.zero || movedOffDevice(row.path, device) ? 0 : measuredBudgetBytes(plan, row.state);
       const unmeasured = budget === 0;
       const measurement = unmeasured ? {ok:false} : measure === undefined ? cachedWorkspaceAllocation(database, row.id, row.path, device) : measure(row.path, device);
       if (!unmeasured && !measurement.ok) measurementFailures.push({ path: row.path, ...(measurement.code ? { code: measurement.code } : {}), error: measurement.error, reservedBytes: budget });
@@ -3500,7 +3527,9 @@ function createWorkspace(database, args, statePath) {
   const mirror = mirrorFor(statePath, intent === null ? repository : upstream.fetch);
   let row = database.prepare("SELECT * FROM workspace WHERE path = ?").get(destination);
   if (row !== undefined && recordRetainsCustody(database, row.id)) growthError("growth-admission-required", "retained growth requires fresh resume-growth admission");
+  const pinFile = refPinPath(statePath, destination, request);
   if (row !== undefined && row.state !== "released") {
+    clearRefPin(pinFile);
     if (row.creation_request !== request) fail(`workspace already exists with a different creation request: ${destination}${row.state === "creating" ? "; resume the original request, or use cancel-creation if its destination is absent" : ""}`);
     if (row.state === "active" && existsSync(destination)) {
       print(creationRecord(database, row.id), bool(args, "json"));
@@ -3510,7 +3539,13 @@ function createWorkspace(database, args, statePath) {
   } else {
     if (existsSync(destination)) fail(`workspace already exists: ${destination}`);
     mkdirSync(root, { recursive: true });
-    const pinnedCommit = resolveRequestedSource(repository, ref);
+    const resolvedCommit = resolveRequestedSource(repository, ref);
+    const pinnedCommit = resolvedCommit === ref ? resolvedCommit : pinnedSourceCommit({ file: pinFile, resolved: resolvedCommit,
+      isAncestor: (pinned, resolved) => {
+        const local = existsSync(repository);
+        const result = command("git", [...(local ? ["-C", repository] : ["--git-dir", mirror]), "merge-base", "--is-ancestor", pinned, resolved]);
+        return result.status === 0 ? true : result.status === 1 || local ? false : null;
+      } });
     const preparation = withResourceLock(statePath, `source-preparation:${destination}`, () =>
       prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns, sourceCommit: pinnedCommit }));
     if (preparation.state !== "ready") {
@@ -3522,6 +3557,7 @@ function createWorkspace(database, args, statePath) {
     }
     reservePreparedCreation(database, args, statePath,
       { root, destination, repository, mirror, ref, intent, sparsePatterns, sourceCommit: pinnedCommit }, preparation.value);
+    clearRefPin(pinFile);
     row = database.prepare("SELECT * FROM workspace WHERE path = ?").get(destination);
     if (row.creation_request !== request) fail(`workspace creation was claimed by another request: ${destination}`);
   }
@@ -5454,6 +5490,7 @@ function measureCapacityCommand(database, args, statePath) {
   for (const row of rows) {
     if(releasedMissing.has(row.id)) continue;
     const plan = JSON.parse(row.plan_json);
+    if (selected === null && movedOffDevice(row.path, row.device_id)) { skipped["moved-off-device"] = (skipped["moved-off-device"] ?? 0) + 1; continue; }
     const budget = measuredBudgetBytes(plan, row.state);
     if (selected === null && budget === 0) { skipped[retainedGrowth(plan) ? "retired-future-growth" : "zero-liability"] += 1; continue; }
     const cached = cachedWorkspaceAllocation(database, row.id, row.path, row.device_id, started);
@@ -5984,11 +6021,23 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
       args.named.set("root", [path.resolve(required(args, "root"))]);
       args.named.set("repo", [repository]);
       const normalized = [...args.named].flatMap(([name, values]) => values.map((value) => `--${name}=${value}`));
-      const result = command("timeout", ["--kill-after=1", String(budgetMs / 1000),
+      const attempt = () => command("timeout", ["--kill-after=1", String(budgetMs / 1000),
         process.execPath, new URL(import.meta.url).pathname, "create", ...normalized], {
         timeout: budgetMs + 3_000,
         env: { PI_WORKSPACE_STATE: statePath, PI_WORKSPACE_CREATE_CHILD: statePath },
       });
+      // Source preparation and checkout run as durable background jobs. Repeat the request
+      // here as each one finishes, so one call normally returns the active workspace instead
+      // of handing the caller a "repeat this request" loop.
+      const waitDeadline = Date.now() + createWaitMs();
+      let result = attempt();
+      while (result.status === 75 && Date.now() < waitDeadline) {
+        const job = pendingJobResult(result.stdout);
+        if (job === null) break;
+        const pause = new Int32Array(new SharedArrayBuffer(4));
+        do Atomics.wait(pause, 0, 0, 1000); while (!existsSync(job) && Date.now() < waitDeadline);
+        result = attempt();
+      }
       if ([124, 137].includes(result.status) || result.error?.code === "ETIMEDOUT") {
         fail("creation budget exhausted; pending reservation retained, not active; repeat the same create command to retry, optionally increasing --creation-timeout-seconds (maximum 86400)");
       }
