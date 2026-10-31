@@ -26,7 +26,8 @@ import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contrac
 import {cacheStagingRoots} from './cache-retirement.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
-import { shareMirrorPacks, configuredLocalSources } from "./mirror-pack-sharing.mjs";
+import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
+import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
 import {awaitSubmittedRelease,RELEASE_AWAIT_MS} from './release-await.mjs';
 import { spawn, spawnSync } from "node:child_process";
@@ -1914,20 +1915,63 @@ function sourceCapacityPlan(repository, sourceCommit, intent, blockSize, mirror,
   return { ...plan, constructionBytes, sourceImportBytes, sourceImportBaseCommits: imported.baseCommits };
 }
 
+// A configured filter driver only runs on paths an attribute assigns it to, so a driver
+// in the system configuration (git-lfs install --system, 2026-10-30) changes nothing by
+// itself. The tree's own .gitattributes are checked by sourceCheckoutCapacity; this
+// checks the attribute files outside the tree.
+// Filter drivers whose committed blobs are git-lfs-format pointer files and whose
+// checkout writes the file the pointer names: seinari.git's data filter (2026-10-30).
+// A checkout of such a file is priced at the pointer's size line.
+const POINTER_FILTERS = new Set(["filter=seinari-data", "filter=lfs"]);
+const transformingAttributes = text => text.split("\n").filter(line => !/^\s*#/u.test(line))
+  .flatMap(line => line.match(/(?:working-tree-encoding|filter)=\S+/gu) ?? []);
+
+function pricePointerFiles(repository, entries, selected) {
+  // A pointer file is about 130 bytes; nothing outside this range can be one.
+  const candidates = entries.filter(entry => entry.type === "blob" && entry.size !== undefined && Number(entry.size) >= 80 && Number(entry.size) <= 400
+    && (selected === null || selected.has(entry.name)));
+  if (candidates.length === 0) return;
+  const unique = [...new Set(candidates.map(entry => entry.hash))];
+  const result = spawnSync("git", ["-C", repository, "cat-file", "--batch"], { env: { ...process.env, ...closureEnvironment }, input: unique.join("\n") + "\n", maxBuffer: 1 << 30, timeout: 120_000 });
+  if (result.status !== 0) fail("source capacity estimate unknown: selected source object is unavailable");
+  const out = result.stdout, sizes = new Map();
+  let offset = 0;
+  while (offset < out.length) {
+    const end = out.indexOf(10, offset);
+    const [hash, , length] = out.toString("latin1", offset, end).split(" ");
+    const body = out.toString("latin1", end + 1, end + 1 + Number(length));
+    offset = end + 1 + Number(length) + 1;
+    const pointer = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\n(?:[^\n]*\n)*?size (\d+)\n/u.exec(body);
+    if (pointer) sizes.set(hash, pointer[1]);
+  }
+  for (const entry of candidates) if (sizes.has(entry.hash) && Number(sizes.get(entry.hash)) > Number(entry.size)) entry.size = sizes.get(entry.hash);
+}
+
 function assertSourceCheckoutFilters(repository) {
-  const filters = command("git", ["-C", repository, "config", "--get-regexp", "^filter\\..*\\.(smudge|process)$"]);
-  if (filters.status !== 1) fail("source capacity estimate unknown: configured checkout filters need an independently budgeted installer");
+  const located = command("git", ["-C", repository, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes"]);
+  const configured = command("git", ["-C", repository, "config", "--path", "--get", "core.attributesFile"]);
+  const home = process.env.HOME || "";
+  const files = [located.status === 0 ? located.stdout.trim() : null, "/etc/gitattributes",
+    configured.status === 0 ? configured.stdout.trim() : path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "git", "attributes")];
+  for (const file of files.filter(Boolean)) {
+    let text;
+    try { text = readFileSync(file, "utf8"); } catch (error) { if (error.code === "ENOENT" || error.code === "ENOTDIR") continue; throw error; }
+    if (transformingAttributes(text).some(value => !POINTER_FILTERS.has(value))) fail(`source capacity estimate unknown: ${file} assigns a checkout filter; it needs an independently budgeted installer`);
+  }
 }
 
 function sourceCheckoutCapacity(repository, sourceCommit, intent, blockSize, sparsePatterns = []) {
   if (!Number.isSafeInteger(blockSize) || blockSize <= 0) fail("source capacity estimate unknown: invalid filesystem allocation unit");
   assertSourceCheckoutFilters(repository);
   const { entries, selected } = sourceTree(repository, sourceCommit, sparsePatterns);
+  let pointerFilter = false;
   for (const { name } of entries) {
-    if (name.endsWith(".gitattributes") && /(?:working-tree-encoding|filter)=/u.test(git(repository, ["show", `${sourceCommit}:${name}`]))) {
-      fail("source capacity estimate unknown: checkout attribute transformation");
-    }
+    if (!name.endsWith(".gitattributes")) continue;
+    const transforms = transformingAttributes(git(repository, ["show", `${sourceCommit}:${name}`]));
+    if (transforms.some(value => !POINTER_FILTERS.has(value))) fail("source capacity estimate unknown: checkout attribute transformation");
+    if (transforms.length > 0) pointerFilter = true;
   }
+  if (pointerFilter) pricePointerFiles(repository, entries, selected);
   const checkoutAllocation = checkoutConstructionCapacity(entries, selected, blockSize);
   return { ...intent, estimate: selected === null ? "whole-tree-upper-bound" : "git-sparse-upper-bound",
     constructionBytes: checkoutAllocation.totalBytes, checkoutAllocation, checkoutPricingVersion: 4, sourceImportBytes: 0, sourceCommit };
@@ -2950,7 +2994,8 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   // Fetch the request's own repository, not the shared remote name another import may be rewriting.
   const fetch = negotiation => run("git", ["--git-dir", mirror, "-c", "core.fsync=loose-object,pack,reference", "-c", "core.fsyncMethod=fsync", "fetch", ...negotiation, "--update-shallow", "--no-tags", "--no-auto-maintenance", "--no-write-fetch-head", repository, `+${resolved}:${sourceRef}`], { timeout: sourcePreparationMode === "worker" ? SOURCE_IMPORT_TIMEOUT_MS : 120_000 });
   // A present commit with its whole closure needs no transfer (shared local packs land here).
-  // Otherwise fetch incrementally and prove the closure; only a proved gap pays for --refetch,
+  // Otherwise fetch incrementally and prove the closure. A gap left by a local source is
+  // filled by copying just the missing objects; only a remote gap (or a failed copy) pays for --refetch,
   // which copies the commit's entire history.
   if (!(commitPresent && hasObjectClosure(mirror, resolved, sparsePatterns))) {
     if (!commitPresent) fetch((existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : []).map(tip => `--negotiation-tip=${tip}`));
@@ -5666,6 +5711,7 @@ function help() {
   agent-workspace retire-cache --id ID --path PATH --owner OWNER --request FILE --request-sha256 SHA --json
   agent-workspace retire-cache-status (--id ID|--stage STAGING_NAME) --json
   agent-workspace share-mirror-packs [--mirror MIRROR_GIT_DIR ...] --json
+  agent-workspace prune-mirrors [--execute] [--unused-days 14] --json
   agent-workspace prune-inode-content --json
   agent-workspace retire-source-materialization --id ID --path PATH --owner OWNER --request ABS_FILE --request-sha256 SHA --json
   agent-workspace retire-growth ${selectorSyntax("retire-growth")} --owner OWNER --disposition FILE --disposition-sha256 SHA [--json]
@@ -5855,10 +5901,44 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     const mirrors = many(args, "mirror").length ? many(args, "mirror").map(mirror => path.resolve(mirror))
       : existsSync(root) ? readdirSync(root).filter(name => name.endsWith(".git")).sort().map(name => path.join(root, name)) : [];
     const results = mirrors.map(mirror => {
+      const stale = removeStaleTemporaryPacks(mirror);
+      if (stale.removed > 0) process.stderr.write(`agent-workspace: removed ${stale.removed} abandoned temporary pack files (${stale.freedBytes} bytes) from ${mirror}\n`);
       try { return { mirror, ...withResourceLock(statePath, `mirror:${mirror}`, () => shareLocalMirrorPacks(statePath, mirror, []), undefined, { mode: "shared", waitMs: 5000 }) }; }
       catch (error) { if (error instanceof ResourceBusyError) return { mirror, ok: false, error: { code: "mirror-busy", detail: error.message } }; throw error; }
     }).filter(result => !result.ok || !["no-local-source", "not-applicable"].includes(result.value.state));
     print({ ok: results.every(result => result.ok), freedBytes: results.reduce((total, result) => total + (result.value?.freedBytes ?? 0), 0), mirrors: results }, true);
+    return;
+  }
+  if (commandName === "prune-mirrors") {
+    const home = process.env.HOME || "/home/kenan";
+    // [checkouts one level down, checkouts two levels down]
+    const MIRROR_BORROWER_ROOTS = [[path.join(home, "worktrees"), null], [path.join(home, "work", "clones"), null], ["/home/kenan-research", "/home/kenan-research/checkouts"]];
+    assertOnly(args, ["execute", "unused-days", "json"]);
+    const unusedDays = numberFlag(args, "unused-days", 14);
+    const root = path.join(path.dirname(statePath), "mirrors");
+    const database = openRegistry(statePath);
+    let rows;
+    try { rows = database.prepare("SELECT path, root, repository, state FROM workspace").all(); } finally { database.close(); }
+    // Every existing checkout the registry knows, anything else in its roots, research
+    // checkouts (their user can enter the mirrors folder), and checkouts moved to the cold tier.
+    const checkouts = new Set([...rows.map(row => row.path).filter(existsSync),
+      ...checkoutsUnder([...new Set(rows.map(row => row.root))], 1),
+      ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([directory]) => directory).filter(Boolean), 1),
+      ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([, directory]) => directory).filter(Boolean), 2)]);
+    const coldBorrowed = coldBorrowedObjectDirectories(process.env.AGENT_WORKSPACE_COLD_OWNERS || "/var/lib/kenan-cold/owners",
+      path.join(path.dirname(statePath), "cold-alternates.v1.json"));
+    const verdicts = classifyMirrors({ mirrorRoot: root, checkouts: [...checkouts], coldBorrowed, unusedDays,
+      activeRepositories: rows.filter(row => row.state !== "released").map(row => row.repository) });
+    const execute = bool(args, "execute");
+    const retired = [];
+    for (const verdict of verdicts.filter(verdict => verdict.retire)) {
+      if (!execute) { retired.push({ ...verdict, action: "would-remove" }); continue; }
+      // Imports hold this lock shared; removal waits for none of them and skips a busy mirror.
+      try { withResourceLock(statePath, `mirror:${verdict.mirror}`, () => removeMirror(verdict.mirror), undefined, { waitMs: 1000 }); retired.push({ ...verdict, action: "removed" }); }
+      catch (error) { if (!(error instanceof ResourceBusyError)) throw error; retired.push({ ...verdict, action: "busy" }); }
+    }
+    const parked = execute ? removeParkedMirrors(root) : 0;
+    print({ ok: true, execute, unusedDays, coldBorrowersKnown: coldBorrowed !== null, mirrors: verdicts.length, kept: verdicts.length - retired.length, retired, parkedLeftoversRemoved: parked }, true);
     return;
   }
   if (commandName === "source-status" || commandName === "job-status") {

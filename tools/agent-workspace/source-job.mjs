@@ -335,6 +335,8 @@ export function runSourceJob({ directory, key, request, command, env = {}, waitM
       `--property=Restart=${restartAbnormal ? "on-abnormal" : "no"}`, "--property=RestartSec=1s",
       "--property=KillMode=control-group", "--property=UMask=0077",
       "--property=TimeoutStartSec=120",
+      // Imports read and write whole repositories; interactive work goes first.
+      "--property=Nice=10", "--property=IOWeight=20",
       "--property=StandardOutput=null", "--property=StandardError=null",
       ...(cleanupCommand.length ? [`--property=ExecStopPost=${cleanupCommand.map(value =>
         `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`).join(" ")}`] : []),

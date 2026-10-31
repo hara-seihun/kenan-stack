@@ -6,8 +6,11 @@
 // them is in a pack the mirror shares with a source; partly covered packs are
 // rewritten to just their uncovered objects. At every step each object stays
 // present in the mirror, so readers (worktrees, reference clones) never miss one.
+// The source's loose objects (pushes since its last repack) are linked too, or
+// copied when the kernel refuses the link, so a mirror of a local repository
+// holds every object its source holds and an import needs no Git transfer.
 import { spawnSync } from "node:child_process";
-import { existsSync, linkSync, lstatSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, lstatSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
 
 const PACK = /^(pack-[0-9a-f]{40,64})\.idx$/u;
@@ -17,6 +20,13 @@ const REMOVE_ORDER = [".idx", ".bitmap", ".rev", ".mtimes", ".pack"];
 const { GIT_DIR, GIT_OBJECT_DIRECTORY, GIT_WORK_TREE, ...inherited } = process.env;
 const gitEnvironment = { ...inherited, GIT_ALTERNATE_OBJECT_DIRECTORIES: "", GIT_NO_LAZY_FETCH: "1" };
 
+// Rewriting a pack is the one heavy step here (a 50 GB pack made three 4-5 GB
+// pack-objects on 2026-10-30). Only one runs on the host at a time, at the lowest
+// CPU and best-effort IO priority, one thread; a busy lock skips the rewrite until
+// the next maintenance run instead of waiting.
+export const PACK_REWRITE_LOCK = process.env.AGENT_WORKSPACE_PACK_LOCK || "/run/lock/kenan-git-pack-rewrite.lock";
+const LOCK_BUSY = 75;
+const MAX_REWRITE_PACK_BYTES = Number(process.env.AGENT_WORKSPACE_MAX_REWRITE_PACK_BYTES || 2 * 1024 ** 3);
 const git = (args, options = {}) => spawnSync("git", args, { encoding: "utf8", env: gitEnvironment, maxBuffer: 16 << 20, timeout: 600_000, ...options });
 const inode = file => { const s = statSync(file, { bigint: true }); return `${s.dev}:${s.ino}`; };
 const missing = error => error?.code === "ENOENT";
@@ -55,6 +65,68 @@ export function objectPackDirectory(repository) {
 
 function packBases(directory) {
   return readdirSync(directory).map(name => PACK.exec(name)?.[1]).filter(Boolean).sort();
+}
+
+function lowPriorityGit(args, options) {
+  return spawnSync("flock", ["--nonblock", "--conflict-exit-code", String(LOCK_BUSY), PACK_REWRITE_LOCK,
+    "nice", "-n", "19", "ionice", "-c", "2", "-n", "7", "git", "-c", "pack.threads=1", ...args],
+  { encoding: "utf8", env: gitEnvironment, maxBuffer: 16 << 20, timeout: 3_600_000, ...options });
+}
+
+const LOOSE_DIRECTORY = /^[0-9a-f]{2}$/u;
+const LOOSE_NAME = /^[0-9a-f]{38}(?:[0-9a-f]{24})?$/u;
+
+// Bring every loose object of the source into the mirror: a hard link when the
+// kernel allows it, else a copy (loose objects are small). Objects are immutable
+// and content-named, so an existing name is already the same object.
+export function shareLooseObjects(sourceObjects, mirrorObjects) {
+  let linked = 0, copied = 0;
+  let directories;
+  try { directories = readdirSync(sourceObjects).filter(name => LOOSE_DIRECTORY.test(name)); }
+  catch (error) { if (missing(error)) return { linked, copied }; throw error; }
+  for (const directory of directories) {
+    let names;
+    try { names = readdirSync(path.join(sourceObjects, directory)).filter(name => LOOSE_NAME.test(name)); }
+    catch (error) { if (missing(error) || error.code === "ENOTDIR") continue; throw error; }
+    if (names.length === 0) continue;
+    const target = path.join(mirrorObjects, directory);
+    for (const name of names) {
+      const from = path.join(sourceObjects, directory, name), to = path.join(target, name);
+      if (existsSync(to)) continue;
+      mkdirSync(target, { recursive: true, mode: 0o755 });
+      const temporary = path.join(target, `.tmp-share-${process.pid}-${name}`);
+      try { linkSync(from, temporary); renameSync(temporary, to); linked++; continue; }
+      catch (error) {
+        if (missing(error)) continue; // the source pruned or packed it meanwhile
+        if (!["EPERM", "EACCES", "EXDEV", "EMLINK"].includes(error.code)) throw error;
+      }
+      try { copyFileSync(from, temporary); renameSync(temporary, to); copied++; }
+      catch (error) { try { unlinkSync(temporary); } catch { /* not created */ } if (!missing(error)) throw error; }
+    }
+  }
+  return { linked, copied };
+}
+
+// Interrupted fetches and repacks leave tmp_pack_*/tmp_idx_* behind (a killed
+// import left a 22 GB tmp_pack on 2026-10-30). A live writer keeps touching its
+// file, so one unchanged for maxAgeMs is dead.
+export function removeStaleTemporaryPacks(mirror, now = Date.now(), maxAgeMs = 3_600_000) {
+  const directory = path.join(mirror, "objects", "pack");
+  let removed = 0, freedBytes = 0;
+  let names;
+  try { names = readdirSync(directory); } catch (error) { if (missing(error)) return { removed, freedBytes }; throw error; }
+  for (const name of names) {
+    if (!/^(?:tmp_pack_|tmp_idx_|tmp_rev_|tmp_mtimes_|\.tmp-share-)/u.test(name)) continue;
+    const file = path.join(directory, name);
+    try {
+      const s = lstatSync(file);
+      if (!s.isFile() || now - s.mtimeMs < maxAgeMs) continue;
+      unlinkSync(file);
+      removed++;
+      if (s.nlink === 1) freedBytes += s.blocks * 512;
+    } catch (error) { if (!missing(error)) throw error; }
+  }
+  return { removed, freedBytes };
 }
 
 // Link one source pack into the mirror. A same-named mirror copy holds the same
@@ -125,9 +197,14 @@ function dedupe(mirror, directory, sharedInodes, hashBytes) {
     if (!names.ok) { result.keptPacks++; continue; }
     const uncovered = names.value.filter(name => !covered.has(name));
     if (uncovered.length === names.value.length) { result.keptPacks++; continue; }
+    // A big pack that is only partly covered means the source rewrote its history
+    // (2026-10-30: seinari.git moving its large files to LFS). Rewriting it would
+    // copy tens of GB of old objects; the mirror is retired instead (mirror-retirement.mjs).
+    if (uncovered.length > 0 && statSync(path.join(directory, base + ".pack")).size > MAX_REWRITE_PACK_BYTES) { result.keptPacks++; result.tooBigToRewrite = (result.tooBigToRewrite ?? 0) + 1; continue; }
     if (uncovered.length > 0) {
-      const written = git(["--git-dir", mirror, "pack-objects", "--quiet", path.join(directory, "pack")],
+      const written = lowPriorityGit(["--git-dir", mirror, "pack-objects", "--quiet", path.join(directory, "pack")],
         { input: uncovered.map(name => Buffer.from(name, "latin1").toString("hex")).join("\n") + "\n" });
+      if (written.status === LOCK_BUSY) { result.keptPacks++; result.rewriteBusy = true; continue; }
       const residue = written.stdout.trim();
       if (written.status !== 0 || !/^[0-9a-f]{40,64}$/u.test(residue) || !existsSync(path.join(directory, `pack-${residue}.idx`))) { result.keptPacks++; continue; }
       if (`pack-${residue}` === base) { result.keptPacks++; continue; }
@@ -148,7 +225,7 @@ export function shareMirrorPacks({ mirror, sources, exclusive }) {
   const hashBytes = hashBytesFor(["--git-dir", mirror]);
   if (!hashBytes.ok) return hashBytes;
   const used = [], sharedInodes = new Set();
-  let linkedPacks = 0, skippedPacks = 0, replacedBytes = 0;
+  let linkedPacks = 0, skippedPacks = 0, replacedBytes = 0, linkedLoose = 0, copiedLoose = 0;
   for (const source of [...new Set(sources.filter(Boolean))]) {
     const sourceDirectory = objectPackDirectory(source);
     if (sourceDirectory === null || path.resolve(sourceDirectory) === path.resolve(directory) || statSync(sourceDirectory).dev !== device) continue;
@@ -163,11 +240,13 @@ export function shareMirrorPacks({ mirror, sources, exclusive }) {
       if (outcome.skipped) { skippedPacks++; continue; }
       try { sharedInodes.add(inode(path.join(sourceDirectory, base + ".pack"))); } catch (error) { if (!missing(error)) throw error; }
     }
+    const loose = shareLooseObjects(path.dirname(sourceDirectory), path.dirname(directory));
+    linkedLoose += loose.linked; copiedLoose += loose.copied;
   }
   if (used.length === 0) return { ok: true, value: { state: "no-local-source", sources: [] } };
   const removal = exclusive(() => dedupe(mirror, directory, sharedInodes, hashBytes.value));
   const { freedBytes = 0, ...counts } = removal ?? { removedPacks: 0, rewrittenPacks: 0, keptPacks: null };
-  return { ok: true, value: { state: removal === null ? "linked-removal-busy" : "shared", sources: used, linkedPacks, skippedPacks,
+  return { ok: true, value: { state: removal === null ? "linked-removal-busy" : "shared", sources: used, linkedPacks, skippedPacks, linkedLoose, copiedLoose,
     ...counts, freedBytes: freedBytes + replacedBytes } };
 }
 
@@ -177,3 +256,4 @@ export function configuredLocalSources(mirror) {
   if (listed.status !== 0) return [];
   return listed.stdout.split("\n").map(line => line.slice(line.indexOf(" ") + 1)).filter(url => path.isAbsolute(url) && existsSync(url));
 }
+

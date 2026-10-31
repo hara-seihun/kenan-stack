@@ -97,6 +97,7 @@ test('a mirror holding a commit without its trees takes only the missing objects
   assert.ok(complete(mirror,second));
   const own=readdirSync(path.join(mirror,'objects','pack')).filter(name=>name.endsWith('.idx')&&!inodes(f.source).has(statSync(path.join(mirror,'objects','pack',name.replace(/\.idx$/,'.pack'))).ino));
   const copied=own.reduce((total,name)=>total+execFileSync('git',['show-index'],{input:execFileSync('cat',[path.join(mirror,'objects','pack',name)])}).toString().trim().split('\n').length,0);
-  assert.equal(copied,2,'only the new tree and blob were copied');
+  // Loose sharing links the new tree and blob before any copy is needed; either way no history is copied.
+  assert.ok(copied<=2,`at most the new tree and blob were copied, not ${copied} objects`);
  } finally {f.cleanup();}
 });
