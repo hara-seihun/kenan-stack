@@ -79,7 +79,9 @@ export function launchOnce(input,binding,uid,spec,args,{root=BACKGROUND_ROOT,exe
    write(record);
    result=submitBackground('/usr/bin/systemd-run',args,{execute});
   }
-  const observed=observeBackground(spec.unit,{execute});
+  // systemd-run's own success means it created this exact unit (an existing name is a refusal), so only an unclear or
+  // missing reply needs the extra manager query: under a CPU-starved agent slice each process costs up to a second.
+  const observed=result?.status===0&&!result.error?null:observeBackground(spec.unit,{execute});
   const verdict=settleBackground(result,observed,spec);
   const response={...verdict,unit:spec.unit,log,identity:binding};
   if(verdict.ok)write({...record,state:'accepted',response});
@@ -109,9 +111,11 @@ export function main(){
   process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
+ // All background jobs share user-agents-kenanbg.slice (Kenan Stack deploy/priority), weighted as one agent command, so
+ // they can't crowd out the agents' own shells (2026-10-30: 17 jobs as separate siblings left each shell 0.05 CPU).
  // A durable name reservation and kernel-held lock prevent retry races. Unit
  // failures remain available for readback after their processes have exited.
- const args=['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
+ const args=['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
  const response=launchOnce(input,binding,uid,spec,args);
  if(!response.ok){console.error(JSON.stringify({ok:false,error:response}));process.exitCode=response.code==='background_launch_outcome_unknown'?75:2;return;}
  console.log(JSON.stringify(response));
