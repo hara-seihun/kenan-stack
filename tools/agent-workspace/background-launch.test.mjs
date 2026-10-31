@@ -181,3 +181,55 @@ test('background receipts live under a state directory that is not a retired pi 
   assert.equal(r.code,'background_state_parent_missing');assert.equal(fs.existsSync(path.join(base,'missing')),false);
  }finally{fs.rmSync(base,{recursive:true,force:true});}
 });
+import {stopBackground,escapedGroups} from './background-launch.mjs';
+// A job like the 2026-10-31 one: the unit holds the kenan-bg wrapper (10) and cpu-slot (11); cpu-slot's scope holds
+// node --test (20) and its CPU-bound child (21), which never runs its SIGTERM handler. Nothing dies until SIGKILL.
+function stuckJob({foreignInScope=false}={}){
+ const unit='/system.slice/kenan-bg-x.service',scope='/user.slice/user-1990.slice/user@1990.service/heavy.slice/cpu-slot-x.scope';
+ const s={alive:new Set([10,11,20,21]),stopQueued:false,log:[],t:0};
+ const where={10:unit,11:unit,20:scope,21:scope,99:scope};
+ if(foreignInScope)s.alive.add(99);
+ const tree={10:[11],11:[20],20:[21]};
+ s.proc={
+  procs:g=>[...s.alive].filter(p=>where[p]===g),
+  children:p=>(tree[p]??[]).filter(c=>s.alive.has(c)),
+  cgroupOf:p=>s.alive.has(p)?where[p]:null,
+  start:p=>s.alive.has(p)?'1000':null,
+  kill:(p,sig)=>{s.log.push(`${sig}:${p}`);if(sig==='SIGKILL')s.alive.delete(p);},
+  killGroup:g=>{s.log.push(`cgroup.kill:${g}`);for(const p of [...s.alive])if(where[p]===g)s.alive.delete(p);},
+ };
+ // Like systemd: the stop SIGTERMs the unit, the wrapper (main, 10) exits, and ExecStopPost (30, with a child 31) runs
+ // at once, while cpu-slot (11) is still alive in the unit.
+ s.execute=(cmd,args)=>{
+  if(args[1]==='stop'){assert.deepEqual(args,['--system','stop','--no-block','kenan-bg-x.service']);s.stopQueued=true;s.log.push('stop');
+   s.alive.delete(10);s.alive.add(30);s.alive.add(31);where[30]=where[31]=unit;tree[30]=[31];return {status:0};}
+  return {status:0,stdout:`ControlGroup=${unit}\nControlPID=${s.alive.has(30)?30:0}\n`};
+ };
+ s.clock={now:()=>s.t,sleep:ms=>{s.t+=ms;}};
+ return {s,unit,scope};
+}
+test('kenan-bg stop ends a job whose CPU-bound Node child ignores SIGTERM, including the processes in its cpu-slot scope',()=>{
+ const {s,scope}=stuckJob();
+ const r=stopBackground('kenan-bg-x.service',{execute:s.execute,proc:s.proc,...s.clock});
+ assert.equal(r.state,'stopped');assert.equal(r.forced,true);assert.deepEqual(r.escaped,[scope]);
+ assert.deepEqual([...s.alive].sort(),[30,31]);
+ // The stop is queued with systemd before anything else, so a caller cut off mid-stop still stops the unit.
+ assert.equal(s.log[0],'stop');assert.ok(s.log.includes('SIGTERM:20')&&s.log.includes('SIGTERM:21'));
+ assert.ok(s.log.indexOf('SIGKILL:11')>s.log.indexOf('SIGTERM:21'));
+ // ExecStopPost, which raises the job's end event, is left to finish.
+ assert.ok(s.alive.has(30)&&s.alive.has(31)&&!s.log.some(l=>/:3[01]$/.test(l)));
+ assert.ok(s.t>=3000&&s.t<=5000,`the whole stop is bounded (${s.t} ms)`);
+});
+test('a stop that SIGTERM ends promptly is never escalated, and a still-running job is never reported stopped',()=>{
+ const quick=stuckJob();const kill=quick.s.proc.kill;
+ quick.s.proc.kill=(p,sig)=>{kill(p,'SIGKILL');quick.s.log.push('graceful');};
+ const execute=quick.s.execute;quick.s.execute=(cmd,args,o)=>{const r=execute(cmd,args,o);if(args[1]==='stop')quick.s.alive.delete(11);return r;};
+ const r=stopBackground('kenan-bg-x.service',{execute:quick.s.execute,proc:quick.s.proc,...quick.s.clock});
+ assert.equal(r.state,'stopped');assert.equal(r.forced,false);assert.ok(quick.s.t<3000);
+ const immortal=stuckJob();immortal.s.proc.kill=()=>{};immortal.s.proc.killGroup=()=>{};
+ assert.equal(stopBackground('kenan-bg-x.service',{execute:immortal.s.execute,proc:immortal.s.proc,...immortal.s.clock}).state,'stopping');
+});
+test('a control group shared with anything outside the job is not the job\'s to kill',()=>{
+ const {s,unit}=stuckJob({foreignInScope:true});
+ assert.deepEqual(escapedGroups(unit,s.proc),[]);
+});

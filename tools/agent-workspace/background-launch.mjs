@@ -58,6 +58,57 @@ export function settleBackground(result,observed,spec){
  // the job's log if it started, or submits it once if it never did).
  return {ok:false,code:'background_launch_outcome_unknown',retry:true,detail:`systemd gave no answer (${result?.error?.code||result?.signal||'no reply'}) and no unit exists yet. Run the same kenan-bg command again: it reports the job if it started, or starts it exactly once if it never did.`};
 }
+// kenan-bg stop. SIGTERM can't interrupt a long synchronous computation (a CPU-bound node --test child kept 2.8 GB
+// after a stop, 2026-10-31), and cpu-slot runs each job in its own scope outside this unit, where stopping the unit never
+// reaches it. So the stop is queued with systemd first (it happens even if this caller is cut off), the job's processes
+// outside the unit are found by ancestry while it still exists, everything gets SIGTERM, and whatever is left after
+// graceMs gets SIGKILL (systemd's own escalation waits TimeoutStopSec, 90 s, after ExecStopPost). The answer is "stopped" only once none of the job's processes is left.
+const procFs={
+ procs(group){
+  const out=[];const walk=dir=>{let entries;try{out.push(...fs.readFileSync(dir+'/cgroup.procs','utf8').split('\n').filter(Boolean).map(Number));entries=fs.readdirSync(dir,{withFileTypes:true});}catch{return;}
+   for(const e of entries)if(e.isDirectory())walk(dir+'/'+e.name);};
+  walk('/sys/fs/cgroup'+group);return out;
+ },
+ children(pid){let tasks;try{tasks=fs.readdirSync(`/proc/${pid}/task`);}catch{return [];}
+  return tasks.flatMap(t=>{try{return fs.readFileSync(`/proc/${pid}/task/${t}/children`,'utf8').split(' ').filter(Boolean).map(Number);}catch{return [];}});},
+ cgroupOf(pid){try{return fs.readFileSync(`/proc/${pid}/cgroup`,'utf8').match(/^0::(.*)$/m)?.[1]??null;}catch{return null;}},
+ start(pid){try{return fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(') ').at(-1).split(' ')[19];}catch{return null;}},
+ kill(pid,signal){try{process.kill(pid,signal);}catch{}},
+ killGroup(group){try{fs.writeFileSync('/sys/fs/cgroup'+group+'/cgroup.kill','1');}catch{}},
+};
+const sleepMs=ms=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
+// Control groups outside the unit that hold nothing but the job's own descendants (cpu-slot's job scopes).
+export function escapedGroups(group,proc=procFs){
+ const inside=g=>g===group||g.startsWith(group+'/');
+ const mine=new Set(),queue=[...proc.procs(group)];
+ while(queue.length){for(const child of proc.children(queue.pop()))if(!mine.has(child)){mine.add(child);queue.push(child);}}
+ const groups=new Set([...mine].map(pid=>proc.cgroupOf(pid)).filter(g=>g&&!inside(g)));
+ return [...groups].filter(g=>{const pids=proc.procs(g);return pids.length>0&&pids.every(pid=>mine.has(pid));});
+}
+export function stopBackground(unit,{execute=run,proc=procFs,sleep=sleepMs,now=Date.now,graceMs=3000,settleMs=2000}={}){
+ const show=()=>{const r=execute('/usr/bin/systemctl',['--system','show',unit,'--property=ControlGroup,ControlPID'],{timeout:10000});
+  return Object.fromEntries((r.stdout??'').trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));};
+ const group=show().ControlGroup||null;
+ const escaped=group?escapedGroups(group,proc):[];
+ execute('/usr/bin/systemctl',['--system','stop','--no-block',unit],{timeout:10000});
+ for(const g of escaped)for(const pid of proc.procs(g))proc.kill(pid,'SIGTERM');
+ // The job's processes in the unit: everything but ExecStopPost (the control process, which raises the job's end event)
+ // and its children. systemd runs ExecStopPost as soon as the main process exits, while the rest may still run.
+ // The processes are read before ControlPID, so an ExecStopPost started in between is never among them.
+ const leftovers=()=>{
+  if(!group)return [];
+  const pids=proc.procs(group),control=Number(show().ControlPID)||0,spared=new Set();
+  if(control){const queue=[control];spared.add(control);while(queue.length)for(const c of proc.children(queue.pop()))if(!spared.has(c)){spared.add(c);queue.push(c);}}
+  return pids.filter(pid=>!spared.has(pid));
+ };
+ const done=()=>leftovers().length===0&&escaped.every(g=>proc.procs(g).length===0);
+ const until=deadline=>{while(now()<deadline){if(done())return true;sleep(100);}return done();};
+ if(until(now()+graceMs))return {unit,state:'stopped',forced:false,escaped};
+ // A start-time match guards against a pid reused since it was read.
+ for(const [pid,start] of leftovers().map(pid=>[pid,proc.start(pid)]))if(start!==null&&proc.start(pid)===start)proc.kill(pid,'SIGKILL');
+ for(const g of escaped)proc.killGroup(g);
+ return {unit,state:until(now()+settleMs)?'stopped':'stopping',forced:true,escaped};
+}
 export const BACKGROUND_ROOT='/var/lib/agent-workspace/background-launch';
 // The wrapper's argv carries its log twice (argv[3] and the ExecStopPost line); a resubmission keeps the original log.
 export function withLog(input,log){
@@ -147,7 +198,8 @@ export function main(){
    if(!prior?.background||prior.agentId!==binding.agentId||prior.channel!==binding.channel||prior.uid!==uid)throw Error('background_owner_mismatch');
   }
   if(process.argv[2]==='status'&&properties.SubState==='exited'){console.log('inactive');return;}
-  const result=run('/usr/bin/systemctl',['--system',process.argv[2]==='stop'?'stop':'is-active',spec.unit]);
+  if(process.argv[2]==='stop'){const r=stopBackground(spec.unit);console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;return;}
+  const result=run('/usr/bin/systemctl',['--system','is-active',spec.unit]);
   process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
