@@ -11,6 +11,7 @@ import {withContentObservation,pruneInodeContent} from './inode-content.mjs';
 import {allocationSlice} from './incremental-allocation.mjs';
 import {prepareFrozenObjectCustody} from './frozen-object-custody.mjs';
 import {sourceHandoff,SourceHandoffError} from './source-handoff.mjs';
+import {literalSparseSelection} from './sparse-literal.mjs';
 import {ensureGrowthPolicyStore,projectGrowthPolicy,recordGrowthSample,restoreGrowthPolicy} from "./growth-policy-store.mjs";
 import {frozenCustody, assertUnfrozenCustody} from "./frozen-custody.mjs";
 import {writerRequest, assertWriterBinding, runWriter} from './writer-custody.mjs';
@@ -1877,6 +1878,8 @@ function capacityIntent(args) {
 
 function sparseSourcePaths(entries, patterns) {
   if (patterns.length === 0) return null;
+  const literal = literalSparseSelection(entries.map(entry => entry.name), patterns);
+  if (literal !== null) return literal;
   const scratch = mkdtempSync(path.join(tmpdir(), "pi-workspace-selection-"));
   try {
     run("git", ["init", "--quiet", scratch]);
@@ -1936,6 +1939,7 @@ function pricePointerFiles(repository, entries, selected) {
   if (candidates.length === 0) return;
   const unique = [...new Set(candidates.map(entry => entry.hash))];
   const result = spawnSync("git", ["-C", repository, "cat-file", "--batch"], { env: { ...process.env, ...closureEnvironment }, input: unique.join("\n") + "\n", maxBuffer: 1 << 30, timeout: 120_000 });
+  if (result.error?.code === "ETIMEDOUT") fail(`source capacity estimate unknown: reading ${unique.length} possible data pointer files took over 120 s; a sparse selection (--sparse-pattern '/DIR/') reads only the selected ones`);
   if (result.status !== 0) fail("source capacity estimate unknown: selected source object is unavailable");
   const out = result.stdout, sizes = new Map();
   let offset = 0;
