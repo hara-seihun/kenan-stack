@@ -21,7 +21,7 @@ import {withStdoutFile, foldRecords} from './stdout-records.mjs';
 import {hasUncoveredCommits, observedRemoteHeads, publishedTreesCover} from './release-reachability.mjs';
 import {classifyLocalMerges,disposedMergesCoverRelease,recordMergeDisposal} from './local-merge-disposal.mjs';
 import {assertNoAmplifyingCleanupImport} from './cleanup-custody-budget.mjs';
-import {workingTreeChanges as listWorkingTreeChanges, archiveWorkingTree, WORKING_TREE_ARCHIVE_MAX_BYTES} from './working-tree-archive.mjs';
+import {workingTreeChanges as listWorkingTreeChanges, ignoredOutput, withIgnoredOutput, archiveWorkingTree, WORKING_TREE_ARCHIVE_MAX_BYTES} from './working-tree-archive.mjs';
 import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as maintenanceDigest} from './maintenance-journal.mjs';
 import {boundedCommand} from './bounded-command.mjs';
 import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contract.mjs';
@@ -961,7 +961,7 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody, archiveCha
       return { safe: false, sourceRetention: true, reason: `working tree has ${workingTreeChanges.bytes} bytes of uncommitted files, more than release archives (${WORKING_TREE_ARCHIVE_MAX_BYTES}); commit, publish or delete them: ${changed.slice(0, 8).join(" | ")}` };
   }
   const archived = (result) => workingTreeChanges === null || !result.safe ? result
-    : { ...result, workingTreeChanges, reason: `${result.reason}; ${workingTreeChanges.files.length} uncommitted file(s) and ${workingTreeChanges.deleted.length} deletion(s) are archived before removal` };
+    : { ...result, workingTreeChanges, reason: `${result.reason}; ${workingTreeChanges.files.length} uncommitted or ignored file(s) and ${workingTreeChanges.deleted.length} deletion(s) are archived before removal${workingTreeChanges.droppedBuildProducts?.length ? `, ${workingTreeChanges.droppedBuildProducts.length} build product(s) dropped` : ""}` };
   const nestedRelativePaths = nestedWorkspaces.map((workspace) => path.relative(record.path, workspace));
   const ignored = lines
     .filter((line) => line.startsWith("!! "))
@@ -1000,7 +1000,14 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody, archiveCha
     };
     if (uncovered() && !recordedMergesCover() && !publishedTrees()) return {safe:false, sourceRetention:true, reason:"checkout has commits absent from remote refs or durable source ancestry", head};
   }
-  if (ignored.length > 0) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
+  if (ignored.length > 0) {
+    if (!archiveChanges) return { safe: false, sourceRetention: false, reason: `checkout has unclassified ignored output: ${ignored.slice(0, 8).join(" | ")}`, head };
+    // An explicit release drops regenerable build products and archives other ignored files.
+    const output = ignoredOutput(record.path, [".", ...nestedExclusions(record, nestedWorkspaces)]);
+    workingTreeChanges = withIgnoredOutput(workingTreeChanges ?? { files: [], deleted: [], bytes: 0 }, output);
+    if (workingTreeChanges.bytes > WORKING_TREE_ARCHIVE_MAX_BYTES)
+      return { safe: false, sourceRetention: true, reason: `checkout has ${workingTreeChanges.bytes} bytes of uncommitted and ignored non-build files, more than release archives (${WORKING_TREE_ARCHIVE_MAX_BYTES}); commit, publish, move or delete them: ${output.archived.slice(0, 8).join(" | ")}`, head };
+  }
   if (head === record.durableSourceCommit) return archived({ safe: true, sourceRetention: false, reason: "checkout remains at its durable source commit", head });
   return archived({ safe: true, sourceRetention: false, reason: "every local branch commit exists on a remote ref or in durable source ancestry", head });
 }

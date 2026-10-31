@@ -77,6 +77,15 @@ reason (for example "working tree has changes") instead of showing the custody-i
 Regressions: the two tests named "release archives uncommitted files…" and "reconcile keeps a
 dirty checkout…" in `test.mjs`.
 
+Ignored output no longer keeps a released checkout either. Regenerable build products (`.so`,
+`.o`, `.pyc`, `.cubin` and similar, and anything under `__pycache__`, `build`, `dist`, `target`,
+`node_modules`, `.venv` and the other cache directories) are deleted with the checkout and
+listed as `droppedBuildProducts` in the manifest. Every other ignored file (results, logs, data)
+goes into the same archive and is listed as `ignored`; the 1 GiB limit covers both together.
+The background `reconcile` sweep still keeps a checkout with ignored output; only an explicit
+`release` disposes of it. Cause: rf-joint (2026-10-31) was fully published but kept for one
+ignored `jointsim.so`. Regression: "release drops ignored build products…" in `test.mjs`.
+
 ## Authenticated ordinary release custody
 
 Ordinary `release`, including `--end-retention` and grouped releases, authenticates the current native tool caller against its root-created scope and exact tool call in the native store before any release journal, lease, state or filesystem transition. Every selected group member must belong to that caller. A registered native UUID is authoritative; otherwise the stored native binding or a byte-exact checkout admission receipt authenticated in the native store determines custody. Unknown or conflicting custody refuses without mutation. Neither the free `--owner` label nor an authorization string grants another agent release rights.

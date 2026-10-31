@@ -148,6 +148,22 @@ function git(cwd, ...args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
 
+// Files in a released-work archive (manifest excluded), by path.
+function archivedFiles(archive) {
+  const out = mkdtempSync(path.join(tmpdir(), "released-work-"));
+  try {
+    execFileSync("tar", ["--zstd", "-xf", archive, "-C", out]);
+    const files = {};
+    const walk = (dir) => { for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (full !== path.join(out, "RELEASED-WORK.json")) files[path.relative(out, full)] = readFileSync(full, "utf8");
+    } };
+    walk(out);
+    return files;
+  } finally { rmSync(out, { recursive: true, force: true }); }
+}
+
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "agent-workspace-"));
   const source = path.join(root, "source");
@@ -640,10 +656,10 @@ test("pending creation preserves edits and ignored output instead of deleting a 
     writeFileSync(path.join(destination, "ignored-output", "proof"), "retain\n");
     assert.throws(() => run(args, f.env), /pending checkout contains changes/);
     assert.throws(() => run(["cancel-creation", "--path", destination], f.env), /pending checkout exists/);
-    const retained = JSON.parse(run(["release", "--path", destination, "--json"], f.env));
-    assert.equal(retained.action, "none");
-    assert.equal(readFileSync(path.join(destination, "file.txt"), "utf8"), "unique source\n");
-    assert.equal(readFileSync(path.join(destination, "ignored-output", "proof"), "utf8"), "retain\n");
+    // An explicit release keeps nothing in place but loses nothing: edits and ignored output are archived.
+    const released = JSON.parse(run(["release", "--path", destination, "--json"], f.env));
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.deepEqual(archivedFiles(released.workingTreeArchive), { "file.txt": "unique source\n", "ignored-output/proof": "retain\n" });
   } finally { f.close(); }
 });
 
@@ -677,8 +693,8 @@ test("interrupted creation resumes with ignored output without removing it", () 
     assert.equal(JSON.parse(run(args, f.env)).state, "active");
     assert.equal(readFileSync(output, "utf8"), "retain ignored work\n");
     const release = JSON.parse(run(["release", "--path", destination, "--json"], f.env));
-    assert.match(release.inspection.reason, /unclassified ignored output/);
-    assert.equal(existsSync(output), true);
+    assert.equal(release.action, "released", JSON.stringify(release.inspection));
+    assert.deepEqual(archivedFiles(release.workingTreeArchive), { "ignored-output/proof": "retain ignored work\n" });
   } finally { f.close(); }
 });
 
@@ -2626,6 +2642,54 @@ test("release archives uncommitted files of a published checkout and removes it"
   }
 });
 
+test("release drops ignored build products and archives other ignored files of a published checkout", () => {
+  // 2026-10-31: rf-joint's commits were all on main, but an ignored jointsim.so ("unclassified
+  // ignored output") kept the checkout. Build products are dropped; other ignored files are archived.
+  const f = fixture();
+  try {
+    const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "ignored-published",
+      "--repo", f.remote, "--min-free-gib", "0", "--json"], f.env));
+    writeFileSync(path.join(created.path, ".git", "info", "exclude"), "*.so\nresults/\n");
+    mkdirSync(path.join(created.path, "joint"), { recursive: true });
+    writeFileSync(path.join(created.path, "joint", "jointsim.so"), Buffer.alloc(4096, 1));
+    mkdirSync(path.join(created.path, "results"), { recursive: true });
+    writeFileSync(path.join(created.path, "results", "run.json"), "{\"ok\":true}\n");
+    writeFileSync(path.join(created.path, "file.txt"), "edited\n");
+    const released = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.equal(existsSync(created.path), false);
+    const out = mkdtempSync(path.join(tmpdir(), "released-work-"));
+    try {
+      execFileSync("tar", ["--zstd", "-xf", released.workingTreeArchive, "-C", out]);
+      assert.equal(readFileSync(path.join(out, "results", "run.json"), "utf8"), "{\"ok\":true}\n");
+      assert.equal(readFileSync(path.join(out, "file.txt"), "utf8"), "edited\n");
+      assert.equal(existsSync(path.join(out, "joint", "jointsim.so")), false);
+      const manifest = JSON.parse(readFileSync(path.join(out, "RELEASED-WORK.json"), "utf8"));
+      assert.deepEqual(manifest.ignored, ["results/run.json"]);
+      assert.deepEqual(manifest.droppedBuildProducts, ["joint/jointsim.so"]);
+    } finally { rmSync(out, { recursive: true, force: true }); }
+  } finally {
+    f.close();
+  }
+});
+
+test("reconcile still keeps a published checkout with ignored output", () => {
+  // Only an explicit release disposes of ignored output; the background sweep keeps the checkout.
+  const f = fixture();
+  try {
+    const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "ignored-swept",
+      "--repo", f.remote, "--lease-seconds", "0", "--min-free-gib", "0", "--json"], f.env));
+    writeFileSync(path.join(created.path, ".git", "info", "exclude"), "*.so\n");
+    writeFileSync(path.join(created.path, "jointsim.so"), Buffer.alloc(16, 1));
+    const results = JSON.parse(run(["reconcile", "--root", f.workspaces, "--after", "start", "--execute", "--json"], f.env));
+    const result = results.find((item) => item.record.id === created.id);
+    assert.match(result.inspection.reason, /unclassified ignored output/);
+    assert.equal(existsSync(path.join(created.path, "jointsim.so")), true);
+  } finally {
+    f.close();
+  }
+});
+
 test("reconcile keeps a dirty checkout that borrows objects with its own reason, not the custody guard's", () => {
   // 2026-10-31: a kept checkout's reason was overwritten by CUSTODY_IMPORT_EXCEEDS_RECLAIM, which
   // hid that it was kept for edited files.
@@ -2949,18 +3013,10 @@ test("Gradle caches in existing records release without stale repair state", () 
       mkdirSync(path.join(created.path, relative), { recursive: true });
       writeFileSync(path.join(created.path, relative, "fixture"), "generated\n");
     }
-    const retained = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
-    assert.equal(retained.inspection.classification, "repair-required");
-    assert.equal(retained.inspection.sourceRetention, false);
-    assert.equal(retained.record.state, "repair-required");
-    assert.match(retained.inspection.reason, /unclassified ignored output/);
-    for (const relative of [".gradle", "android/.gradle", "modules/library/.gradle"]) {
-      assert.equal(existsSync(path.join(created.path, relative)), false);
-    }
-    assert.equal(readFileSync(path.join(created.path, "ignored-output", "fixture"), "utf8"), "generated\n");
-    rmSync(path.join(created.path, "ignored-output"), { recursive: true });
+    // Gradle caches are build products; the other ignored fixture is archived.
     const released = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
-    assert.equal(released.action, "released");
+    assert.equal(released.action, "released", JSON.stringify(released.inspection));
+    assert.deepEqual(archivedFiles(released.workingTreeArchive), { "ignored-output/fixture": "generated\n" });
     assert.equal(released.inspection.classification, "reclaimable");
     assert.equal(released.record.state, "released");
     assert.equal(released.record.leaseExpiresAt, 0);
@@ -3068,9 +3124,10 @@ test("an untracked .agent-workspace-caches manifest does not classify anything",
     writeFileSync(path.join(created.path, ".agent-workspace-caches"), "src/api/client.generated.ts\n");
     mkdirSync(path.join(created.path, "src", "api"), { recursive: true });
     writeFileSync(path.join(created.path, "src", "api", "client.generated.ts"), "generated\n");
+    // Not classified as a cache, so release archives it with the other ignored files.
     const result = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
-    assert.equal(result.inspection.classification, "repair-required");
-    assert.match(result.inspection.reason, /unclassified ignored output/);
+    assert.equal(result.action, "released", JSON.stringify(result.inspection));
+    assert.deepEqual(archivedFiles(result.workingTreeArchive), { ".agent-workspace-caches": "src/api/client.generated.ts\n", "src/api/client.generated.ts": "generated\n" });
   } finally {
     f.close();
   }
@@ -3662,7 +3719,7 @@ test("empty ignored directories do not masquerade as unique work", () => {
   }
 });
 
-test("unknown ignored output requires repair", () => {
+test("release archives ignored output that is not a build product", () => {
   const f = fixture();
   try {
     const created = JSON.parse(run([
@@ -3672,9 +3729,9 @@ test("unknown ignored output requires repair", () => {
     mkdirSync(path.join(created.path, "ignored-output"));
     writeFileSync(path.join(created.path, "ignored-output", "proof.txt"), "keep me\n");
     const result = JSON.parse(run(["release", "--id", created.id, "--json"], f.env));
-    assert.equal(result.inspection.classification, "repair-required");
-    assert.match(result.inspection.reason, /unclassified ignored output/);
-    assert.equal(existsSync(created.path), true);
+    assert.equal(result.action, "released", JSON.stringify(result.inspection));
+    assert.deepEqual(archivedFiles(result.workingTreeArchive), { "ignored-output/proof.txt": "keep me\n" });
+    assert.equal(existsSync(created.path), false);
   } finally {
     f.close();
   }

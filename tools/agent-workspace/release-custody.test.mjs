@@ -12,6 +12,8 @@ function fixture(action){
   action({root,source,remote,state,record,db,git,run,commit,release});
  }finally{db?.close();if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;fs.rmSync(root,{recursive:true,force:true});}
 }
+// Ignored files that are not build products are archived, not kept in place (2026-10-31, rf-joint).
+const archived=(result,file)=>execFileSync('tar',['--zstd','-xOf',result.workingTreeArchive,file],{encoding:'utf8'});
 test('ordinary release preserves generated cache with unpublished source custody',()=>fixture(f=>{
  f.commit();
  const result=f.release();assert.equal(result.record.state,'repair-required',JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.leaseRelease.kind,'released');assert.equal(result.cacheDisposition.kind,'none-selected');assert.equal(result.action,'none');assert.equal(fs.readFileSync(path.join(f.source,'node_modules','receipt'),'utf8'),'generated cache');assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'new unique work');
@@ -39,8 +41,8 @@ test('a different unpublished local branch still protects all cache/source even 
 test('unknown remote custody retains source and cache instead of performing speculative cleanup',()=>fixture(f=>{
  f.commit();f.git('-C',f.source,'remote','set-url','origin',path.join(f.root,'missing.git'));const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.cacheDisposition.kind,'none-selected');assert.match(result.inspection.reason,/remote custody observation unavailable/);assert.equal(fs.existsSync(path.join(f.source,'node_modules','receipt')),true);
 }));
-test('retained unclassified evidence and actual declared-cache detachment have separate typed effects',()=>fixture(f=>{
- fs.mkdirSync(path.join(f.source,'private-evidence'));fs.writeFileSync(path.join(f.source,'private-evidence','proof'),'preserve evidence');const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.equal(result.record.state,'repair-required',JSON.stringify(result));assert.equal(result.cacheDisposition.kind,'detached-for-retirement');assert.deepEqual(result.cacheDisposition.paths,['node_modules']);assert.equal(fs.readFileSync(path.join(f.source,'private-evidence','proof'),'utf8'),'preserve evidence');
+test('ignored evidence is archived and declared caches detached when a published checkout is released',()=>fixture(f=>{
+ fs.mkdirSync(path.join(f.source,'private-evidence'));fs.writeFileSync(path.join(f.source,'private-evidence','proof'),'preserve evidence');const result=f.release();assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));assert.equal(result.cacheDisposition.kind,'detached-for-retirement');assert.deepEqual(result.cacheDisposition.paths,['node_modules']);assert.equal(archived(result,'private-evidence/proof'),'preserve evidence');
 }));
 test('group reconciliation also retains cache when unique source prevents release',()=>fixture(f=>{
  f.commit();f.db.prepare('UPDATE workspace SET lease_expires_at=0 WHERE id=?').run(f.record.id);
@@ -101,21 +103,21 @@ test('one transition shares remote custody, but rechecks every local branch and 
  }finally{process.env.PATH=oldPath;}
 }));
 
-for(const prepare of ['husky','husky install','husky || true','husky install || :'])test('tracked Husky prepare "'+prepare+'" owns only ignored internal hooks, not arbitrary ignored evidence',()=>fixture(f=>{
+for(const prepare of ['husky','husky install','husky || true','husky install || :'])test('tracked Husky prepare "'+prepare+'" owns only ignored internal hooks; other ignored evidence is archived',()=>fixture(f=>{
  fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare}}));
  fs.appendFileSync(path.join(f.source,'.gitignore'),'\.husky/_/\n');
  f.git('-C',f.source,'add','.');f.git('-C',f.source,'commit','-m','tracked prepare');f.git('-C',f.source,'push','origin','main');
  fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/h'),'generated hooks');
  fs.mkdirSync(path.join(f.source,'private-evidence'));fs.writeFileSync(path.join(f.source,'private-evidence/proof'),'valuable');
- const result=f.release();assert.equal(result.physicalDisposition.kind,'retained');assert.ok(result.cacheDisposition.paths.includes('.husky/_'));
- assert.equal(fs.existsSync(path.join(f.source,'.husky/_')),false);assert.equal(fs.readFileSync(path.join(f.source,'private-evidence/proof'),'utf8'),'valuable');
+ const result=f.release();assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));assert.ok(result.cacheDisposition.paths.includes('.husky/_'));
+ assert.equal(archived(result,'private-evidence/proof'),'valuable');assert.equal(result.inspection.workingTreeChanges?.ignored?.includes('.husky/_/h')??false,false);
 }));
 for(const kind of ['untracked','different-generator','chained-command'])test('Husky inference refuses '+kind+' prepare source',()=>fixture(f=>{
  fs.appendFileSync(path.join(f.source,'.gitignore'),'.husky/_/\n');f.git('-C',f.source,'commit','-am','ignore generated');
  fs.writeFileSync(path.join(f.source,'package.json'),JSON.stringify({scripts:{prepare:kind==='untracked'?'husky':kind==='chained-command'?'husky && custom-tool':'custom-tool'}}));
  if(kind!=='untracked'){f.git('-C',f.source,'add','package.json');f.git('-C',f.source,'commit','-m','different generator');}f.git('-C',f.source,'push','origin','main');
  fs.mkdirSync(path.join(f.source,'.husky/_'),{recursive:true});fs.writeFileSync(path.join(f.source,'.husky/_/proof'),'preserve');
- assert.equal(f.release().physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'.husky/_/proof')),true);
+ const result=f.release();assert.equal(result.cacheDisposition.paths?.includes('.husky/_')??false,false,JSON.stringify(result));assert.equal(result.physicalDisposition.kind,'removed');assert.equal(archived(result,'.husky/_/proof'),'preserve');
 }));
 // Link BE/UI shape (October 29: three released Link checkouts retained on `.husky/_`): husky 9
 // prepare `husky || true`, generated `.husky/_/` ignored only by its own `*` .gitignore, a
@@ -166,5 +168,5 @@ for(const kind of ['generator','no-dependency'])test('swagger-autogen outputs ar
  fs.writeFileSync(path.join(f.source,'src/docs/swagger-output.json'),'{}');fs.mkdirSync(path.join(f.source,'src/docs/definitions'));fs.writeFileSync(path.join(f.source,'src/docs/definitions/A.json'),'{}');
  const result=f.release();
  if(kind==='generator'){assert.ok(result.cacheDisposition?.paths?.includes('src/docs/definitions'),JSON.stringify(result));assert.equal(fs.existsSync(path.join(f.source,'src/docs/swagger-output.json')),false);}
- else {assert.equal(result.physicalDisposition.kind,'retained');assert.equal(fs.existsSync(path.join(f.source,'src/docs/definitions/A.json')),true);}
+ else {assert.equal(result.cacheDisposition.paths?.includes('src/docs/definitions')??false,false,JSON.stringify(result));assert.equal(archived(result,'src/docs/definitions/A.json'),'{}');}
 }));

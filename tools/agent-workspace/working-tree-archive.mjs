@@ -3,7 +3,7 @@
 // An explicit release of a checkout whose commits are all published used to keep the checkout
 // forever when its working tree had edits or untracked files, even when those edits were
 // superseded by what was published (rf-long-tail: ten edited files, all redone on Seinari main).
-// Release now copies every changed and untracked (not ignored) file into one compressed tar next
+// Release now copies every changed, untracked and non-build ignored file into one compressed tar next
 // to the registry, with a manifest naming the checkout, its HEAD and its deleted paths, and then
 // removes the checkout. Nothing is lost and nobody has to judge whether the edits mattered.
 import {mkdirSync, lstatSync, writeFileSync, renameSync, rmSync, mkdtempSync, openSync, fsyncSync, closeSync} from 'node:fs';
@@ -33,6 +33,38 @@ export function parseStatusZ(output) {
   return {present: [...present].sort(), deleted: [...deleted].sort()};
 }
 
+// Ignored output in a released checkout (2026-10-31, rf-joint: jointsim.so blocked release).
+// Regenerable build products are dropped with the checkout; every other ignored file is archived
+// beside the uncommitted files, under the same size limit.
+const BUILD_DIRECTORIES = new Set(['__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', 'node_modules', 'build', 'dist',
+  'target', '.lake', '.gradle', '.nx', '.react-router', '.converge-cache', '.venv', 'venv', '.tox', '.eggs', 'CMakeFiles']);
+const BUILD_EXTENSIONS = new Set(['.so', '.o', '.a', '.obj', '.lo', '.la', '.pyc', '.pyo', '.pyd', '.dylib', '.dll', '.exe',
+  '.cubin', '.fatbin', '.class', '.whl', '.olean', '.ilean']);
+export function isBuildProduct(file) {
+  const parts = file.split('/');
+  if (parts.slice(0, -1).some(part => BUILD_DIRECTORIES.has(part) || part.endsWith('.egg-info'))) return true;
+  const base = parts.at(-1);
+  if (BUILD_DIRECTORIES.has(base) || base.endsWith('.egg-info')) return true;
+  return BUILD_EXTENSIONS.has(path.extname(base)) || /\.so\.\d+(\.\d+)*$/u.test(base);
+}
+
+// Every ignored file (not directory) under pathspec, split into dropped build products and
+// archived ignored files.
+export function ignoredOutput(root, pathspec = ['.']) {
+  const result = spawnSync('git', ['-C', root, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...pathspec], {encoding: 'utf8', maxBuffer: 256 * 1024 * 1024});
+  if (result.status !== 0) throw new WorkingTreeArchiveError('ignored-output-status-failed', String(result.stderr).trim().slice(0, 300));
+  const dropped = [], archived = [];
+  let bytes = 0;
+  for (const file of result.stdout.split('\0').filter(Boolean).sort()) {
+    if (isBuildProduct(file)) { dropped.push(file); continue; }
+    let stat;
+    try { stat = lstatSync(path.join(root, file)); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    archived.push(file);
+    if (stat.isFile()) bytes += stat.size;
+  }
+  return {dropped, archived, bytes};
+}
+
 export function workingTreeChanges(root, pathspec = ['.']) {
   const result = spawnSync('git', ['-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspec], {encoding: 'utf8', maxBuffer: 256 * 1024 * 1024});
   if (result.status !== 0) throw new WorkingTreeArchiveError('working-tree-status-failed', String(result.stderr).trim().slice(0, 300));
@@ -45,7 +77,13 @@ export function workingTreeChanges(root, pathspec = ['.']) {
     files.push(file);
     if (stat.isFile()) bytes += stat.size;
   }
-  return {files, deleted: [...new Set(deleted)].sort(), bytes};
+  return {files, deleted: [...new Set(deleted)].sort(), bytes, ignored: [], droppedBuildProducts: []};
+}
+
+// Adds ignored output to a change set: archived ignored files join the archive, build products are listed only.
+export function withIgnoredOutput(changes, ignored) {
+  return {...changes, files: [...changes.files, ...ignored.archived], bytes: changes.bytes + ignored.bytes,
+    ignored: ignored.archived, droppedBuildProducts: ignored.dropped};
 }
 
 // Writes <directory>/<name>-<time>.tar.zst atomically and returns its path.
@@ -57,7 +95,8 @@ export function archiveWorkingTree({root, directory, name, manifest, changes}) {
   const target = path.join(directory, `${name}-${stamp}.tar.zst`);
   const staging = mkdtempSync(path.join(directory, '.staging-'));
   try {
-    writeFileSync(path.join(staging, 'RELEASED-WORK.json'), JSON.stringify({...manifest, files: changes.files, deleted: changes.deleted, bytes: changes.bytes}, null, 2) + '\n');
+    writeFileSync(path.join(staging, 'RELEASED-WORK.json'), JSON.stringify({...manifest, files: changes.files, deleted: changes.deleted, bytes: changes.bytes,
+      ignored: changes.ignored ?? [], droppedBuildProducts: changes.droppedBuildProducts ?? []}, null, 2) + '\n');
     const partial = path.join(staging, 'archive.tar.zst');
     // Manifest first (from the staging directory), then the changed files relative to the checkout.
     const tar = spawnSync('tar', ['--zstd', '-cf', partial, '-C', staging, 'RELEASED-WORK.json', '-C', root, '--null', '--no-recursion', '-T', '-'],
