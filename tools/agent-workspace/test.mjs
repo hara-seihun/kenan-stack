@@ -209,7 +209,7 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const result = spawnSync(${JSON.stringify(realGit)}, args, {stdio:'inherit'});
-if (result.status === 0 && args.includes(${JSON.stringify(stage)}) && !fs.existsSync(${JSON.stringify(marker)})) {
+if (result.status === 0 && args.includes(${JSON.stringify(stage)}) && (${JSON.stringify(stage)} !== "update-ref" || !args.some(arg => arg.startsWith("refs/pi-workspace/sources/"))) && !fs.existsSync(${JSON.stringify(marker)})) {
   fs.writeFileSync(${JSON.stringify(marker)}, 'interrupted');
   process.kill(process.ppid, 'SIGKILL');
 }

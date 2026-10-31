@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, openSync, closeSync } from "node:fs";
-import { availableParallelism } from "node:os";
+import { testSlotCount } from "./test-slot-policy.mjs";
+export { testSlotCount } from "./test-slot-policy.mjs";
 import path from "node:path";
 
 // Host-wide cap on concurrently running heavy agent-workspace test processes. Each fixture process spawns dozens of
@@ -8,12 +9,6 @@ import path from "node:path";
 // overlapping a second run, put ~290 of them on 16 cores (load 104). Whatever launches the tests, a process holds one
 // slot for its lifetime: the flock sits on this process's own open descriptor, so it ends exactly when the process does.
 
-export function testSlotCount(env = process.env) {
-  if (env.AGENT_WORKSPACE_TEST_SLOTS === undefined) return Math.max(1, Math.floor(availableParallelism() / 4));
-  const count = Number(env.AGENT_WORKSPACE_TEST_SLOTS);
-  if (!Number.isSafeInteger(count) || count < 1) throw Object.assign(new Error("AGENT_WORKSPACE_TEST_SLOTS must be a positive integer"), { code: "test-slot-config" });
-  return count;
-}
 
 function tryLock(file) {
   const descriptor = openSync(file, "a", 0o666);
