@@ -74,3 +74,29 @@ test('a local import of a packed source copies no object bytes and a later commi
   assert.equal(spawnSync('git',['-C',path.join(workspaces,'one'),'fsck','--connectivity-only'],{encoding:'utf8'}).status,0);
  } finally {f.cleanup();}
 });
+
+test('a mirror holding a commit without its trees takes only the missing objects from a local source, not its history',()=>{
+ const f=fixture();
+ try {
+  const first=f.commit('a');run(f.source,'repack','-qad');
+  const state=path.join(f.root,'state','registry.sqlite3'),workspaces=path.join(f.root,'workspaces');mkdirSync(workspaces);
+  const env={...process.env,PI_WORKSPACE_STATE:state,PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty'};
+  const create=(name,commit)=>{
+   const end=Date.now()+45000;let result;
+   do{result=spawnSync(entry,['create','--root',workspaces,'--name',name,'--repo',f.source,'--ref',commit,'--owner','fixture','--intent','source-only','--headroom-gib','1','--growth-mib','512','--json'],{env,encoding:'utf8',timeout:30000});}
+   while(result.status===75&&Date.now()<end);
+   assert.equal(result.status,0,result.stderr+result.stdout);return JSON.parse(result.stdout);
+  };
+  const mirror=path.join(f.root,'state','mirrors',sha(f.source).slice(0,24)+'.git');
+  assert.equal(create('one',first).sourceCommit,first);
+  // The next commit stays loose in the source; the mirror gets its commit object alone.
+  const second=f.commit('b');
+  execFileSync('git',['--git-dir',mirror,'hash-object','-t','commit','-w','--stdin'],{input:execFileSync('git',['--git-dir',f.source,'cat-file','commit',second])});
+  assert.ok(!complete(mirror,second));
+  assert.equal(create('two',second).sourceCommit,second);
+  assert.ok(complete(mirror,second));
+  const own=readdirSync(path.join(mirror,'objects','pack')).filter(name=>name.endsWith('.idx')&&!inodes(f.source).has(statSync(path.join(mirror,'objects','pack',name.replace(/\.idx$/,'.pack'))).ino));
+  const copied=own.reduce((total,name)=>total+execFileSync('git',['show-index'],{input:execFileSync('cat',[path.join(mirror,'objects','pack',name)])}).toString().trim().split('\n').length,0);
+  assert.equal(copied,2,'only the new tree and blob were copied');
+ } finally {f.cleanup();}
+});

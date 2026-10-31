@@ -2914,6 +2914,27 @@ function ensureSourceCustody(mirror, repository, ref, expected, sparsePatterns =
   return expected;
 }
 
+const isLocalRepository = repository => path.isAbsolute(repository) && existsSync(repository);
+
+// A local source has every object, so a gap in the mirror is filled by packing just the missing objects from it
+// straight into the mirror's pack directory. --refetch would copy the commit's entire history instead: on
+// 2026-10-30 it wrote a 22 GiB temporary pack of the 52 GiB seinari remote into its mirror until root ran out.
+// A missing tree hides its children from rev-list, so repeat until nothing is missing (bounded by tree depth).
+function copyMissingObjects(mirror, repository, commit) {
+  for (let round = 0; round < 64; round++) {
+    // Only the missing names come back: a whole tree's listing can pass the output buffer.
+    const listed = command("sh", ["-c", 'set -o pipefail; git --git-dir "$1" rev-list --objects --no-object-names --missing=print "$2^{commit}" | { grep "^?" || test $? = 1; }',
+      "sh", mirror, commit], { env: closureEnvironment, timeout: SOURCE_IMPORT_TIMEOUT_MS });
+    if (listed.status !== 0) return false;
+    const missing = listed.stdout.split("\n").filter(line => line.startsWith("?")).map(line => line.slice(1));
+    if (missing.length === 0) return true;
+    const packed = command("git", ["-C", repository, "pack-objects", "--quiet", path.join(mirror, "objects", "pack", "pack")],
+      { input: missing.join("\n") + "\n", timeout: SOURCE_IMPORT_TIMEOUT_MS });
+    if (packed.status !== 0) return false;
+  }
+  return false;
+}
+
 function fetchSource(mirror, repository, ref, sparsePatterns) {
   let resolved = ref;
   if (/^[0-9a-f]{4,39}$/u.test(ref)) {
@@ -2933,7 +2954,8 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
   // which copies the commit's entire history.
   if (!(commitPresent && hasObjectClosure(mirror, resolved, sparsePatterns))) {
     if (!commitPresent) fetch((existsSync(repository) ? importBaseCommits(repository, resolved, mirror) : []).map(tip => `--negotiation-tip=${tip}`));
-    if (!hasObjectClosure(mirror, resolved, sparsePatterns)) fetch(["--refetch"]);
+    if (!hasObjectClosure(mirror, resolved, sparsePatterns) && !(isLocalRepository(repository) && copyMissingObjects(mirror, repository, resolved)
+      && hasObjectClosure(mirror, resolved, sparsePatterns))) fetch(["--refetch"]);
   }
   publishSourcePhase({ phase: "verifying", commit: resolved });
   return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
