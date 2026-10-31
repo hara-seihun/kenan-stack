@@ -181,3 +181,21 @@ test('a foreground release run through a PATH symlink, and the processes waiting
     fs.rmSync(root,{recursive:true,force:true});
   }
 });
+
+// October 31: the authenticated foreground release inherited the source child's cwd,
+// and its background worker correctly retained it as a physical consumer. Move the
+// administrative submitter, rather than teaching safety to ignore real cwd references.
+test('the foreground submitter vacates its checkout before launching physical release',()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'release-own-cwd-'));
+  const before=process.cwd();
+  try {
+    process.chdir(root);
+    workspaceTesting.leaveReleaseDirectory();
+    assert.equal(process.cwd(),fs.realpathSync(os.homedir()));
+    const record={pid:7,ppid:1,command:'node',commandLine:['node','/srv/pi/tools/agent-workspace/main','release','--path',root],cwd:process.cwd(),executable:process.execPath,writableFiles:[]};
+    assert.deepEqual(workspaceTesting.processReferences(root,[record]),[]);
+    assert.equal(workspaceTesting.processReferences(root,[{...record,cwd:root}]).length,1,'a shell or unvacated CLI remains a real reference');
+    assert.equal(workspaceTesting.processReferences(root,[{...record,writableFiles:[root+'/output']}]).length,1,'held descriptors are not administrative references');
+    assert.equal(workspaceTesting.processReferences(root,[{...record,executable:root+'/node'}]).length,1,'an executable in the checkout remains protected');
+  } finally {process.chdir(before);fs.rmSync(root,{recursive:true,force:true});}
+});

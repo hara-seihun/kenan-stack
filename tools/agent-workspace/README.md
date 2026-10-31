@@ -1180,3 +1180,5 @@ is present. An unavailable manager or an interrupted submission with no unit
 remains honestly unknown and reserves the original name; absence alone cannot
 prove that an external effect never ran. Successful submissions are retained
 durably and are never replayed automatically.
+
+A native foreground `release` resolves its selected record and request before moving its own current directory to the home directory and submitting physical cleanup. This prevents the waiting administrative CLI from retaining its checkout by inherited current directory. Real shell current directories, executables and held descriptors remain protected; no cwd reference is waived.

@@ -5804,13 +5804,20 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { processReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { leaveReleaseDirectory, processReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 // Whether a submission's background unit has ceased (never a guess: an observation error is "not ceased").
 function releaseUnitCessation(row) {
   const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
   const fields=Object.fromEntries(String(observed.stdout??'').trim().split('\n').map(line=>line.split('=')));
   return {ceased:!observed.error&&observed.status===0&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
+}
+
+// A detached physical release must not be pinned by its submitter's inherited cwd.
+// Resolve the selector and flags first, then move only this administrative process;
+// real shells, descriptors, executables and other writers remain in the census.
+function leaveReleaseDirectory() {
+  process.chdir(homedir());
 }
 
 // One foreground release attempt. Returns {adopt:refusal} when an authenticated native caller is
@@ -5832,6 +5839,7 @@ function releaseForegroundAttempt(database,args,statePath,selected,{deadline,rel
         assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
         const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
           members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
+        leaveReleaseDirectory();
         return submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
           custodyLineage:[...endedCustodyLineage(database,record)],
           observe:releaseUnitCessation,launch:name=>{
