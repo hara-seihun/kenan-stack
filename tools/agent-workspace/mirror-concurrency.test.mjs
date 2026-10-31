@@ -20,8 +20,9 @@ function fixture(shortLocks){
  const commits=['slow','peer'].map(name=>{writeFileSync(path.join(source,name),name);git('add','.');git('commit','-m',name);return git('rev-parse','HEAD');});
  const mirror=path.join(root,'state','mirrors',sha(source).slice(0,24)+'.git');
  const gate=path.join(root,'blocked'),release=path.join(root,'release'),imports=path.join(root,'imports');
- // Hold the first commit's import inside its Git fetch until the test releases it.
- writeFileSync(path.join(bin,'git'),`#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process'),a=process.argv.slice(2);if(a.includes('fetch'))fs.appendFileSync(${JSON.stringify(imports)},JSON.stringify(a)+'\\n');if(a.includes('fetch')&&a.some(x=>x.startsWith('+'+${JSON.stringify(commits[0])}+':'))){fs.writeFileSync(${JSON.stringify(gate)},'blocked');const end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(release)})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);}const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);`);
+ // Hold the first commit at durable source publication. Local pack reuse may
+ // legitimately avoid fetch; publication remains the exact per-source boundary.
+ writeFileSync(path.join(bin,'git'),`#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process'),a=process.argv.slice(2);const publishing=a.includes('update-ref')&&a.some(x=>x.startsWith('refs/pi-workspace/sources/'));if(publishing)fs.appendFileSync(${JSON.stringify(imports)},JSON.stringify(a)+'\\n');if(publishing&&a.includes(${JSON.stringify(commits[0])})){fs.writeFileSync(${JSON.stringify(gate)},'blocked');const end=Date.now()+90000;while(!fs.existsSync(${JSON.stringify(release)})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);}const r=cp.spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});process.exit(r.status??1);`);
  // Shorten only the named lock waits so a serialising implementation fails in seconds, not 30 s.
  writeFileSync(path.join(bin,'flock'),`#!${process.execPath}\nconst cp=require('node:child_process'),fs=require('node:fs'),a=process.argv.slice(2);const i=a.indexOf('--wait');const short=${JSON.stringify(shortLocks(mirror,commits).map(sha))};if(i>=0&&short.some(h=>fs.readlinkSync('/proc/self/fd/3').endsWith(h)))a[i+1]='0.3';const r=cp.spawnSync(${JSON.stringify(realFlock)},a,{stdio:['inherit','inherit','inherit',3]});process.exit(r.status??1);`);
  chmodSync(path.join(bin,'git'),0o755);chmodSync(path.join(bin,'flock'),0o755);
@@ -32,7 +33,7 @@ function fixture(shortLocks){
  const jobs=()=>{const dir=path.join(root,'state','source-preparations','jobs');return existsSync(dir)?readdirSync(dir).map(id=>path.join(dir,id)):[];};
  const read=file=>existsSync(file)?JSON.parse(readFileSync(file,'utf8')):null;
  const jobFor=destination=>jobs().find(dir=>read(path.join(dir,'request.json'))?.destination===path.join(workspaces,destination));
- const fetchesOf=commit=>existsSync(imports)?readFileSync(imports,'utf8').trim().split('\n').filter(line=>line.includes(`+${commit}:`)).length:0;
+ const fetchesOf=commit=>existsSync(imports)?readFileSync(imports,'utf8').trim().split('\n').filter(line=>JSON.parse(line).includes(commit)).length:0;
  return {root,commits,gate,release,invoke,until,waitFor,jobFor,read,fetchesOf,cleanup(){writeFileSync(release,'go');sleep(100);rmSync(root,{recursive:true,force:true});}};
 }
 
@@ -42,7 +43,7 @@ test('a blocked import neither serialises another commit of the same mirror nor 
   const [slow,peer]=f.commits;
   assert.equal(f.invoke('slow',slow).status,75);f.waitFor(()=>existsSync(f.gate));
   f.until('peer',peer,30000);
-  assert.equal(existsSync(f.release),false,'the other commit became active while the first import was still inside git fetch');
+  assert.equal(existsSync(f.release),false,'the other commit became active while the first import was still at source publication');
   {const twin=f.invoke('twin',slow);assert.ok([2,75].includes(twin.status),twin.stderr);}
   f.waitFor(()=>{const job=f.jobFor('twin');return job&&(f.read(path.join(job,'progress.json'))?.value?.phase==='awaiting-mirror'||f.read(path.join(job,'result.json'))?.error?.code==='workspace-mirror-lock-busy');});
   writeFileSync(f.release,'go');
@@ -62,7 +63,7 @@ test('a busy same-commit wait records the holder and its phase, and the same req
   assert.equal(failed.error.code,'workspace-mirror-lock-busy');
   const [holder,...others]=failed.error.detail.holders;
   assert.equal(others.length,0);
-  assert.equal(holder.job,f.jobFor('slow'));assert.equal(holder.phase,'importing');assert.equal(holder.mode,'exclusive');
+  assert.equal(holder.job,f.jobFor('slow'));assert.equal(holder.phase,'verifying');assert.equal(holder.mode,'exclusive');
   assert.match(holder.unit,/^pi-workspace-source-.*\.service$/u);
   assert.equal(failed.error.detail.waiterPhase,'awaiting-mirror');
   writeFileSync(f.release,'go');
