@@ -233,3 +233,10 @@ test('a control group shared with anything outside the job is not the job\'s to 
  const {s,unit}=stuckJob({foreignInScope:true});
  assert.deepEqual(escapedGroups(unit,s.proc),[]);
 });
+import {socketPeer} from './background-launch.mjs';
+test('the launch socket takes its caller from the peer the kernel reported in the instance name, never from the request',()=>{
+ // systemd 259 on kenan-server names a connection "0-21202-3022292_116236682-1000"; older systemd "0-3022292-1000".
+ assert.deepEqual(socketPeer('0-21202-3022292_116236682-1000'),{pid:3022292,uid:1000});
+ assert.deepEqual(socketPeer('7-3022292-1990'),{pid:3022292,uid:1990});
+ for(const bad of [undefined,'','x-1-2','1-2','0-1-2-3-4'])assert.throws(()=>socketPeer(bad),/background_invalid_peer/);
+});

@@ -135,7 +135,10 @@ export function launchOnce(input,binding,uid,spec,argsFor,{root=BACKGROUND_ROOT,
   if(lock.status!==0||lock.error)return {ok:false,code:'background_launch_busy',retry:true,detail:'Another launch of this name is in progress; run the command again.'};
   const identity=launchIdentity(input);let saved;
   try{saved=JSON.parse(fs.readFileSync(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
-  const write=value=>{const tmp=file+'.tmp';const out=fs.openSync(tmp,'w',0o600);try{fs.writeFileSync(out,JSON.stringify(value)+'\n');fs.fsyncSync(out);}finally{fs.closeSync(out);}fs.renameSync(tmp,file);const dir=fs.openSync(root,'r');try{fs.fsyncSync(dir);}finally{fs.closeSync(dir);}};
+  // Rename keeps a reader from ever seeing half a record. No fsync: the record only has to outlive a killed caller (the
+  // page cache does), and after a host crash no unit survives anyway. Four fsyncs cost up to 2.5 s on the busy RAID
+  // and pushed a launch past its caller's 10 s timeout (2026-10-31).
+  const write=value=>{const tmp=file+'.tmp';fs.writeFileSync(tmp,JSON.stringify(value)+'\n',{mode:0o600});fs.renameSync(tmp,file);};
   const accept=(record,extra)=>{const response={ok:true,unit:spec.unit,log:record.log,identity:binding,...extra};write({...record,state:'accepted',response});return response;};
   let launch=input,loaded=false;
   if(saved){
@@ -173,11 +176,42 @@ export function launchOnce(input,binding,uid,spec,argsFor,{root=BACKGROUND_ROOT,
   return response;
  }finally{fs.closeSync(fd);}
 }
-export function main(){
- if(process.getuid()!==0)throw Error('background_root_required');
+// The launch socket (kenan-bg-launch.socket, Accept=yes) names each connection's service instance after the peer the
+// kernel reported: "<nr>-<pid>-<uid>", or "<nr>-<cookie>-<pid>_<pidfd id>-<uid>" on newer systemd.
+export function socketPeer(instance){
+ const m=/^\d+-(?:\d+-)?(\d+)(?:_\d+)?-(\d+)$/.exec(instance??'');
+ if(!m)throw Error('background_invalid_peer');
+ return {pid:Number(m[1]),uid:Number(m[2])};
+}
+const gidOf=pid=>Number(/^Gid:\s+(\d+)/m.exec(fs.readFileSync(`/proc/${pid}/status`,'utf8'))?.[1]);
+function caller(pid){
  let diagnostic;
- const binding=callerToolCall({background:false,onError:value=>{diagnostic=value;}});
+ const binding=callerToolCall({...(pid?{pid}:{}),background:false,onError:value=>{diagnostic=value;}});
  if(!binding&&diagnostic)throw Error(`background_native_caller_required: ${diagnostic.code}: ${diagnostic.detail}`);
+ return binding;
+}
+// serve: one launch per connection, run by systemd in system.slice. Under a CPU-starved agent slice, starting sudo and
+// node inside the caller's own tool scope took up to 8 s (2026-10-31); the caller now only starts socat.
+export function serve(instance){
+ let response;
+ try{
+  if(process.getuid()!==0)throw Error('background_root_required');
+  const peer=socketPeer(instance);
+  const binding=caller(peer.pid);
+  const input=JSON.parse(fs.readFileSync(0,'utf8'));
+  const spec=backgroundSpec(input,binding,peer.uid,gidOf(peer.pid));
+  response=launchOnce(input,binding,peer.uid,spec,argsFor(spec,peer.uid,gidOf(peer.pid)));
+  if(!response.ok)response={ok:false,error:response};
+ }catch(error){response={ok:false,error:{code:error.message}};}
+ process.stdout.write(JSON.stringify(response)+'\n');
+}
+// All background jobs share user-agents-kenanbg.slice (Kenan Stack deploy/priority), weighted as one agent command, so
+// they can't crowd out the agents' own shells (2026-10-30: 17 jobs as separate siblings left each shell 0.05 CPU).
+const argsFor=(spec,uid,gid)=>input=>['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
+export function main(){
+ if(process.argv[2]==='serve')return serve(process.argv[3]);
+ if(process.getuid()!==0)throw Error('background_root_required');
+ const binding=caller();
  const uid=Number(process.env.SUDO_UID),gid=Number(process.env.SUDO_GID);
  const input=JSON.parse(fs.readFileSync(0,'utf8'));
  const spec=backgroundSpec(input,binding,uid,gid);
@@ -203,12 +237,7 @@ export function main(){
   process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
- // All background jobs share user-agents-kenanbg.slice (Kenan Stack deploy/priority), weighted as one agent command, so
- // they can't crowd out the agents' own shells (2026-10-30: 17 jobs as separate siblings left each shell 0.05 CPU).
- // A durable name reservation and kernel-held lock prevent retry races. Unit
- // failures remain available for readback after their processes have exited.
- const argsFor=input=>['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
- const response=launchOnce(input,binding,uid,spec,argsFor);
+ const response=launchOnce(input,binding,uid,spec,argsFor(spec,uid,gid));
  if(!response.ok){console.error(JSON.stringify({ok:false,error:response}));process.exitCode=response.code==='background_launch_outcome_unknown'?75:2;return;}
  console.log(JSON.stringify(response));
 
