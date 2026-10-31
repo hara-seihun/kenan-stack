@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {execFileSync,spawnSync} from 'node:child_process';
+import {execFileSync,spawn,spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {frozenCustody,FROZEN_OBSERVATION_BUDGET} from './frozen-custody.mjs';
 const {main}=await import('./workspace.mjs');
 
@@ -33,6 +34,26 @@ test('an observation that cannot finish in its deadline is unknown custody, neve
   assert.equal(result?.code,'FROZEN_CUSTODY_UNKNOWN',JSON.stringify(result));
   assert.match(result.reason,/budget exhausted after \d+ entries/);
   assert.doesNotMatch(result.reason,/Traceback/);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
+// A host saturated by other work gives the scanner a small share of the CPU. Stopping it 90% of the time reproduces that:
+// the scan must still finish, because its allowance is charged against its own CPU time, not the wall clock.
+test('a scan starved of CPU by other work still completes and is not frozen',{timeout:120000},async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'frozen-starved-'));
+ try{
+  const tree=path.join(root,'tree');fs.mkdirSync(tree);
+  for(let d=0;d<20;d++){const dir=path.join(tree,'d'+d);fs.mkdirSync(dir);for(let f=0;f<500;f++)fs.closeSync(fs.openSync(path.join(dir,'f'+f),'w'));}
+  const scanner=fileURLToPath(new URL('./frozen-custody.py',import.meta.url));
+  const child=spawn('/usr/bin/python3',[scanner,tree,'recursive','0.5','0','60'],{stdio:['ignore','pipe','pipe']});
+  let stdout='',stderr='',running=true;child.stdout.on('data',x=>stdout+=x);child.stderr.on('data',x=>stderr+=x);
+  const done=new Promise(resolve=>child.on('exit',code=>{running=false;resolve(code);}));
+  (async()=>{while(running){child.kill('SIGSTOP');await new Promise(r=>setTimeout(r,450));if(!running)break;child.kill('SIGCONT');await new Promise(r=>setTimeout(r,50));}})();
+  const code=await done;
+  assert.equal(code,0,stderr);
+  const value=JSON.parse(stdout);
+  assert.equal(value.frozen,false);
+  assert.ok(value.entries>10000,stdout);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 

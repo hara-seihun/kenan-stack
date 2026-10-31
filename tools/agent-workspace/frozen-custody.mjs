@@ -3,8 +3,9 @@ import path from 'node:path';
 import {homedir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {boundedCommand} from './bounded-command.mjs';
-// Observation time scales with the tree: BASE_SECONDS plus PER_ENTRY_SECONDS for each entry seen (a 2,000 entries/second floor),
-// never beyond CAP_SECONDS. The enclosing process timeout leaves room for the cap. Anything unfinished is FROZEN_CUSTODY_UNKNOWN.
+// The scanner's CPU time may grow with the tree: BASE_SECONDS plus PER_ENTRY_SECONDS for each entry seen (a 2,000 entries per
+// CPU-second floor). CPU time, not wall-clock time, so a saturated host only slows the scan. CAP_SECONDS bounds wall-clock time;
+// the enclosing process timeout leaves room for it. Anything unfinished is FROZEN_CUSTODY_UNKNOWN.
 export const FROZEN_OBSERVATION_BUDGET=Object.freeze({baseSeconds:20,perEntrySeconds:0.0005,capSeconds:900});
 const SCANNER=fileURLToPath(new URL('./frozen-custody.py',import.meta.url));
 const UNREADABLE=4;

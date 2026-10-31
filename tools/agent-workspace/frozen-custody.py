@@ -1,10 +1,11 @@
 #!/usr/bin/python3
 """Bounded read-only immutable-bit observation; never changes flags or follows links."""
 import array,ctypes,errno,fcntl,json,os,stat,struct,sys,time
-# argv: PATH recursive|root BASE_SECONDS PER_ENTRY_SECONDS CAP_SECONDS. The allowed time grows with the entries seen,
-# so a large tree is never refused for being large; only a pathologically slow observation is.
-# Exit 3 means unknown; exit 4 means an entry could not be observed without read/search permission.
-request={'path':sys.argv[1],'recursive':sys.argv[2]=='recursive'};base,per_entry,cap=(float(value) for value in sys.argv[3:6]);start=time.monotonic();count=0
+# argv: PATH recursive|root BASE_SECONDS PER_ENTRY_SECONDS CAP_SECONDS. The size-scaled allowance (BASE plus PER_ENTRY for
+# each entry seen) is charged against this scanner's own CPU time, so a host whose CPU is saturated by other work slows the
+# scan without failing it; a large tree is never refused for being large. CAP_SECONDS bounds wall-clock time, catching a
+# scan stuck on I/O. Exit 3 means unknown; exit 4 means an entry could not be observed without read/search permission.
+request={'path':sys.argv[1],'recursive':sys.argv[2]=='recursive'};base,per_entry,cap=(float(value) for value in sys.argv[3:6]);start=time.monotonic();cpu_start=time.process_time();count=0
 
 # statx reports the immutable attribute from the inode without opening the file, so a file this
 # account can't read (root-owned 0600 bytecode, for example) is still observed exactly.
@@ -43,8 +44,8 @@ def immutable_by_ioctl(p,st):
 def visit(p):
  global count
  count+=1
- elapsed=time.monotonic()-start
- if elapsed>min(cap,base+per_entry*count):raise RuntimeError('immutable observation budget exhausted after %d entries in %.1fs'%(count,elapsed))
+ elapsed=time.monotonic()-start;cpu=time.process_time()-cpu_start
+ if elapsed>cap or cpu>min(cap,base+per_entry*count):raise RuntimeError('immutable observation budget exhausted after %d entries in %.1fs (%.1fs CPU)'%(count,elapsed,cpu))
  try:st=os.lstat(p)
  except PermissionError:raise Unobservable(p)
  if stat.S_ISLNK(st.st_mode):return None
