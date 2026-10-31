@@ -186,16 +186,18 @@ import {stopBackground,escapedGroups} from './background-launch.mjs';
 // node --test (20) and its CPU-bound child (21), which never runs its SIGTERM handler. Nothing dies until SIGKILL.
 function stuckJob({foreignInScope=false}={}){
  const unit='/system.slice/kenan-bg-x.service',scope='/user.slice/user-1990.slice/user@1990.service/heavy.slice/cpu-slot-x.scope';
- const s={alive:new Set([10,11,20,21]),stopQueued:false,log:[],t:0};
+ const s={alive:new Set([10,11,20,21]),stopQueued:false,log:[],t:0,env:{},mortal:new Set(),where:null,tree:null};
  const where={10:unit,11:unit,20:scope,21:scope,99:scope};
  if(foreignInScope)s.alive.add(99);
  const tree={10:[11],11:[20],20:[21]};
+ s.where=where;s.tree=tree;
  s.proc={
   procs:g=>[...s.alive].filter(p=>where[p]===g),
   children:p=>(tree[p]??[]).filter(c=>s.alive.has(c)),
   cgroupOf:p=>s.alive.has(p)?where[p]:null,
   start:p=>s.alive.has(p)?'1000':null,
-  kill:(p,sig)=>{s.log.push(`${sig}:${p}`);if(sig==='SIGKILL')s.alive.delete(p);},
+  marked:entry=>[...s.alive].filter(p=>s.env[p]===entry),
+  kill:(p,sig)=>{s.log.push(`${sig}:${p}`);if(sig==='SIGKILL'||s.mortal.has(p))s.alive.delete(p);},
   killGroup:g=>{s.log.push(`cgroup.kill:${g}`);for(const p of [...s.alive])if(where[p]===g)s.alive.delete(p);},
  };
  // Like systemd: the stop SIGTERMs the unit, the wrapper (main, 10) exits, and ExecStopPost (30, with a child 31) runs
@@ -203,6 +205,7 @@ function stuckJob({foreignInScope=false}={}){
  s.execute=(cmd,args)=>{
   if(args[1]==='stop'){assert.deepEqual(args,['--system','stop','--no-block','kenan-bg-x.service']);s.stopQueued=true;s.log.push('stop');
    s.alive.delete(10);s.alive.add(30);s.alive.add(31);where[30]=where[31]=unit;tree[30]=[31];return {status:0};}
+  if(s.unitGone)return {status:0,stdout:'ControlGroup=\nControlPID=0\n'};
   return {status:0,stdout:`ControlGroup=${unit}\nControlPID=${s.alive.has(30)?30:0}\n`};
  };
  s.clock={now:()=>s.t,sleep:ms=>{s.t+=ms;}};
@@ -211,7 +214,7 @@ function stuckJob({foreignInScope=false}={}){
 test('kenan-bg stop ends a job whose CPU-bound Node child ignores SIGTERM, including the processes in its cpu-slot scope',()=>{
  const {s,scope}=stuckJob();
  const r=stopBackground('kenan-bg-x.service',{execute:s.execute,proc:s.proc,...s.clock});
- assert.equal(r.state,'stopped');assert.equal(r.forced,true);assert.deepEqual(r.escaped,[scope]);
+ assert.equal(r.state,'stopped');assert.equal(r.forced,true);assert.deepEqual(r.scopes,[scope]);assert.equal(r.survivors,undefined);
  assert.deepEqual([...s.alive].sort(),[30,31]);
  // The stop is queued with systemd before anything else, so a caller cut off mid-stop still stops the unit.
  assert.equal(s.log[0],'stop');assert.ok(s.log.includes('SIGTERM:20')&&s.log.includes('SIGTERM:21'));
@@ -239,4 +242,44 @@ test('the launch socket takes its caller from the peer the kernel reported in th
  assert.deepEqual(socketPeer('0-21202-3022292_116236682-1000'),{pid:3022292,uid:1000});
  assert.deepEqual(socketPeer('7-3022292-1990'),{pid:3022292,uid:1990});
  for(const bad of [undefined,'','x-1-2','1-2','0-1-2-3-4'])assert.throws(()=>socketPeer(bad),/background_invalid_peer/);
+});
+import {jobMarker} from './background-launch.mjs';
+// 2026-10-31: a stop answered {state: stopped, escaped: [scope]} and the caller read "escaped" as "got away", though the
+// scope had ended on the SIGTERM. The answer now names the scopes it stopped and lists survivors only when there are some.
+test('a cpu-slot scope that ends on SIGTERM is reported as stopped, with no survivors',()=>{
+ const {s,scope}=stuckJob();for(const p of [20,21])s.mortal.add(p);
+ const execute=s.execute;s.execute=(cmd,args,o)=>{const r=execute(cmd,args,o);if(args[1]==='stop')s.alive.delete(11);return r;};
+ const r=stopBackground('kenan-bg-x.service',{execute:s.execute,proc:s.proc,...s.clock});
+ assert.deepEqual(r,{unit:'kenan-bg-x.service',state:'stopped',forced:false,scopes:[scope]});
+});
+test('a job process that outlives SIGKILL is listed as a survivor, and the stop says stopping',()=>{
+ const {s,scope}=stuckJob();s.proc.killGroup=()=>{};const kill=s.proc.kill;s.proc.kill=(p,sig)=>{if(p!==21)kill(p,sig);};
+ const r=stopBackground('kenan-bg-x.service',{execute:s.execute,proc:s.proc,...s.clock});
+ assert.equal(r.state,'stopping');assert.equal(r.forced,true);assert.deepEqual(r.survivors,[{pid:21,cgroup:scope}]);
+});
+test('a cpu-slot scope started while the stop is under way is found and stopped too',()=>{
+ const {s,unit}=stuckJob();const late='/heavy.slice/cpu-slot-late.scope';
+ // cpu-slot (11) starts a second job (40) into its own scope just after the stop was queued.
+ const execute=s.execute;s.execute=(cmd,args,o)=>{const r=execute(cmd,args,o);
+  if(args[1]==='stop'){s.alive.add(40);s.where[40]=late;s.tree[11]=[20,40];}return r;};
+ const r=stopBackground('kenan-bg-x.service',{execute:s.execute,proc:s.proc,...s.clock});
+ assert.equal(r.state,'stopped');assert.ok(r.scopes.includes(late));assert.ok(!s.alive.has(40));
+ assert.ok(s.log.includes('SIGTERM:40'));
+});
+test('a repeated stop, after the unit is gone and the scope lost its parent, still finds the scope by the job marker; then it is a no-op',()=>{
+ const {s,scope}=stuckJob();const marker=jobMarker('kenan-bg-x.service','/var/tmp/kenan-bg/u/x-1.log');
+ // The unit ended (its wrapper and cpu-slot died) but the scope's processes were reparented and run on.
+ s.unitGone=true;s.alive.delete(10);s.alive.delete(11);s.env[20]=s.env[21]=marker;
+ // An unrelated process in another scope with another launch's marker is left alone.
+ s.alive.add(50);s.where[50]='/heavy.slice/cpu-slot-other.scope';s.env[50]=jobMarker('kenan-bg-x.service','/var/tmp/kenan-bg/u/x-2.log');
+ const r=stopBackground('kenan-bg-x.service',{marker,execute:s.execute,proc:s.proc,...s.clock});
+ assert.equal(r.state,'stopped');assert.deepEqual(r.scopes,[scope]);assert.ok(!s.alive.has(20)&&!s.alive.has(21)&&s.alive.has(50));
+ assert.ok(!s.log.includes('stop'),'no systemd stop is queued for a unit that is gone');
+ assert.deepEqual(stopBackground('kenan-bg-x.service',{marker,execute:s.execute,proc:s.proc,...s.clock}),{unit:'kenan-bg-x.service',state:'stopped',forced:false,scopes:[]});
+});
+test('a marked job process in a control group shared with others is killed alone, never with its whole group',()=>{
+ const {s}=stuckJob({foreignInScope:true});s.unitGone=true;s.alive.delete(10);s.alive.delete(11);
+ const marker=jobMarker('kenan-bg-x.service','/l');s.env[20]=s.env[21]=marker;
+ const r=stopBackground('kenan-bg-x.service',{marker,execute:s.execute,proc:s.proc,...s.clock});
+ assert.equal(r.state,'stopped');assert.ok(s.alive.has(99));assert.ok(!s.log.some(l=>l.startsWith('cgroup.kill')));
 });

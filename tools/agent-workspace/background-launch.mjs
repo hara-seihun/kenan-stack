@@ -60,9 +60,12 @@ export function settleBackground(result,observed,spec){
 }
 // kenan-bg stop. SIGTERM can't interrupt a long synchronous computation (a CPU-bound node --test child kept 2.8 GB
 // after a stop, 2026-10-31), and cpu-slot runs each job in its own scope outside this unit, where stopping the unit never
-// reaches it. So the stop is queued with systemd first (it happens even if this caller is cut off), the job's processes
-// outside the unit are found by ancestry while it still exists, everything gets SIGTERM, and whatever is left after
-// graceMs gets SIGKILL (systemd's own escalation waits TimeoutStopSec, 90 s, after ExecStopPost). The answer is "stopped" only once none of the job's processes is left.
+// reaches it. So the stop is queued with systemd first (it happens even if this caller is cut off), then the job's
+// processes outside the unit are found two ways, looked for again on every poll so a scope started mid-stop is caught too:
+// by ancestry from the unit, and by the KENAN_BG_JOB marker every job process inherits (it survives reparenting, so a
+// repeated stop after the unit is gone still finds a scope whose parent died). Everything gets SIGTERM, and whatever is
+// left after graceMs gets SIGKILL (systemd's own escalation waits TimeoutStopSec, 90 s, after ExecStopPost).
+// The answer is "stopped" only once none of the job's processes is left; "stopping" lists the survivors.
 const procFs={
  procs(group){
   const out=[];const walk=dir=>{let entries;try{out.push(...fs.readFileSync(dir+'/cgroup.procs','utf8').split('\n').filter(Boolean).map(Number));entries=fs.readdirSync(dir,{withFileTypes:true});}catch{return;}
@@ -71,27 +74,53 @@ const procFs={
  },
  children(pid){let tasks;try{tasks=fs.readdirSync(`/proc/${pid}/task`);}catch{return [];}
   return tasks.flatMap(t=>{try{return fs.readFileSync(`/proc/${pid}/task/${t}/children`,'utf8').split(' ').filter(Boolean).map(Number);}catch{return [];}});},
+ // Every process whose environment carries this exact entry.
+ marked(entry){
+  const out=[];for(const name of fs.readdirSync('/proc')){if(!/^\d+$/.test(name))continue;
+   let env;try{env=fs.readFileSync(`/proc/${name}/environ`);}catch{continue;}
+   if(env.includes(entry)&&env.toString('latin1').split('\0').includes(entry))out.push(Number(name));}
+  return out;
+ },
  cgroupOf(pid){try{return fs.readFileSync(`/proc/${pid}/cgroup`,'utf8').match(/^0::(.*)$/m)?.[1]??null;}catch{return null;}},
- start(pid){try{return fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(') ').at(-1).split(' ')[19];}catch{return null;}},
+ // null for a process that is gone or a zombie (already dead, only waiting to be reaped).
+ start(pid){try{const f=fs.readFileSync(`/proc/${pid}/stat`,'utf8').split(') ').at(-1).split(' ');return f[0]==='Z'||f[0]==='X'?null:f[19];}catch{return null;}},
  kill(pid,signal){try{process.kill(pid,signal);}catch{}},
  killGroup(group){try{fs.writeFileSync('/sys/fs/cgroup'+group+'/cgroup.kill','1');}catch{}},
 };
 const sleepMs=ms=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
-// Control groups outside the unit that hold nothing but the job's own descendants (cpu-slot's job scopes).
-export function escapedGroups(group,proc=procFs){
- const inside=g=>g===group||g.startsWith(group+'/');
- const mine=new Set(),queue=[...proc.procs(group)];
+// The environment entry that marks one launch's processes: the unit and its log, which is new for every launch.
+export const jobMarker=(unit,log)=>`KENAN_BG_JOB=${unit}:${log}`;
+// The job's processes outside its unit (in cpu-slot's job scopes): descendants of the unit's processes, plus every process
+// carrying the job's marker, plus the ones already found (known: pid to start time), whose parents may have died since.
+// A control group whose processes are all the job's may be killed whole.
+export function outsideProcesses(group,marker,proc=procFs,known=new Map()){
+ const inside=g=>g===group||(group&&g.startsWith(group+'/'));
+ const mine=new Set([...(marker?proc.marked(marker):[]),...[...known].filter(([pid,start])=>proc.start(pid)===start).map(([pid])=>pid)]);
+ const queue=[...(group?proc.procs(group):[]),...mine];
  while(queue.length){for(const child of proc.children(queue.pop()))if(!mine.has(child)){mine.add(child);queue.push(child);}}
- const groups=new Set([...mine].map(pid=>proc.cgroupOf(pid)).filter(g=>g&&!inside(g)));
- return [...groups].filter(g=>{const pids=proc.procs(g);return pids.length>0&&pids.every(pid=>mine.has(pid));});
+ const pids=[...mine].filter(pid=>proc.start(pid)!==null).map(pid=>[pid,proc.cgroupOf(pid)]).filter(([,g])=>g&&!inside(g));
+ const groups=[...new Set(pids.map(([,g])=>g))];
+ return {pids:pids.map(([pid])=>pid),groups,whole:groups.filter(g=>{const all=proc.procs(g);return all.length>0&&all.every(pid=>mine.has(pid));})};
 }
-export function stopBackground(unit,{execute=run,proc=procFs,sleep=sleepMs,now=Date.now,graceMs=3000,settleMs=2000}={}){
+export function escapedGroups(group,proc=procFs){return outsideProcesses(group,null,proc).whole;}
+export function stopBackground(unit,{marker=null,execute=run,proc=procFs,sleep=sleepMs,now=Date.now,graceMs=3000,settleMs=2000}={}){
  const show=()=>{const r=execute('/usr/bin/systemctl',['--system','show',unit,'--property=ControlGroup,ControlPID'],{timeout:10000});
   return Object.fromEntries((r.stdout??'').trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));};
  const group=show().ControlGroup||null;
- const escaped=group?escapedGroups(group,proc):[];
- execute('/usr/bin/systemctl',['--system','stop','--no-block',unit],{timeout:10000});
- for(const g of escaped)for(const pid of proc.procs(g))proc.kill(pid,'SIGTERM');
+ // Found before the stop is queued, while the unit's processes still link to their scopes.
+ const known=new Map();
+ // Reading every process's environment costs about 0.1 s, so the marker is searched once a second and before any "stopped".
+ let scanned=-Infinity;
+ const find=(full=false)=>{const scan=marker&&(full||now()-scanned>=1000);if(scan)scanned=now();
+  const found=outsideProcesses(group,scan?marker:null,proc,known);for(const pid of found.pids){const start=proc.start(pid);if(start!==null&&!known.has(pid))known.set(pid,start);}return found;};
+ let outside=find();
+ if(group)execute('/usr/bin/systemctl',['--system','stop','--no-block',unit],{timeout:10000});
+ const scopes=new Set(),signalled=new Map();
+ // Each pid is signalled once per signal, guarded by its start time against reuse.
+ const signal=(pids,sig)=>{for(const pid of pids){const start=proc.start(pid),key=`${sig}:${pid}`;
+  if(start===null||signalled.get(key)===start)continue;signalled.set(key,start);proc.kill(pid,sig);}};
+ const sweep=sig=>{for(const g of outside.groups)scopes.add(g);signal(outside.pids,sig);};
+ sweep('SIGTERM');
  // The job's processes in the unit: everything but ExecStopPost (the control process, which raises the job's end event)
  // and its children. systemd runs ExecStopPost as soon as the main process exits, while the rest may still run.
  // The processes are read before ControlPID, so an ExecStopPost started in between is never among them.
@@ -101,13 +130,16 @@ export function stopBackground(unit,{execute=run,proc=procFs,sleep=sleepMs,now=D
   if(control){const queue=[control];spared.add(control);while(queue.length)for(const c of proc.children(queue.pop()))if(!spared.has(c)){spared.add(c);queue.push(c);}}
   return pids.filter(pid=>!spared.has(pid));
  };
- const done=()=>leftovers().length===0&&escaped.every(g=>proc.procs(g).length===0);
- const until=deadline=>{while(now()<deadline){if(done())return true;sleep(100);}return done();};
- if(until(now()+graceMs))return {unit,state:'stopped',forced:false,escaped};
- // A start-time match guards against a pid reused since it was read.
- for(const [pid,start] of leftovers().map(pid=>[pid,proc.start(pid)]))if(start!==null&&proc.start(pid)===start)proc.kill(pid,'SIGKILL');
- for(const g of escaped)proc.killGroup(g);
- return {unit,state:until(now()+settleMs)?'stopped':'stopping',forced:true,escaped};
+ const survivors=(full=false)=>{outside=find(full);sweep('SIGTERM');
+  return [...leftovers().map(pid=>({pid,cgroup:group})),...outside.pids.map(pid=>({pid,cgroup:proc.cgroupOf(pid)}))];};
+ const until=deadline=>{while(now()<deadline){if(!survivors().length&&!(survivors(true)).length)return [];sleep(100);}return survivors(true);};
+ const answer=(left,forced)=>({unit,state:left.length?'stopping':'stopped',forced,scopes:[...scopes],...(left.length?{survivors:left}:{})});
+ let left=until(now()+graceMs);
+ if(!left.length)return answer(left,false);
+ signal(leftovers(),'SIGKILL');signal(outside.pids,'SIGKILL');
+ for(const g of outside.whole)proc.killGroup(g);
+ left=until(now()+settleMs);
+ return answer(left,true);
 }
 export const BACKGROUND_ROOT='/var/lib/agent-workspace/background-launch';
 // The wrapper's argv carries its log twice (argv[3] and the ExecStopPost line); a resubmission keeps the original log.
@@ -207,7 +239,7 @@ export function serve(instance){
 }
 // All background jobs share user-agents-kenanbg.slice (Kenan Stack deploy/priority), weighted as one agent command, so
 // they can't crowd out the agents' own shells (2026-10-30: 17 jobs as separate siblings left each shell 0.05 CPU).
-const argsFor=(spec,uid,gid)=>input=>['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1','--',...input.argv];
+const argsFor=(spec,uid,gid)=>input=>['--system','--quiet','--expand-environment=no','--property=Type=exec',`--unit=${spec.unit}`,`--uid=${uid}`,`--gid=${gid}`,`--working-directory=${backgroundDirectory(input,fs.readFileSync('/etc/passwd','utf8').split('\n').find(line=>line.split(':')[2]===String(uid))?.split(':')[5]||'/')}`,`--description=${spec.description}`,'--property=MemoryMax=8G','--property=MemorySwapMax=0','--property=OOMPolicy=continue',`--property=UMask=${input.umask}`,'--property=Slice=user-agents-kenanbg.slice','--property=CPUQuota=200%','--property=CPUWeight=10',`--property=ExecStopPost=${input.after}`,...input.env.filter(x=>!x.startsWith('KENAN_TOOL_CALL_ID=')&&!x.startsWith('KENAN_BG_NATIVE=')&&!x.startsWith('KENAN_BG_JOB=')).map(x=>'--setenv='+x),'--setenv=KENAN_BG_NATIVE=1',...(input.argv[1]==='--run'?['--setenv='+jobMarker(spec.unit,input.argv[3])]:[]),'--',...input.argv];
 export function main(){
  if(process.argv[2]==='serve')return serve(process.argv[3]);
  if(process.getuid()!==0)throw Error('background_root_required');
@@ -218,12 +250,13 @@ export function main(){
  if(process.argv[2]==='status'||process.argv[2]==='stop'){
   const observed=run('/usr/bin/systemctl',['--system','show',spec.unit,'--property=Description,LoadState,SubState']);
   const properties=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
+  let saved;try{saved=JSON.parse(fs.readFileSync(`${BACKGROUND_ROOT}/${spec.unit}.json`,'utf8'));}catch{}
+  const marker=saved?.log&&saved.uid===uid&&saved.channel===binding.channel?jobMarker(spec.unit,saved.log):null;
   if(properties.LoadState==='not-found'){
-   if(process.argv[2]==='status'){
-    // A launch whose caller was cut off before systemd answered: the job never started, and the same command starts it.
-    let saved;try{saved=JSON.parse(fs.readFileSync(`${BACKGROUND_ROOT}/${spec.unit}.json`,'utf8'));}catch{}
-    console.log(saved?.state==='pending'&&saved.log&&!fs.existsSync(saved.log)?'not-started':'inactive');process.exitCode=3;
-   }
+   // A launch whose caller was cut off before systemd answered: the job never started, and the same command starts it.
+   if(process.argv[2]==='status'){console.log(saved?.state==='pending'&&saved.log&&!fs.existsSync(saved.log)?'not-started':'inactive');process.exitCode=3;}
+   // The unit is gone, but a cpu-slot scope it started may still run: a repeated stop finds it by the job's marker.
+   else{const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;}
    return;
   }
   if(observed.status!==0||properties.Description!==spec.description) {
@@ -232,7 +265,7 @@ export function main(){
    if(!prior?.background||prior.agentId!==binding.agentId||prior.channel!==binding.channel||prior.uid!==uid)throw Error('background_owner_mismatch');
   }
   if(process.argv[2]==='status'&&properties.SubState==='exited'){console.log('inactive');return;}
-  if(process.argv[2]==='stop'){const r=stopBackground(spec.unit);console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;return;}
+  if(process.argv[2]==='stop'){const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;return;}
   const result=run('/usr/bin/systemctl',['--system','is-active',spec.unit]);
   process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
  }
