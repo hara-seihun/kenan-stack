@@ -158,7 +158,25 @@ export function authenticateToolCalls(pairs,{deadline,channels=kenanChannels,exe
     }
    }
   }
-  return {errors:[],confirmed};
+  // A person moved between channels keeps their old rows in the source channel (history), so a
+  // call from before the move is confirmed in both. The person's current channel is the one whose
+  // database holds their most recent agent activity.
+  const current=new Map();
+  const moved=[...new Set(pairs.filter(pair=>(confirmed.get(pair.agentId+'\0'+pair.callId)??[]).length>1).map(pair=>pair.agentId))];
+  for(const agentId of moved){
+   let best=null,tie=false;
+   for(const channel of channels()){
+    const remaining=deadline-Date.now();if(remaining<=0)throw new Error('authentication deadline exhausted before '+channel);
+    const sql=`SELECT coalesce(max(updated_at),0) FROM agent WHERE owner_id=(SELECT owner_id FROM agent WHERE id=${literal(agentId)})`;
+    const result=execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,'--dbname',channelDatabase(channel),'--set=ON_ERROR_STOP=1','--command',sql],{encoding:'utf8',timeout:Math.min(10_000,remaining),maxBuffer:1<<20,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
+    if(result.status!==0||result.error)throw new Error('native owner activity unavailable: '+channel);
+    const at=Number(String(result.stdout).trim());
+    if(!Number.isFinite(at))throw new Error('native owner activity malformed: '+channel);
+    if(!best||at>best.at){best={channel,at};tie=false;}else if(at===best.at)tie=true;
+   }
+   if(best&&best.at>0&&!tie)current.set(agentId,best.channel);
+  }
+  return {errors:[],confirmed,current};
  }catch(error){return {errors:[String(error.message)],confirmed:new Map()};}
 }
 
@@ -168,6 +186,8 @@ export function receiptBinding(receipt,authentication){
  const channels=new Set();
  for(const pair of receipt.pairs){
   const found=authentication.confirmed.get(pair.agentId+'\0'+pair.callId)??[];
+  const live=authentication.current?.get(pair.agentId);
+  if(found.length>1&&live!==undefined&&found.includes(live)){channels.add(live);continue;}
   if(found.length!==1)return {kind:'unbound',code:found.length?'receipt-tool-call-ambiguous':'receipt-tool-call-unconfirmed',job:pair.job};
   channels.add(found[0]);
  }

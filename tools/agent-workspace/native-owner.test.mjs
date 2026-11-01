@@ -113,6 +113,9 @@ test('receipt binding needs every call confirmed on exactly one and the same cha
  assert.equal(v.kind,'bindable');assert.deepEqual(v.binding,{agentId:A,channel:'beta',callId:'c1'});assert.equal(v.evidence.jobs.length,2);
  assert.equal(receiptBinding(receipt([['c1','j1']]),seen(['c1',['beta','production']])).code,'receipt-tool-call-ambiguous');
  assert.equal(receiptBinding(receipt([['c1','j1']]),seen()).code,'receipt-tool-call-unconfirmed');
+ const moved=receiptBinding(receipt([['c1','j1'],['c2','j2']]),{...seen(['c1',['beta','production']],['c2',['production']]),current:new Map([[A,'production']])});
+ assert.equal(moved.kind,'bindable','a call from before the owner moved channels is in both; the current channel wins');assert.equal(moved.binding.channel,'production');
+ assert.equal(receiptBinding(receipt([['c1','j1']]),{...seen(['c1',['beta','production']]),current:new Map([[A,'other']])}).code,'receipt-tool-call-ambiguous');
  assert.equal(receiptBinding(receipt([['c1','j1'],['c2','j2']]),seen(['c1',['beta']])).code,'receipt-tool-call-unconfirmed','one unconfirmed call is enough to refuse');
  assert.equal(receiptBinding(receipt([['c1','j1'],['c2','j2']]),seen(['c1',['beta']],['c2',['production']])).code,'receipt-channels-conflict');
  assert.equal(receiptBinding({kind:'invalid',code:'receipt-agents-conflict'},seen()).code,'receipt-agents-conflict');
@@ -145,10 +148,11 @@ test('observation fails closed on bad deadline, role, channel, exit, timeout, ma
 test('observation collects each channel that confirms a pair, so duplicates surface as ambiguity',()=>{
  const rows='[{"agentId":"'+A+'","callId":"c1"}]';
  const seenArgs=[];
- const result=authenticateToolCalls([pair('c1')],{deadline:Date.now()+5000,channels:()=>['beta','production','beta'],user:()=>'fixture',execute:(c,args)=>{seenArgs.push(args[args.indexOf('--dbname')+1]);return ok(rows);}});
+ const result=authenticateToolCalls([pair('c1')],{deadline:Date.now()+5000,channels:()=>['beta','production','beta'],user:()=>'fixture',execute:(c,args)=>{seenArgs.push(args[args.indexOf('--dbname')+1]);const sql=args[args.indexOf('--command')+1];return ok(sql.startsWith('SELECT coalesce(max(updated_at)')?(args.includes('kenan_production')?'20':'10'):rows);}});
  assert.deepEqual(result.errors,[]);
+ assert.equal(result.current.get(A),'production','the channel with the owner\'s latest activity is current');
  assert.deepEqual(result.confirmed.get(A+'\0c1'),['beta','production']);
- assert.equal(receiptBinding(receipt([['c1','j']]),result).code,'receipt-tool-call-ambiguous');
+ assert.equal(receiptBinding(receipt([['c1','j']]),result).binding.channel,'production','a call present in both channels from before a move binds to the current one');
  assert.deepEqual(seenArgs.slice(0,2),['kenan_beta','kenan_production']);
 });
 
@@ -170,7 +174,7 @@ test('actual PostgreSQL: only a tool call that exists in that agent\'s own conve
   pg('pg_ctl',['-D',data,'-l',path.join(root,'postgres.log'),'-o',`-F -k ${root} -c listen_addresses='' -c max_connections=10 -c shared_buffers=8MB`,'-w','start']);started=true;
   const psql=(database,sql)=>pg('psql',['-X','-qAt','--host',root,'--username','fixture','--dbname',database,'--set=ON_ERROR_STOP=1','--command',sql]);
   psql('postgres','CREATE DATABASE kenan_beta');psql('postgres','CREATE DATABASE kenan_production');
-  const schema=`CREATE TABLE agent(id text PRIMARY KEY,conversation_id text NOT NULL);CREATE TABLE message(id serial PRIMARY KEY,conversation_id text NOT NULL,role text,parts jsonb NOT NULL);`;
+  const schema=`CREATE TABLE agent(id text PRIMARY KEY,conversation_id text NOT NULL,owner_id text DEFAULT 'p',updated_at bigint DEFAULT 1);CREATE TABLE message(id serial PRIMARY KEY,conversation_id text NOT NULL,role text,parts jsonb NOT NULL);`;
   psql('kenan_beta',schema+`INSERT INTO agent VALUES('${A}','conv-a'),('${B}','conv-b');
    INSERT INTO message(conversation_id,role,parts) VALUES('conv-a','tool','[{"type":"text","text":"x"},{"type":"tool","callId":"c1"}]'),
    ('conv-a','assistant','[{"type":"tool","callId":"${COMPOSITE}"}]'),('conv-a','tool','[{"type":"tool","callId":"${COMPOSITE}"}]'),
