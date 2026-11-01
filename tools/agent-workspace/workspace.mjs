@@ -3727,6 +3727,7 @@ function createWorkspace(database, args, statePath) {
     if (info.checkoutType !== strategy) fail("pending checkout type changed");
     if (strategy === "clone") {
       prepareSparseCheckout(materialization, input);
+      writeSelectedData(materialization, input, sourceCommit, checkoutTimeout);
       resumeCloneCheckout(materialization, input, sourceCommit, upstream, checkoutTimeout);
     }
     const head = git(materialization, ["rev-parse", "HEAD"]);
@@ -3774,6 +3775,23 @@ function prepareSparseCheckout(destination, input) {
   }
   git(destination, ["config", "--local", "core.sparseCheckout", "true"]);
   git(destination, ["config", "--local", "core.sparseCheckoutCone", "false"]);
+}
+
+// The host git template (init.templateDir, 2026-10-31) starts every new repository with
+// seinari-data.selective true, under which a Seinari checkout writes data bytes only for small text and
+// leaves archives and files over 4 MiB as git-lfs pointer files. A workspace checks out exactly the paths
+// its caller selected, and admission priced every selected data file at the size its pointer names, so it
+// writes them all (2026-10-31: a /compiler/ clone left model/machine/instruction-schema.json, 13 MB, as a
+// pointer and every reader failed parsing it). Outside Seinari the setting does nothing.
+function writeSelectedData(destination, input, sourceCommit, timeout) {
+  git(destination, ["config", "--local", "seinari-data.selective", "false"]);
+  const attributes = command("git", ["-C", destination, "show", `${sourceCommit}:.gitattributes`]);
+  if (attributes.status !== 0 || !/filter=seinari-data/u.test(attributes.stdout)) return;
+  // Objects already moved to the Storage Box come over 16 at a time here instead of one at a time during
+  // checkout. Only a speed-up: the checkout reads any object this misses.
+  const literal = input.sparsePatterns?.length && input.sparsePatterns.every(pattern => /^\/[^*?[\]\\]+$/u.test(pattern));
+  const paths = literal ? input.sparsePatterns.map(pattern => pattern.slice(1)) : [];
+  spawnSync("seinari-data", ["prefetch", "--rev", sourceCommit, ...paths], { cwd: destination, stdio: ["ignore", "ignore", "inherit"], timeout });
 }
 
 function resumeCloneCheckout(destination, input, sourceCommit, upstream, checkoutTimeout) {
