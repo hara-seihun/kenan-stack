@@ -2026,7 +2026,51 @@ const POINTER_FILTERS = new Set(["filter=seinari-data", "filter=lfs"]);
 const transformingAttributes = text => text.split("\n").filter(line => !/^\s*#/u.test(line))
   .flatMap(line => line.match(/(?:working-tree-encoding|filter)=\S+/gu) ?? []);
 
-function pricePointerFiles(repository, entries, selected) {
+// A Seinari clone writes the bytes of only the data its code needs, like a research-clone checkout (2026-11-01: four
+// /compiler/symbolic-search/ clones wrote 13 GiB of data each, 10 GiB of it research evidence nothing read, and their
+// prefetch copied 31 GiB from the Storage Box in 8 minutes; root went from 76% to 83% in 15 minutes). The checkout is
+// selective (seinari-data.selective true): data files get bytes when the cone's code names them by path (seinari-cone-plan,
+// shared with research-clone, reads imports, new URL(..., import.meta.url) and tools/sparse-deps.json), when a sparse pattern
+// names the file itself, inside tools/, or when they are text of at most 4 MiB (seinari-data's own rule). Every other data
+// file stays a pointer; `seinari-data materialize PATH` writes it. Returns the seinari-data.materialize values, or null
+// when the tree doesn't use the seinari-data filter. Admission prices from the same list, so the estimate matches the checkout.
+const SEINARI_ALWAYS_MATERIALIZED = ["tools", "research/receiver-relative/tools"];
+function seinariDataSelection(repository, sourceCommit, sparsePatterns) {
+  const attributes = command("git", ["-C", repository, "show", `${sourceCommit}:.gitattributes`], { env: closureEnvironment });
+  if (attributes.status !== 0 || !/filter=seinari-data/u.test(attributes.stdout)) return null;
+  const folders = new Set(), named = new Set();
+  if (sparsePatterns.length === 0) {
+    for (const name of git(repository, ["ls-tree", "--name-only", "-d", sourceCommit]).split("\n")) if (name) folders.add(name);
+  }
+  for (const pattern of sparsePatterns) {
+    if (pattern.startsWith("!")) continue;
+    const literal = !/[*?[\]\\]/u.test(pattern);
+    const prefix = pattern.replace(/^\//u, "").split(/[*?[\]\\]/u)[0];
+    if (literal && !prefix.endsWith("/") && prefix !== "") named.add(prefix);
+    const folder = literal ? prefix.replace(/\/$/u, "") : prefix.slice(0, prefix.lastIndexOf("/") + 1).replace(/\/$/u, "");
+    if (folder !== "") folders.add(folder);
+  }
+  // A pattern without a trailing slash may still name a folder: only a file is materialized whole.
+  const kinds = named.size === 0 ? [] : command("git", ["-C", repository, "cat-file", "--batch-check=%(objecttype)"],
+    { input: [...named].map(name => `${sourceCommit}:${name}\n`).join(""), env: closureEnvironment }).stdout.split("\n");
+  const files = [...named].filter((_, index) => kinds[index] === "blob");
+  const paths = [...folders].sort().join(",");
+  const cacheDir = path.join(process.env.XDG_CACHE_HOME || path.join(homedir(), ".cache"), "agent-workspace", "seinari-selection");
+  const cacheFile = path.join(cacheDir, createHash("sha256").update(`v1\0${sourceCommit}\0${paths}`).digest("hex").slice(0, 32));
+  let reads;
+  try { reads = JSON.parse(readFileSync(cacheFile, "utf8")); } catch {
+    const plan = command("seinari-cone-plan", [repository, paths, "0", sourceCommit], { timeout: 180_000 });
+    if (plan.error?.code === "ENOENT") fail("seinari data selection unknown: seinari-cone-plan is not installed (Kenan Stack deploy/research-only/install.sh puts it in /usr/local/bin)");
+    if (plan.status !== 0) fail(`seinari data selection unknown: seinari-cone-plan failed: ${plan.stderr.slice(-500)}`);
+    reads = plan.stdout.split("\n").filter(line => line.startsWith("read\t")).map(line => line.split("\t")[2]);
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(`${cacheFile}.${process.pid}`, JSON.stringify(reads));
+    renameSync(`${cacheFile}.${process.pid}`, cacheFile);
+  }
+  return [...new Set([...SEINARI_ALWAYS_MATERIALIZED, ...files, ...reads])].sort();
+}
+
+function pricePointerFiles(repository, entries, selected, materialize = null) {
   // A pointer file is about 130 bytes; nothing outside this range can be one.
   const candidates = entries.filter(entry => entry.type === "blob" && entry.size !== undefined && Number(entry.size) >= 80 && Number(entry.size) <= 400
     && (selected === null || selected.has(entry.name)));
@@ -2045,7 +2089,15 @@ function pricePointerFiles(repository, entries, selected) {
     const pointer = /^version https:\/\/git-lfs\.github\.com\/spec\/v1\n(?:[^\n]*\n)*?size (\d+)\n/u.exec(body);
     if (pointer) sizes.set(hash, pointer[1]);
   }
-  for (const entry of candidates) if (sizes.has(entry.hash) && Number(sizes.get(entry.hash)) > Number(entry.size)) entry.size = sizes.get(entry.hash);
+  let written = candidates.filter(entry => sizes.has(entry.hash) && Number(sizes.get(entry.hash)) > Number(entry.size));
+  if (materialize !== null && written.length > 0) {
+    const wanted = command("seinari-data", ["wanted", ...materialize.flatMap(value => ["--materialize", value])],
+      { input: written.map(entry => `${sizes.get(entry.hash)}\t${entry.name}\n`).join(""), timeout: 120_000 });
+    if (wanted.status !== 0) fail(`source capacity estimate unknown: seinari-data wanted failed: ${wanted.stderr.slice(-500)}`);
+    const names = new Set(wanted.stdout.split("\n"));
+    written = written.filter(entry => names.has(entry.name));
+  }
+  for (const entry of written) entry.size = sizes.get(entry.hash);
 }
 
 function assertSourceCheckoutFilters(repository) {
@@ -2072,10 +2124,10 @@ function sourceCheckoutCapacity(repository, sourceCommit, intent, blockSize, spa
     if (transforms.some(value => !POINTER_FILTERS.has(value))) fail("source capacity estimate unknown: checkout attribute transformation");
     if (transforms.length > 0) pointerFilter = true;
   }
-  if (pointerFilter) pricePointerFiles(repository, entries, selected);
+  if (pointerFilter) pricePointerFiles(repository, entries, selected, seinariDataSelection(repository, sourceCommit, sparsePatterns));
   const checkoutAllocation = checkoutConstructionCapacity(entries, selected, blockSize);
   return { ...intent, estimate: selected === null ? "whole-tree-upper-bound" : "git-sparse-upper-bound",
-    constructionBytes: checkoutAllocation.totalBytes, checkoutAllocation, checkoutPricingVersion: 4, sourceImportBytes: 0, sourceCommit };
+    constructionBytes: checkoutAllocation.totalBytes, checkoutAllocation, checkoutPricingVersion: 5, sourceImportBytes: 0, sourceCommit };
 }
 
 function checkoutConstructionCapacity(entries, selected, blockSize) {
@@ -3203,7 +3255,7 @@ function prepareSourceValue(database, args, request) {
   publishSourcePhase({ phase: "forecasting", commit: sourceCommit });
   const blockSize = statfsSync(root).bsize;
   const forecastPath = `${request.receipt}.forecast.json`;
-  const inputs = { version: 4, repository, sourceCommit, intent, sparsePatterns, blockSize, stamp: objectStoreStamp(mirror) };
+  const inputs = { version: 5, repository, sourceCommit, intent, sparsePatterns, blockSize, stamp: objectStoreStamp(mirror) };
   const cached = existsSync(forecastPath) ? JSON.parse(readFileSync(forecastPath, "utf8")) : null;
   const fingerprint = sourceJobId("source-forecast", inputs);
   let plan = cached !== null && cached.fingerprint === fingerprint ? cached.plan : intent === null
@@ -3784,21 +3836,17 @@ function prepareSparseCheckout(destination, input) {
   git(destination, ["config", "--local", "core.sparseCheckoutCone", "false"]);
 }
 
-// The host git template (init.templateDir, 2026-10-31) starts every new repository with
-// seinari-data.selective true, under which a Seinari checkout writes data bytes only for small text and
-// leaves archives and files over 4 MiB as git-lfs pointer files. A workspace checks out exactly the paths
-// its caller selected, and admission priced every selected data file at the size its pointer names, so it
-// writes them all (2026-10-31: a /compiler/ clone left model/machine/instruction-schema.json, 13 MB, as a
-// pointer and every reader failed parsing it). Outside Seinari the setting does nothing.
+// Before the first checkout: the clone writes the data seinariDataSelection names (see there), and only those objects
+// come over from the Storage Box first, 16 at a time (a speed-up only: the checkout reads any object this misses).
 function writeSelectedData(destination, input, sourceCommit, timeout) {
-  git(destination, ["config", "--local", "seinari-data.selective", "false"]);
-  const attributes = command("git", ["-C", destination, "show", `${sourceCommit}:.gitattributes`]);
-  if (attributes.status !== 0 || !/filter=seinari-data/u.test(attributes.stdout)) return;
-  // Objects already moved to the Storage Box come over 16 at a time here instead of one at a time during
-  // checkout. Only a speed-up: the checkout reads any object this misses.
+  const materialize = seinariDataSelection(destination, sourceCommit, input.sparsePatterns ?? []);
+  if (materialize === null) return;
+  git(destination, ["config", "--local", "seinari-data.selective", "true"]);
+  command("git", ["-C", destination, "config", "--local", "--unset-all", "seinari-data.materialize"]);
+  for (const value of materialize) git(destination, ["config", "--local", "--add", "seinari-data.materialize", value]);
   const literal = input.sparsePatterns?.length && input.sparsePatterns.every(pattern => /^\/[^*?[\]\\]+$/u.test(pattern));
   const paths = literal ? input.sparsePatterns.map(pattern => pattern.slice(1)) : [];
-  spawnSync("seinari-data", ["prefetch", "--rev", sourceCommit, ...paths], { cwd: destination, stdio: ["ignore", "ignore", "inherit"], timeout });
+  spawnSync("seinari-data", ["prefetch", "--selected", "--rev", sourceCommit, ...paths], { cwd: destination, stdio: ["ignore", "ignore", "inherit"], timeout });
 }
 
 function resumeCloneCheckout(destination, input, sourceCommit, upstream, checkoutTimeout) {

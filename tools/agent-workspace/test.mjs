@@ -1414,7 +1414,7 @@ process.exit(result.status ?? 1);
     assert.equal(created.state, "active");
     assert.equal(created.sourceCommit, commit);
     assert.equal(created.capacity.estimate, "git-sparse-upper-bound");
-    assert.equal(created.capacity.checkoutPricingVersion, 4);
+    assert.equal(created.capacity.checkoutPricingVersion, 5);
     assert.equal(created.capacity.sourceImportBytes, 0);
     assert.equal(created.capacity.constructionBytes, expected.constructionBytes);
     assert.equal(readFileSync(path.join(created.path, "AGENTS.md"), "utf8"), "source instructions\n");

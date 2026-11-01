@@ -15,8 +15,11 @@ test('a checkout whose files are pointers behind a known data filter is priced a
  try {
   const work=path.join(root,'work');mkdirSync(work);run(work,'init','-q','-b','main');run(work,'config','user.name','T');run(work,'config','user.email','t@example.invalid');
   writeFileSync(path.join(work,'.gitattributes'),'* filter=seinari-data\n');
-  const size=64*1024**2;
-  writeFileSync(path.join(work,'weights.bin'),`version https://git-lfs.github.com/spec/v1\noid sha256:${'a'.repeat(64)}\nsize ${size}\n`);
+  const size=64*1024**2;mkdirSync(path.join(work,'model'));
+  // a seinari-data checkout writes the data its code reads (model/load.mjs reads weights.bin), not the rest (2026-11-01)
+  writeFileSync(path.join(work,'model','weights.bin'),`version https://git-lfs.github.com/spec/v1\noid sha256:${'a'.repeat(64)}\nsize ${size}\n`);
+  writeFileSync(path.join(work,'model','unread.bin'),`version https://git-lfs.github.com/spec/v1\noid sha256:${'b'.repeat(64)}\nsize ${size}\n`);
+  writeFileSync(path.join(work,'model','load.mjs'),"export const weights = new URL('./weights.bin', import.meta.url);\n");
   writeFileSync(path.join(work,'notes.txt'),'small\n');
   run(work,'add','.');run(work,'commit','-qm','data');
   const env={...process.env,PI_WORKSPACE_STATE:path.join(root,'state','registry.sqlite3'),PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty'};
@@ -32,7 +35,7 @@ test('a checkout whose files are pointers behind a known data filter is priced a
   const plan=JSON.parse(priced.stdout).plan ?? JSON.parse(priced.stdout).record?.plan ?? JSON.parse(priced.stdout);
   assert.ok(JSON.stringify(plan).includes('materializedBlobBytes'),priced.stdout.slice(0,2000));
   const blobBytes=Number(/"materializedBlobBytes":\s*(\d+)/u.exec(priced.stdout)[1]);
-  assert.ok(blobBytes>=size,`priced ${blobBytes} bytes for a ${size}-byte data file`);
+  assert.ok(blobBytes>=size&&blobBytes<3*size,`priced ${blobBytes} bytes for one read and one unread ${size}-byte data file`);
 
   writeFileSync(path.join(work,'.gitattributes'),'* filter=unknown-transform\n');run(work,'commit','-qam','other filter');
   const refused=create('two');
