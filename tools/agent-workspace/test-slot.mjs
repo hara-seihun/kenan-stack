@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, openSync, closeSync } from "node:fs";
+import { chmodSync, mkdirSync, openSync, closeSync, constants } from "node:fs";
 import { testSlotCount } from "./test-slot-policy.mjs";
 export { testSlotCount } from "./test-slot-policy.mjs";
 import path from "node:path";
@@ -11,7 +11,8 @@ import path from "node:path";
 
 
 function tryLock(file) {
-  const descriptor = openSync(file, "a", 0o666);
+  // flock needs only a read descriptor, so a slot another user created (mode 0644 under its umask) still serves.
+  const descriptor = openSync(file, constants.O_RDONLY | constants.O_CREAT, 0o666);
   const result = spawnSync("flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "ignore", "pipe", descriptor] });
   if (result.status === 0) return descriptor;
   closeSync(descriptor);
