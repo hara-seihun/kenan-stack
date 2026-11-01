@@ -4,7 +4,8 @@ import {currentStackQueueReferences} from './cache-queue.mjs';
 import {observeGrowthWriters} from './growth-writer-observation.mjs';
 import {processAncestry,within} from './safety-census.mjs';
 import {boundedCommand} from './bounded-command.mjs';
-import {fileURLToPath,pathToFileURL} from 'node:url';
+import {privilegedCommand} from './operator-observation.mjs';
+import {pathToFileURL} from 'node:url';
 
 export const OWNER_IDLE_FORECAST_MS=60*60_000;
 
@@ -35,7 +36,7 @@ export function observeCapacityProcesses(roots,deadline){
 function privilegedProcesses(roots,deadline){
  const remaining=deadline-Date.now();
  if(remaining<=0)throw new Error('capacity child observation deadline exhausted');
- const result=boundedCommand('sudo',['-n',process.execPath,fileURLToPath(import.meta.url),'--processes',JSON.stringify(roots),String(deadline)],{encoding:'utf8',timeout:remaining,maxBuffer:2<<20});
+ const result=boundedCommand('sudo',privilegedCommand(import.meta.url,['--processes',JSON.stringify(roots),String(deadline)]),{encoding:'utf8',timeout:remaining,maxBuffer:2<<20});
  if(result.status!==0||result.error)throw new Error('capacity process observation unavailable: '+String(result.error?.code??result.stderr??result.status).slice(0,1000));
  const value=JSON.parse(result.stdout);
  if(typeof value?.complete!=='boolean'||!Array.isArray(value.references)||!Array.isArray(value.errors))throw new Error('capacity process observation malformed');

@@ -8,6 +8,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import {pathToFileURL} from "node:url";
 import {rootPlanReferences,publisherPlanReferences,DEFAULT_ROOT_PLANS} from './root-plan-references.mjs';
 import {withPreparedRuntimeReferences} from './prepared-runtime-references.mjs';
 
@@ -38,6 +39,12 @@ class Budget {
     if (this.total > this.limits.maxTotalBytes) throw new Error("qualification census exceeded its total byte bound");
     return fs.readFileSync(file);
   }
+}
+
+// Only ENOENT is absence. existsSync() is also false for EACCES, which would let an
+// unreadable qualification store count as "not installed".
+function absent(file) {
+  try { fs.statSync(file); return false; } catch (error) { return error?.code === "ENOENT"; }
 }
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -85,7 +92,7 @@ export function qualificationReferences(roots = null, options = {}) {
   const publisherPlans=publisherPlanReferences(roots,{directory:options.dataRoot ?? path.dirname(directories.requestsDir)});
   nativePlans.errors.push(...publisherPlans.errors);nativePlans.references.push(...publisherPlans.references);nativePlans.released.push(...publisherPlans.released);nativePlans.complete=nativePlans.complete&&publisherPlans.complete;nativePlans.observations.push(...publisherPlans.observations);
   // Native root-plan custody is independent of qualification-authority installation.
-  if (!fs.existsSync(directories.requestsDir) && !fs.existsSync(directories.queueStateFile))
+  if (absent(directories.requestsDir) && absent(directories.queueStateFile))
     return withPreparedRuntimeReferences({...nativePlans, observations:[{source:"qualification-records",state:"not-installed"}, ...nativePlans.observations]},roots,{...options,dataRoot:options.dataRoot ?? path.dirname(directories.requestsDir)});
   const limits = { ...LIMITS, ...(options.limits ?? {}) };
   const budget = new Budget(limits);
@@ -295,4 +302,20 @@ function finish(roots, errors, references, released, ignored) {
 export function protects(result, candidate) {
   if (!result.complete) return true;
   return result.references.some((reference) => reference.paths.some((p) => overlaps(p, candidate)));
+}
+
+// Root census for the operator observer (operator-observe.mjs): only the references and
+// settlements that concern the caller's own roots leave the owner's private records.
+export function operatorCensus(roots, options = {}) {
+  const census = qualificationReferences(roots, options);
+  const concerned = (item) => [...(item.paths ?? []), item.preparedPath].some((p) => typeof p === "string" && roots.some((root) => overlaps(p, root)));
+  return {...census, released: census.released.filter(concerned)};
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
+  if (process.argv[2] !== "--census" || process.argv.length !== 4) {
+    process.stderr.write("usage: qualification-references.mjs --census ROOTS_JSON\n");
+    process.exit(64);
+  }
+  process.stdout.write(`${JSON.stringify(operatorCensus(JSON.parse(process.argv[3])))}\n`);
 }

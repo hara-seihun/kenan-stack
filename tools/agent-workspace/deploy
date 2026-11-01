@@ -38,15 +38,36 @@ rsync -a --chmod=D755,F644 --exclude=deploy "$root/tools/agent-workspace/" "$sta
 chmod 755 "$stage/agent-workspace/workspace.mjs" "$stage/agent-workspace/background-launch.mjs"
 node "$stage/agent-workspace/main" --help >/dev/null
 printf '%s\n' "$commit" > "$stage/.pi-stack-commit"
-node - "$stage/agent-workspace/.component-release.json" "$baseline" "$commit" <<'NODE'
+# Household operators (the kenan-operators group; a host without it has none) run root
+# read-only observations through operator-observe.mjs at the stable selected path.
+observer_node=$(command -v node)
+observer_entry=$dest/agent-workspace/operator-observe.mjs
+observer_gid=$(getent group kenan-operators | cut -d: -f3) || observer_gid=
+node - "$stage/agent-workspace/.component-release.json" "$baseline" "$commit" "$observer_node" "$observer_entry" "$observer_gid" <<'NODE'
 const fs = require('node:fs');
-fs.writeFileSync(process.argv[2], JSON.stringify({component: 'agent-workspace', baseline: process.argv[3],
-  sourceCommit: process.argv[4], deployedAt: Date.now(), scope: 'tools-only; other tool bodies and dependency links retained'}, null, 2) + '\n');
+const [file, baseline, sourceCommit, node, entry, gid] = process.argv.slice(2);
+fs.writeFileSync(file, JSON.stringify({component: 'agent-workspace', baseline, sourceCommit, deployedAt: Date.now(),
+  scope: 'tools-only; other tool bodies and dependency links retained',
+  ...(gid === '' ? {} : {operatorObserver: {gid: Number(gid), node, entry}})}, null, 2) + '\n');
 NODE
 pi_stack_publish_release "$root" "$stage" "$dest" tools
 cmp "$root/tools/agent-workspace/workspace.mjs" "$dest/agent-workspace/workspace.mjs"
 node "$dest/agent-workspace/main" --help >/dev/null
 printf 'deployed agent-workspace %s over tools %s; no services or workspace records changed\n' "$commit" "$baseline"
+
+# The operator group may run the observer as root; without the group the rule is absent.
+if (( EUID == 0 )); then
+  observer_rule=/etc/sudoers.d/agent-workspace-operator-observe
+  if [[ -n $observer_gid ]]; then
+    rule=$(mktemp)
+    printf '# Installed by pi-stack tools/agent-workspace/deploy: root read-only observations of paths the caller owns.\n%%kenan-operators ALL=(root) NOPASSWD: %s %s *\n' "$observer_node" "$observer_entry" > "$rule"
+    visudo -cqf "$rule"
+    install -m 0440 -o root -g root "$rule" "$observer_rule"
+    rm -f "$rule"
+  else
+    rm -f "$observer_rule"
+  fi
+fi
 
 # Shared Git writers use one kernel-held object-store fence on this host.
 if [[ $dest == /srv/pi/tools ]]; then

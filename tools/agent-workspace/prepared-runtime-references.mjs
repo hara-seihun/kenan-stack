@@ -10,6 +10,8 @@ const SHA=/^[a-f0-9]{64}$/;
 const absolute=value=>typeof value==='string'&&path.isAbsolute(value)&&path.normalize(value)===value&&value!=='/';
 const overlaps=(a,b)=>a===b||a.startsWith(b+'/')||b.startsWith(a+'/');
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
+// Only ENOENT is absence; existsSync() also hides EACCES.
+const present=file=>{try{fs.lstatSync(file);return true;}catch(error){if(error.code==='ENOENT')return false;throw error;}};
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 
 export function preparedRuntimeReferences(roots=null,options={}){
@@ -57,7 +59,7 @@ export function preparedRuntimeReferences(roots=null,options={}){
   if(!object(v)||v.version!==1||v.kind!==kind||v.sourcePath!==file||v.sourceSha256!==source.sha256||!['disposed','handed-over'].includes(v.disposition)||typeof v.owner!=='string'||!v.owner.trim()||typeof v.reason!=='string'||!v.reason.trim()||!Array.isArray(v.paths)||JSON.stringify([...v.paths].sort())!==JSON.stringify(paths))throw Error(file+': terminal custody disposition does not bind the exact source and paths');
   if(v.disposition==='handed-over'){
    if(!object(v.successor)||!absolute(v.successor.path)||!SHA.test(v.successor.sha256)||v.successor.path===file)throw Error(file+': exact successor custody required for handover');
-   if(fs.existsSync(v.successor.path+'.disposition.json'))throw Error(file+': successor already carries a terminal disposition');
+   if(present(v.successor.path+'.disposition.json'))throw Error(file+': successor already carries a terminal disposition');
    const next=read(v.successor.path);if(!next||next.sha256!==v.successor.sha256)throw Error(file+': successor custody is absent or changed');
    // The destination must be another owning canonical record, not an arbitrary receipt or log.
    const successorConfig=path.dirname(path.dirname(v.successor.path))===preparedRoot&&path.basename(v.successor.path)==='CONFIG.json';
@@ -104,7 +106,7 @@ export function preparedRuntimeReferences(roots=null,options={}){
    }
   }
   const pointer=path.join(preparedRoot,'CURRENT-HOST-CONFIG-PATH');
-  if(fs.existsSync(pointer)){
+  if(present(pointer)){
    const stat=fs.lstatSync(pointer);if(!stat.isFile()||stat.size>4096)throw Error(pointer+': invalid current configuration pointer');
    const current=fs.readFileSync(pointer,'utf8').trim();
    if(!absolute(current)||path.basename(current)!=='CONFIG.json'||path.dirname(path.dirname(current))!==preparedRoot)throw Error(pointer+': current configuration is outside the canonical preparation root');
@@ -117,7 +119,7 @@ export function preparedRuntimeReferences(roots=null,options={}){
    if(!entry.isFile()||!entry.name.endsWith('.json')||entry.name.endsWith('.disposition.json'))continue;
    adoption(path.join(adoptionDir,entry.name));
   }
-  if(fs.existsSync(helperRoot))references.push({kind:'publisher_helper_custody',id:helperRoot,state:'canonical-tooling-source',resourceClass:'qualification-request',targetPath:helperRoot,paths:[helperRoot]});
+  if(present(helperRoot))references.push({kind:'publisher_helper_custody',id:helperRoot,state:'canonical-tooling-source',resourceClass:'qualification-request',targetPath:helperRoot,paths:[helperRoot]});
   observations.push({source:'prepared-runtime-and-publisher-custody',configs:configs.length,records:references.length,released:released.length,entries,bytes:total});
  }catch(error){errors.push(String(error.message));}
  return {errors,references:roots===null?references:Array.isArray(roots)&&roots.every(absolute)?references.filter(r=>r.paths.some(p=>roots.some(root=>overlaps(p,root)))):[],released,observations,complete:errors.length===0,observedAt:Date.now()};

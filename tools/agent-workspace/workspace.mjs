@@ -70,6 +70,7 @@ import { capacityRecovery } from "./capacity-recovery.mjs";
 import { retireWorkspaceCache, validateCacheRequest, CacheRetirementError, cacheRetirementStatus } from "./cache-retirement.mjs";
 import { procScope, currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
+import { privilegedCommand, stackQualificationReferences } from "./operator-observation.mjs";
 import { NATIVE_CUSTODIAN_ID, OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
 import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import {adoptEndedActions} from "./actions-adoption.mjs";
@@ -1215,7 +1216,7 @@ function stackQueueSafety(roots,safety,resourceKind,deadline) {
     return {...observed,errors:[...observed.errors,...qualifications.errors],references:[...observed.references.filter(ref=>resourceKind==="source"||ref.resourceClass!=="source-intent"),...qualifications.references]};
   }
   const native = currentStackQueueReferences(roots,{resourceKind,deadline});
-  const qualifications = qualificationReferences(roots);
+  const qualifications = stackQualificationReferences(roots);
   return {...native, errors:[...native.errors,...qualifications.errors], references:[...native.references,...qualifications.references], qualificationObservation:qualifications.observations};
 }
 function stackQueueInspection(queued) {
@@ -2293,7 +2294,8 @@ function measuredBudgetBytes(plan, state) {
 
 let nativeTerminalProjection=null;
 function terminalQualificationPaths(rows, database) {
-  const census = qualificationReferences(rows.map(row=>row.path), process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT ? {dataRoot:process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT} : {});
+  const census = process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT ? qualificationReferences(rows.map(row=>row.path), {dataRoot:process.env.PI_WORKSPACE_TEST_QUALIFICATION_ROOT})
+    : stackQualificationReferences(rows.map(row=>row.path));
   if (!census.complete) return new Map();
   const settled=new Map();
   for(const item of census.released){
@@ -5053,8 +5055,9 @@ function growthSafety(database, record, {preservationOnly=false,snapshot}={}) {
   if (!isolated) {
     if (process.getuid?.() === 0) processes = growthProcessReferences(paths);
     else {
-      const observed = command("sudo", ["-n", process.execPath, new URL(import.meta.url).pathname,
-        "growth-process-snapshot", ...paths.flatMap(value => ["--path",value])], {timeout:10_000});
+      let observed;
+      try { observed = command("sudo", privilegedCommand(import.meta.url, ["growth-process-snapshot", ...paths.flatMap(value => ["--path",value])]), {timeout:10_000}); }
+      catch (error) { growthError("growth-writer-unknown", `privileged process observation unavailable: ${error.message}`); }
       if (observed.status !== 0) growthError("growth-writer-unknown", `privileged process observation failed: ${observed.stderr}`);
       try { processes = JSON.parse(observed.stdout); } catch { growthError("growth-writer-unknown", "invalid process observation"); }
       if (!Array.isArray(processes)) growthError("growth-writer-unknown", "process observation is not an array");
@@ -5105,8 +5108,9 @@ function materializationSafety(database, parent, roots, resourceKind, cacheRoots
   let processes;
   if (process.getuid?.() === 0) processes = materializationProcessReferences(roots);
   else {
-    const observed = command("sudo", ["-n", process.execPath, new URL(import.meta.url).pathname,
-      "materialization-process-snapshot", ...roots.flatMap(root => ["--path", root])], {timeout: 10000});
+    let observed;
+    try { observed = command("sudo", privilegedCommand(import.meta.url, ["materialization-process-snapshot", ...roots.flatMap(root => ["--path", root])]), {timeout: 10000}); }
+    catch (error) { throw new MaterializationError("materialization-safety-unknown", `privileged all-FD observer unavailable: ${error.message}`); }
     if (observed.status !== 0) throw new MaterializationError("materialization-safety-unknown", `privileged all-FD observer failed: ${observed.stderr}`);
     try { processes = JSON.parse(observed.stdout); } catch { throw new MaterializationError("materialization-safety-unknown", "invalid process observation JSON"); }
     if (!Array.isArray(processes) || processes.some(row => !row || !Number.isSafeInteger(row.pid) || !Array.isArray(row.matches)))
@@ -5129,7 +5133,7 @@ function cacheSymlinkSafety(database, record, roots) {
     return {errors:[], references:[], retainedBorrowers:[], observedAt:Date.now()};
   const safety = materializationSafety(database, record, roots, "generated-cache", roots);
   const installed = installedReferenceSnapshot(census.INSTALL_ROOTS);
-  const qualifications = qualificationReferences(roots);
+  const qualifications = stackQualificationReferences(roots);
   return {...safety, errors:[...safety.errors, ...qualifications.errors],
     references:[...safety.references, ...cacheAliasInstalledReferences(roots[0], installed), ...qualifications.references], observedAt:Date.now()};
 }
