@@ -5,6 +5,8 @@
 // worktrees, no unreleased workspace names one of its sources, and either every
 // source it fetches from is a local path that is gone or it has been idle for
 // `unusedDays`. A later create for the same source simply builds a new mirror.
+// Two mirrors of one origin are never both kept once the extra one has sat idle for a
+// day (on 2026-11-01 duplicates of halo-5090 and programme 12 held 9 GiB of root).
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
@@ -28,7 +30,7 @@ function alternatesOf(gitDirectory) {
     return readFileSync(path.join(gitDirectory, "objects", "info", "alternates"), "utf8").split("\n")
       .map(line => line.trim()).filter(line => line && !line.startsWith("#"))
       .map(line => path.isAbsolute(line) ? line : path.resolve(gitDirectory, "objects", line));
-  } catch (error) { if (missing(error)) return []; throw error; }
+  } catch (error) { if (missing(error) || error.code === "EACCES") return []; throw error; }
 }
 
 function gitDirectoryOf(checkout) {
@@ -171,11 +173,22 @@ function liveWorktrees(mirror) {
   }).filter(gitdir => gitdir && existsSync(gitdir));
 }
 
-// Newest change to the mirror's refs, packs, closure proofs or configuration.
+const USE_STAMP = "pi-workspace-last-use";
+
+// create stamps the mirror it reads from, since a create whose commit the mirror already
+// holds writes nothing else there. A mirror that doesn't exist yet needs no stamp.
+export function markMirrorUse(mirror) {
+  try { writeFileSync(path.join(mirror, USE_STAMP), `${new Date().toISOString()}\n`); }
+  catch (error) { if (!missing(error)) throw error; }
+}
+
+// Newest change to the mirror's refs, closure proofs or configuration: what a create or
+// fetch writes. Pack and loose-object files are left out, because the hourly
+// share-mirror-packs relinks them into every mirror and so made idle mirrors look used.
 export function lastActivityMs(mirror) {
   let newest = 0;
   const note = file => { try { newest = Math.max(newest, lstatSync(file).mtimeMs); } catch (error) { if (!missing(error)) throw error; } };
-  for (const name of ["", "config", "packed-refs", "FETCH_HEAD", "objects/pack", "pi-workspace-closure"]) note(path.join(mirror, name));
+  for (const name of ["", "config", "packed-refs", "FETCH_HEAD", "pi-workspace-closure", USE_STAMP]) note(path.join(mirror, name));
   const walk = (directory, depth) => {
     let entries;
     try { entries = readdirSync(directory, { withFileTypes: true }); } catch (error) { if (missing(error)) return; throw error; }
@@ -186,33 +199,87 @@ export function lastActivityMs(mirror) {
   return newest;
 }
 
+function originOf(mirror) {
+  const origin = spawnSync("git", ["--git-dir", mirror, "config", "--local", "--get", "remote.origin.url"], { encoding: "utf8", env: gitEnvironment });
+  return origin.status === 0 ? origin.stdout.trim() || null : null;
+}
+
+const PROTECTED = new Set(["borrowed", "cold-borrowers-unknown", "linked-worktree", "active-workspace"]);
+
 // Decide, for every mirror under mirrorRoot, whether it is retired and why.
-// activeRepositories: repository strings of workspaces that are not released.
-// checkouts: existing checkout paths that might borrow from a mirror.
+// activeMirrors: paths of the mirrors unreleased workspaces create from (create's own naming).
+// checkouts: existing checkout or Git directory paths that might borrow from a mirror.
 // coldBorrowed: object directories borrowed by checkouts on the cold tier, or null if unknown.
-export function classifyMirrors({ mirrorRoot, activeRepositories, checkouts, coldBorrowed = new Set(), now = Date.now(), unusedDays = 14 }) {
+export function classifyMirrors({ mirrorRoot, activeMirrors = [], checkouts, coldBorrowed = new Set(), now = Date.now(), unusedDays = 14, duplicateIdleDays = 1 }) {
   let names;
   try { names = readdirSync(mirrorRoot).filter(name => name.endsWith(".git") && !name.startsWith(".")).sort(); }
   catch (error) { if (missing(error)) return []; throw error; }
   const borrowed = borrowedObjectDirectories(checkouts);
   for (const target of coldBorrowed ?? []) borrowed.add(target);
-  const active = new Set(activeRepositories.filter(Boolean));
-  return names.map(name => {
+  const active = new Set([...activeMirrors].map(mirror => path.resolve(mirror)));
+  const verdicts = names.map(name => {
     const mirror = path.join(mirrorRoot, name);
     const objects = real(path.join(mirror, "objects"));
     const sources = mirrorSources(mirror);
     const lastActivity = lastActivityMs(mirror);
-    const base = { mirror, sources, lastActivity: new Date(lastActivity).toISOString() };
+    const base = { mirror, sources, origin: originOf(mirror), lastActivity: new Date(lastActivity).toISOString(), lastActivityMs: lastActivity };
     if (objects && (borrowed.has(objects) || borrowed.has(path.join(mirror, "objects")))) return { ...base, retire: false, reason: "borrowed" };
     if (coldBorrowed === null) return { ...base, retire: false, reason: "cold-borrowers-unknown" };
     if (liveWorktrees(mirror).length > 0) return { ...base, retire: false, reason: "linked-worktree" };
-    if (sources.some(url => active.has(url))) return { ...base, retire: false, reason: "active-workspace" };
+    if (active.has(mirror)) return { ...base, retire: false, reason: "active-workspace" };
     const localGone = sources.length > 0 && sources.every(url => path.isAbsolute(url) && !underColdStorage(url) && !existsSync(url));
     if (localGone) return { ...base, retire: true, reason: "source-gone" };
     if (sourcesRewritten(mirror, sources)) return { ...base, retire: true, reason: "source-rewritten" };
     if (now - lastActivity > unusedDays * 86_400_000) return { ...base, retire: true, reason: "unused" };
     return { ...base, retire: false, reason: "recent" };
   });
+  // One mirror per origin: the kept one is a protected mirror, else the most recently used.
+  const byOrigin = new Map();
+  for (const verdict of verdicts) if (verdict.origin && !verdict.retire) byOrigin.set(verdict.origin, [...(byOrigin.get(verdict.origin) ?? []), verdict]);
+  for (const group of byOrigin.values()) {
+    if (group.length < 2) continue;
+    const keepers = group.filter(verdict => PROTECTED.has(verdict.reason));
+    const kept = keepers.length ? keepers : [group.reduce((a, b) => (b.lastActivityMs > a.lastActivityMs ? b : a))];
+    for (const verdict of group) {
+      if (kept.includes(verdict) || verdict.reason !== "recent" || now - verdict.lastActivityMs <= duplicateIdleDays * 86_400_000) continue;
+      Object.assign(verdict, { retire: true, reason: "duplicate", duplicateOf: kept[0].mirror });
+    }
+  }
+  return verdicts.map(({ lastActivityMs: _, ...verdict }) => verdict);
+}
+
+// Git directories anywhere under `roots` whose objects/info/alternates names a directory
+// inside mirrorRoot, and the object directories they name. Read through `sudo -n` when it is available, so other users' folders
+// count too. Returns null when the scan did not finish or could not read everything; then
+// nothing is retired.
+export function hostMirrorBorrowers(roots, mirrorRoot, { timeoutMs = 300_000 } = {}) {
+  const existing = roots.filter(root => existsSync(root));
+  if (existing.length === 0) return { gitDirectories: [], objectDirectories: [] };
+  const findArgs = [...existing, "-xdev", "(", "-name", "node_modules", "-o", "-name", ".lake", "-o", "-path", mirrorRoot, ")", "-prune",
+    "-o", "-path", "*/objects/info/alternates", "-type", "f", "-exec", "grep", "-H", "-Z", "", "{}", "+"];
+  const scan = elevated => spawnSync(elevated ? "sudo" : "nice", elevated ? ["-n", "nice", "-n", "19", "ionice", "-c", "3", "find", ...findArgs] : ["-n", "19", "find", ...findArgs],
+    { encoding: "utf8", timeout: timeoutMs, maxBuffer: 1 << 28 });
+  let result = scan(true);
+  if (!result.error && /^sudo: /mu.test(result.stderr ?? "")) result = scan(false);
+  // grep exits 1 for an empty alternates file, so the exit status says little; an unreadable
+  // folder could hide a borrower, files vanishing mid-scan (in /tmp) can't.
+  if (result.error || result.signal || /Permission denied/u.test(result.stderr ?? "")) return null;
+  const root = real(mirrorRoot) ?? path.resolve(mirrorRoot);
+  const found = new Set(), borrowed = new Set();
+  for (const line of result.stdout.split("\n")) {
+    const nul = line.indexOf("\0");
+    if (nul < 0) continue;
+    const file = line.slice(0, nul), target = line.slice(nul + 1).trim();
+    if (!target || target.startsWith("#")) continue;
+    const objects = path.dirname(path.dirname(file));
+    const resolved = path.isAbsolute(target) ? target : path.resolve(objects, target);
+    const canonical = real(resolved) ?? resolved;
+    if (canonical === root || canonical.startsWith(root + path.sep) || resolved.startsWith(path.resolve(mirrorRoot) + path.sep)) {
+      found.add(path.dirname(objects));
+      borrowed.add(canonical);
+    }
+  }
+  return { gitDirectories: [...found].sort(), objectDirectories: [...borrowed].sort() };
 }
 
 // Remove a retired mirror: rename it out of the way first, so no reader sees it half deleted.

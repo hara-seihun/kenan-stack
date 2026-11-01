@@ -31,7 +31,7 @@ import { recentImportBase } from "./import-ancestors.mjs";
 import { refPinPath, pinnedSourceCommit, clearRefPin } from "./ref-pin.mjs";
 import { movedToColdStorage } from "./cold-storage.mjs";
 import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
-import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
+import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, hostMirrorBorrowers, markMirrorUse, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
 import {awaitSubmittedRelease,RELEASE_AWAIT_MS} from './release-await.mjs';
 import { spawn, spawnSync } from "node:child_process";
@@ -3608,6 +3608,7 @@ function createWorkspace(database, args, statePath) {
         const result = command("git", [...(local ? ["-C", repository] : ["--git-dir", mirror]), "merge-base", "--is-ancestor", pinned, resolved]);
         return result.status === 0 ? true : result.status === 1 || local ? false : null;
       } });
+    markMirrorUse(mirror);
     const preparation = withResourceLock(statePath, `source-preparation:${destination}`, () =>
       prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns, sourceCommit: pinnedCommit }));
     if (preparation.state !== "ready") {
@@ -6069,22 +6070,46 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     const home = process.env.HOME || "/home/kenan";
     // [checkouts one level down, checkouts two levels down]
     const MIRROR_BORROWER_ROOTS = [[path.join(home, "worktrees"), null], [path.join(home, "work", "clones"), null], ["/home/kenan-research", "/home/kenan-research/checkouts"]];
+    // Where the full alternates scan looks before anything is removed.
+    const HOST_SCAN_ROOTS = (process.env.AGENT_WORKSPACE_MIRROR_SCAN_ROOTS ?? "/home:/var/tmp:/tmp:/srv:/opt:/root").split(":").filter(Boolean);
     assertOnly(args, ["execute", "unused-days", "json"]);
     const unusedDays = numberFlag(args, "unused-days", 14);
     const root = path.join(path.dirname(statePath), "mirrors");
+    const remembered = path.join(path.dirname(statePath), "mirror-borrowers.v1.json");
     const database = openRegistry(statePath);
     let rows;
     try { rows = database.prepare("SELECT path, root, repository, state FROM workspace").all(); } finally { database.close(); }
     // Every existing checkout the registry knows, anything else in its roots, research
-    // checkouts (their user can enter the mirrors folder), and checkouts moved to the cold tier.
+    // checkouts (their user can enter the mirrors folder), Git directories an earlier full
+    // scan found borrowing, and checkouts moved to the cold tier.
+    let rememberedBorrowers = [];
+    try { rememberedBorrowers = JSON.parse(readFileSync(remembered, "utf8")).gitDirectories ?? []; } catch { rememberedBorrowers = []; }
     const checkouts = new Set([...rows.map(row => row.path).filter(file => !movedToColdStorage(file) && existsSync(file)),
       ...checkoutsUnder([...new Set(rows.map(row => row.root))], 1),
       ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([directory]) => directory).filter(Boolean), 1),
-      ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([, directory]) => directory).filter(Boolean), 2)]);
+      ...checkoutsUnder(MIRROR_BORROWER_ROOTS.map(([, directory]) => directory).filter(Boolean), 2),
+      ...rememberedBorrowers.filter(directory => existsSync(directory))]);
     const coldBorrowed = coldBorrowedObjectDirectories(process.env.AGENT_WORKSPACE_COLD_OWNERS || "/var/lib/kenan-cold/owners",
       path.join(path.dirname(statePath), "cold-alternates.v1.json"));
-    const verdicts = classifyMirrors({ mirrorRoot: root, checkouts: [...checkouts], coldBorrowed, unusedDays,
-      activeRepositories: rows.filter(row => row.state !== "released").map(row => row.repository) });
+    // The mirrors unreleased workspaces create from, named the way create names them.
+    const activeMirrors = new Set();
+    for (const row of rows.filter(row => row.state !== "released" && row.repository)) {
+      activeMirrors.add(mirrorFor(statePath, row.repository));
+      if (!movedToColdStorage(row.repository)) activeMirrors.add(mirrorFor(statePath, repositoryRemotes(row.repository).fetch));
+    }
+    const classify = borrowed => classifyMirrors({ mirrorRoot: root, checkouts: [...checkouts], coldBorrowed: borrowed, unusedDays, activeMirrors: [...activeMirrors] });
+    let verdicts = classify(coldBorrowed);
+    let hostScan = "not-needed";
+    if (coldBorrowed !== null && verdicts.some(verdict => verdict.retire)) {
+      // Before removing anything, look for alternates anywhere on the host, not only where checkouts usually live.
+      const scanned = hostMirrorBorrowers(HOST_SCAN_ROOTS, root);
+      if (scanned === null) { hostScan = "incomplete"; verdicts = classify(null); }
+      else {
+        hostScan = "complete";
+        try { writeFileSync(remembered, JSON.stringify({ scannedAt: new Date().toISOString(), gitDirectories: scanned.gitDirectories }, null, 2) + "\n"); } catch { /* only saves a later scan */ }
+        verdicts = classify(new Set([...coldBorrowed, ...scanned.objectDirectories]));
+      }
+    }
     const execute = bool(args, "execute");
     const retired = [];
     for (const verdict of verdicts.filter(verdict => verdict.retire)) {
@@ -6094,7 +6119,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
       catch (error) { if (!(error instanceof ResourceBusyError)) throw error; retired.push({ ...verdict, action: "busy" }); }
     }
     const parked = execute ? removeParkedMirrors(root) : 0;
-    print({ ok: true, execute, unusedDays, coldBorrowersKnown: coldBorrowed !== null, mirrors: verdicts.length, kept: verdicts.length - retired.length, retired, parkedLeftoversRemoved: parked }, true);
+    print({ ok: true, execute, unusedDays, coldBorrowersKnown: coldBorrowed !== null, hostScan, mirrors: verdicts.length, kept: verdicts.length - retired.length, retired, parkedLeftoversRemoved: parked }, true);
     return;
   }
   if (commandName === "source-status" || commandName === "job-status") {

@@ -11,7 +11,7 @@ import path from 'node:path';
 const scratch=mkdtempSync(path.join(tmpdir(),'mirror-retirement-'));
 process.env.AGENT_WORKSPACE_PACK_LOCK=path.join(scratch,'pack.lock');
 const {shareMirrorPacks,removeStaleTemporaryPacks}=await import('./mirror-pack-sharing.mjs');
-const {sourcesRewritten}=await import('./mirror-retirement.mjs');
+const {sourcesRewritten,classifyMirrors,lastActivityMs,hostMirrorBorrowers,markMirrorUse}=await import('./mirror-retirement.mjs');
 
 const entry=new URL('./main',import.meta.url).pathname;
 const sha=value=>createHash('sha256').update(value).digest('hex');
@@ -75,7 +75,7 @@ test('prune-mirrors removes a mirror whose source is gone or that sat unused, ke
  f.commit('a');run(f.source,'repack','-qad');
  const other=fixture();const otherCommit=other.commit('z');
  const state=path.join(f.root,'state','registry.sqlite3'),workspaces=path.join(f.root,'workspaces');mkdirSync(workspaces);
- const env={...process.env,PI_WORKSPACE_STATE:state,PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty',AGENT_WORKSPACE_COLD_OWNERS:path.join(f.root,'no-cold-tier')};
+ const env={...process.env,PI_WORKSPACE_STATE:state,PI_WORKSPACE_TEST_EXTERNAL_SAFETY:'empty',AGENT_WORKSPACE_COLD_OWNERS:path.join(f.root,'no-cold-tier'),AGENT_WORKSPACE_MIRROR_SCAN_ROOTS:f.root};
  const cli=(...args)=>spawnSync(entry,args,{env,encoding:'utf8',timeout:60000});
  const create=(name,repo,commit)=>{
   const end=Date.now()+45000;let result;
@@ -130,6 +130,62 @@ test('a mirror counts as rewritten only once its local source holds none of the 
  run(f.work,'checkout','-q','--orphan','fresh');f.commit('b');
  run(f.source,'-c','gc.reflogExpire=now','reflog','expire','--all');run(f.source,'gc','-q','--prune=now');
  assert.equal(sourcesRewritten(mirror,[f.source]),true);
+});
+
+// A bare mirror of `origin` whose every file looks `ageDays` old.
+function agedMirror(root,name,origin,ageDays){
+ const mirror=path.join(root,'mirrors',name);mkdirSync(path.dirname(mirror),{recursive:true});
+ run(root,'init','-q','--bare',mirror);run(mirror,'remote','add','origin',origin);
+ const when=(Date.now()-ageDays*86_400_000)/1000;
+ const walk=dir=>{for(const entry of readdirSync(dir,{withFileTypes:true})){const file=path.join(dir,entry.name);if(entry.isDirectory())walk(file);utimesSync(file,when,when);}utimesSync(dir,when,when);};
+ walk(mirror);return mirror;
+}
+const borrowFrom=(root,name,mirror)=>{const repo=path.join(root,name);run(root,'init','-q',repo);writeFileSync(path.join(repo,'.git','objects','info','alternates'),path.join(mirror,'objects')+'\n');return repo;};
+
+test('of two mirrors of one origin the idle extra one is retired, and the one a checkout borrows is kept',()=>{
+ const root=mkdtempSync(path.join(scratch,'dup-'));
+ const kept=agedMirror(root,'a.git','https://example.invalid/r.git',5),extra=agedMirror(root,'b.git','https://example.invalid/r.git',3);
+ const lone=agedMirror(root,'c.git','https://example.invalid/other.git',3);
+ const checkout=borrowFrom(root,'checkout',kept);
+ const verdicts=Object.fromEntries(classifyMirrors({mirrorRoot:path.join(root,'mirrors'),checkouts:[checkout],unusedDays:14}).map(v=>[path.basename(v.mirror),v]));
+ assert.equal(verdicts['a.git'].reason,'borrowed');
+ assert.deepEqual([verdicts['b.git'].retire,verdicts['b.git'].reason,verdicts['b.git'].duplicateOf],[true,'duplicate',kept]);
+ assert.equal(verdicts['c.git'].reason,'recent','a mirror with no twin stays until it is unused');
+ // An extra mirror used within the last day is left alone, so a create in flight keeps its mirror.
+ markMirrorUse(extra);
+ const again=classifyMirrors({mirrorRoot:path.join(root,'mirrors'),checkouts:[checkout],unusedDays:14}).find(v=>v.mirror===extra);
+ assert.equal(again.reason,'recent');
+ // With nothing borrowing either, the more recently used one is kept.
+ const both=classifyMirrors({mirrorRoot:path.join(root,'mirrors'),checkouts:[],unusedDays:14,now:Date.now()+2*86_400_000});
+ assert.deepEqual(both.filter(v=>v.origin==='https://example.invalid/r.git').map(v=>[path.basename(v.mirror),v.reason]),[['a.git','duplicate'],['b.git','recent']]);
+});
+
+test('relinking packs into a mirror is not use, and only the mirror create would read from counts as an unreleased workspace\'s',()=>{
+ const root=mkdtempSync(path.join(scratch,'idle-'));
+ const mirror=agedMirror(root,'m.git','https://example.invalid/m.git',30);
+ const before=lastActivityMs(mirror);
+ writeFileSync(path.join(mirror,'objects','pack','pack-x.keep'),'');
+ assert.equal(lastActivityMs(mirror),before,'share-mirror-packs writes do not refresh a mirror');
+ const classify=activeMirrors=>classifyMirrors({mirrorRoot:path.join(root,'mirrors'),checkouts:[],unusedDays:14,activeMirrors})[0];
+ // An unreleased workspace whose repository merely appears among this mirror's sources no longer pins it.
+ assert.equal(classify([path.join(root,'mirrors','other.git')]).reason,'unused');
+ assert.equal(classify([mirror]).reason,'active-workspace');
+});
+
+test('the host scan finds a checkout outside the usual folders that borrows a mirror, by absolute or relative alternates',()=>{
+ const root=mkdtempSync(path.join(scratch,'scan-'));
+ const mirrorRoot=path.join(root,'state','mirrors');
+ const a=agedMirror(path.join(root,'state'),'a.git','https://example.invalid/a.git',30),b=agedMirror(path.join(root,'state'),'b.git','https://example.invalid/b.git',30);
+ agedMirror(path.join(root,'state'),'c.git','https://example.invalid/c.git',30);
+ const far=path.join(root,'somewhere','deep','x');mkdirSync(far,{recursive:true});
+ const absolute=borrowFrom(far,'abs',a);
+ const relative=path.join(far,'rel');run(far,'init','-q',relative);
+ writeFileSync(path.join(relative,'.git','objects','info','alternates'),path.relative(path.join(relative,'.git','objects'),path.join(b,'objects'))+'\n');
+ const unrelated=path.join(far,'plain');run(far,'init','-q',unrelated);writeFileSync(path.join(unrelated,'.git','objects','info','alternates'),'');
+ const found=hostMirrorBorrowers([path.join(root,'somewhere')],mirrorRoot);
+ assert.deepEqual(found.gitDirectories,[path.join(absolute,'.git'),path.join(relative,'.git')].sort());
+ const verdicts=classifyMirrors({mirrorRoot,checkouts:[],coldBorrowed:new Set(found.objectDirectories),unusedDays:14});
+ assert.deepEqual(verdicts.map(v=>[path.basename(v.mirror),v.reason]),[['a.git','borrowed'],['b.git','borrowed'],['c.git','unused']]);
 });
 
 test.after(()=>rmSync(scratch,{recursive:true,force:true}));
