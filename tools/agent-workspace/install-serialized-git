@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stable physical entrypoint, independent of a disposable source checkout.
+set -eu
+[ "$(id -u)" = 0 ] || { echo 'Run install-serialized-git as root' >&2; exit 77; }
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Install atomically; an in-flight Git child keeps its existing lock descriptor.
+install -m 755 "$root/serialized-git" /usr/local/bin/.git.serialized-next
+mv -f /usr/local/bin/.git.serialized-next /usr/local/bin/git

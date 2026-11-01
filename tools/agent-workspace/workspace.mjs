@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {fileURLToPath} from 'node:url';
 import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache-symlink.mjs';
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {persistAllocationSample} from './allocation-sample-store.mjs';
@@ -258,7 +259,10 @@ function command(executable, commandArgs, options = {}) {
   if (sourcePreparationMode === "foreground" && remaining <= 0) throw new SourcePreparationRequired();
   if (remaining <= 0 && creationDeadline === undefined) inspectionTimeout("workspace inspection budget exhausted; no safety verdict was established");
   if (remaining <= 0) fail("creation budget exhausted; checkout retained; repeat the same create command to resume");
-  const launch = stdout => spawnSync(executable, commandArgs, {
+  // Use the same object-store writer lock as interactive Git, independently of PATH.
+  const gitWriter = executable === 'git' && commandArgs.some(arg => ['fetch', 'pull', 'gc', 'repack', 'prune', 'maintenance'].includes(arg));
+  const launch = stdout => spawnSync(gitWriter ? '/usr/bin/python3' : executable,
+    gitWriter ? [fileURLToPath(new URL('./serialized-git', import.meta.url)), ...commandArgs] : commandArgs, {
     // Git operands are resolved before launch; a released caller directory may vanish mid-command.
     cwd: options.cwd ?? homedir(),
     encoding: "utf8",

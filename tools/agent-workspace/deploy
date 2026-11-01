@@ -47,3 +47,8 @@ pi_stack_publish_release "$root" "$stage" "$dest" tools
 cmp "$root/tools/agent-workspace/workspace.mjs" "$dest/agent-workspace/workspace.mjs"
 node "$dest/agent-workspace/main" --help >/dev/null
 printf 'deployed agent-workspace %s over tools %s; no services or workspace records changed\n' "$commit" "$baseline"
+
+# Shared Git writers use one kernel-held object-store fence on this host.
+if [[ $dest == /srv/pi/tools ]]; then
+  pi_stack_as_root bash "$root/tools/agent-workspace/install-serialized-git"
+fi

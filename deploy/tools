@@ -106,3 +106,8 @@ elif [[ $skip_links != 1 ]]; then
 fi
 
 printf 'deployed Pi tools from %s to %s\n' "$commit" "$dest"
+
+# Shared Git writers use one kernel-held object-store fence on this host.
+if [[ $dest == /srv/pi/tools ]]; then
+  pi_stack_as_root bash "$root/tools/agent-workspace/install-serialized-git"
+fi

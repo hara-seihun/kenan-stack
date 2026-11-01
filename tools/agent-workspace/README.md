@@ -1219,3 +1219,22 @@ prove that an external effect never ran. Successful submissions are retained
 durably and are never replayed automatically.
 
 A native foreground `release` resolves its selected record and request before moving its own current directory to the home directory and submitting physical cleanup. This prevents the waiting administrative CLI from retaining its checkout by inherited current directory. Real shell current directories, executables and held descriptors remain protected; no cwd reference is waived.
+
+## Concurrent shared-checkout Git transport
+
+`sudo tools/agent-workspace/install-serialized-git` installs the source-owned
+`/usr/local/bin/git` entrypoint. Ordinary Git discovery then serializes fetch,
+pull and explicit object-store maintenance with a kernel lock in the canonical
+Git common directory, including linked worktrees. The descriptor remains held
+by the real Git process and its children, including after a wrapper caller dies.
+A 120-second contention deadline returns 75 without starting Git. Other commands
+and Git's original errors/exit status pass through. Fetch graph rewriting is
+not needed for transport and is disabled. Agent-workspace source also calls the
+same wrapper directly for these commands, independent of PATH. Explicit
+`/usr/bin/git` bypasses the entrypoint and should not be used for shared writers.
+
+This prevents overlapping cooperating fetches and maintenance; it does not claim
+that concurrency caused every historical missing object or repair existing
+corruption. Check existing connectivity before adopting a shared source. The
+November 1 missing-parent repair remains a separate observed recovery.
+Regression: `python3 tools/agent-workspace/serialized-git.test.py`.

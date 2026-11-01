@@ -1,0 +1,62 @@
+#!/usr/bin/python3
+"""Serialize object-store writers across Git worktrees; keep the lock across exec."""
+import errno
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+REAL_GIT = '/usr/bin/git'
+WRITERS = {'fetch', 'pull', 'gc', 'repack', 'prune', 'maintenance'}
+
+
+def invocation(args):
+    """Separate documented global options without interpreting command operands."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix'):
+            i += 2
+        elif arg.startswith('-'):
+            i += 1
+        else:
+            return args[:i], arg
+    return args, None
+
+
+def main():
+    args = sys.argv[1:]
+    prefix, command = invocation(args)
+    if command not in WRITERS:
+        os.execv(REAL_GIT, [REAL_GIT, *args])
+    probe = subprocess.run([REAL_GIT, *prefix, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if probe.returncode:
+        # Preserve Git's own diagnostic for invocations outside a repository.
+        os.execv(REAL_GIT, [REAL_GIT, *args])
+    common = os.fsdecode(probe.stdout.rstrip(b'\n'))
+    lock = os.path.join(common, 'agent-workspace-fetch.lock')
+    # Read-only flock works on Linux and permits root/owner sharing without chmod.
+    # O_NOFOLLOW prevents replacing the lock with an unrelated symlink target.
+    fd = os.open(lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            if time.monotonic() >= deadline:
+                print('git: shared object-store writer is busy; no Git command started (120 second lock budget)', file=sys.stderr)
+                return 75
+            time.sleep(0.05)
+    os.set_inheritable(fd, True)
+    # Disable fetch's optional graph rewriting; it is not part of object transport.
+    # The same lock also covers explicit maintenance and pull's internal fetch.
+    os.execv(REAL_GIT, [REAL_GIT, '-c', 'fetch.writeCommitGraph=false', *args])
+
+
+if __name__ == '__main__':
+    sys.exit(main())
