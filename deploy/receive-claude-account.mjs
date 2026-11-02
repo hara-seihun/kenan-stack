@@ -37,6 +37,16 @@ export async function receiveClaudeAccount({packet, alias, migration, store, wit
   return result;
 }
 
+export function readClaudeAdmission(store, alias, since) {
+  // An ended lease alone also describes a failed request. Require actual Opus
+  // output accounting on that same lease, a current meter, and the loaded grant.
+  const lease = store.db.prepare("SELECT l.id FROM lease l WHERE l.account_id=? AND l.started_at>=? AND l.ended_at IS NOT NULL AND EXISTS (SELECT 1 FROM usage_hour u WHERE u.run_id=l.id AND u.account_id=l.account_id AND u.model='claude-opus-5-5' AND u.component='output' AND u.tokens>0) ORDER BY l.started_at DESC LIMIT 1").get(alias,since);
+  const fresh = store.latestMeters(alias).some(m=>m.observed_at>=since);
+  const declared = JSON.parse(store.control('broker-grant:converge')??'null');
+  if (lease && fresh && declared?.accounts.includes(alias))
+    return {completed:true,meterFresh:true,granted:true,leaseId:lease.id};
+}
+
 export async function main(args) {
   const options = Object.fromEntries(Array.from({length:args.length/2},(_,i)=>[args[i*2],args[i*2+1]]));
   if (args.length !== 6 || !options['--packet'] || !options['--alias'] || !options['--migration'])
@@ -71,16 +81,12 @@ export async function main(args) {
         // sessions so the ordinary scheduler, not an account-pin bypass, proves admission.
         const start = Date.now();
         const accounts = JSON.parse(readFileSync(configPath)).listeners.find(l=>l.principal==='converge').accounts;
-        let last;
         for (let n=0; n<accounts.length*3; n++) {
           const response = await fetch('http://127.0.0.1:25100/v1/messages',{method:'POST',signal,headers:{'content-type':'application/json','anthropic-version':'2023-06-01','anthropic-beta':'claude-code-20250219,oauth-2025-04-20','x-claude-code-session-id':`receive-${packet.id}-${randomUUID()}`},body:JSON.stringify({model:'claude-opus-5-5',max_tokens:16,stream:true,system:[{type:'text',text:"You are Claude Code, Anthropic's official CLI for Claude."}],messages:[{role:'user',content:'Reply with exactly ok.'}]})});
           const text = await response.text();
           if (response.status !== 200 || !text.includes('"message_stop"')) throw Error(`Receive proof failed with HTTP ${response.status}`);
-          last = store.db.prepare('SELECT id,ended_at FROM lease WHERE account_id=? AND started_at>=? AND ended_at IS NOT NULL ORDER BY started_at DESC LIMIT 1').get(alias,start);
-          const meters = store.latestMeters(alias);
-          const declared = JSON.parse(store.control('broker-grant:converge')??'null');
-          if (last && meters.some(m=>m.observed_at>=start) && declared?.accounts.includes(alias))
-            return {completed:true,meterFresh:true,granted:true,leaseId:last.id};
+          const admitted = readClaudeAdmission(store,alias,start);
+          if (admitted) return admitted;
         }
         throw Error('Received account was not selected by the ordinary scheduler');
       }});

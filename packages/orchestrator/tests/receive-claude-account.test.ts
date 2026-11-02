@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 // @ts-expect-error The receiving CLI is a standalone Node deployment module.
-import { receiveClaudeAccount } from '../../../deploy/receive-claude-account.mjs';
+import { receiveClaudeAccount, readClaudeAdmission } from '../../../deploy/receive-claude-account.mjs';
+import { Store } from '../src/store.js';
 
 it('receives, grants and probes together; resume never overwrites a rotated token',async()=>{
   const auth: Record<string, any> = {}, events: string[] = [];
@@ -32,4 +33,21 @@ it('does not probe or declare success when grant publication fails',async()=>{
     grant:async()=>{throw Error('Grant write failed');},probe:async()=>{probed=true;}})).rejects.toThrow('Grant write failed');
   expect(probed).toBe(false);
   expect(auth['broker-receive:grant-failure'].phase).toBe('received');
+});
+
+it('does not mistake an ended failed lease or a sibling account for successful admission',()=>{
+  const store=Store.open(':memory:'),now=Date.now(),alias='anthropic-2';
+  try{
+    for(const id of [alias,'anthropic-6'])store.upsertAccount({id,provider:'anthropic'});
+    store.createLease('failed',alias,'interactive',undefined,now);store.endLease('failed');
+    store.recordMeter(alias,'anthropic-7d',68,now+86400_000,now);
+    store.setControl('broker-grant:converge',JSON.stringify({accounts:[alias]}));
+    expect(readClaudeAdmission(store,alias,now)).toBeUndefined();
+    store.recordUsage({accountId:'anthropic-6',runId:'failed',source:'interactive',hour:now,model:'claude-opus-5-5',component:'output',tokens:4});
+    expect(readClaudeAdmission(store,alias,now)).toBeUndefined();
+    store.recordUsage({accountId:alias,runId:'failed',source:'interactive',hour:now,model:'claude-opus-5-5',component:'output',tokens:4});
+    expect(readClaudeAdmission(store,alias,now)).toMatchObject({leaseId:'failed',granted:true,meterFresh:true,completed:true});
+    store.setControl('broker-grant:converge',JSON.stringify({accounts:[]}));
+    expect(readClaudeAdmission(store,alias,now)).toBeUndefined();
+  }finally{store.close();}
 });
