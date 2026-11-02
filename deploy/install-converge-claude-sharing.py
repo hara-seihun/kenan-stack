@@ -58,7 +58,8 @@ def main():
         raise RuntimeError('Install requires root')
     root = Path(__file__).resolve().parents[1]
     source = root / 'packages/orchestrator/src/auth/account-selection.ts'
-    for path in [source, Path(__file__)]:
+    receiver = root / 'deploy/receive-claude-account.mjs'
+    for path in [source, Path(__file__), receiver]:
         run(['git', '-c', f'safe.directory={root}', '-C', str(root), 'diff', '--exit-code', 'HEAD', '--', str(path)], stdout=subprocess.DEVNULL)
     commit = run(['git', '-c', f'safe.directory={root}', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
     base = Path('/opt/kenan-claude-broker')
@@ -66,6 +67,9 @@ def main():
     old = current.resolve()
     selector, broker = patch_sources((old/'src/auth/account-selection.ts').read_text(),source.read_text(),(old/'src/model-broker.ts').read_text())
     install_readiness()
+    receiving_path = base / 'deploy/receive-claude-account.mjs'
+    run(['install', '-o', 'root', '-g', 'root', '-m', '755', str(receiver), str(receiving_path)])
+    run(['ln', '-sfn', str(receiving_path), '/usr/local/sbin/kenan-claude-account-receive'])
     if selector == (old/'src/auth/account-selection.ts').read_text() and broker == (old/'src/model-broker.ts').read_text():
         run(['systemctl','start','kenan-claude-broker.service'])
         run(['systemctl','is-active','--quiet','kenan-claude-broker.service'])
