@@ -110,7 +110,7 @@ test('a worker that is not a child of the custodian manager cannot adopt its che
 
 test('a submitted foreground release reports the background outcome instead of exit 75',()=>{
   const clock=()=>{let t=0;return {now:()=>t,sleep:ms=>{t+=ms;}};};
-  const states=[{submissionState:'submitted',recordState:'active',pathExists:true},{submissionState:'submitted',recordState:'released',pathExists:false}];
+  const states=[{submissionState:'submitted',recordState:'active',pathExists:true},{submissionState:'submitted',recordState:'released',pathExists:false,settlementKind:'completed'}];
   let c=clock(),i=0;
   assert.equal(awaitSubmittedRelease({read:()=>states[Math.min(i++,1)],...c}).kind,'completed');
   c=clock();
@@ -133,6 +133,10 @@ test('the foreground observation of a submitted release reports completion, a ce
   const ceased=workspaceTesting.finishSubmittedRelease(f.db,f.record,submitted,{...fast,observeUnit:()=>({ceased:true})});
   assert.equal(ceased.action,'release-retained');assert.equal(ceased.ok,false);assert.match(ceased.note,/\/log\/x/);
   fs.rmSync(f.source,{recursive:true,force:true});f.db.prepare("UPDATE workspace SET state='released' WHERE id=?").run(f.record.id);
+  const uncommitted=workspaceTesting.finishSubmittedRelease(f.db,f.record,submitted,{budgetMs:0,observeUnit:()=>({ceased:false})});
+  assert.equal(uncommitted.completed,false);assert.equal(uncommitted.action,'release-submitted');
+  f.db.exec('CREATE TABLE IF NOT EXISTS workspace_release_attempt(sequence INTEGER PRIMARY KEY,workspace_id TEXT,receipt_json TEXT)');
+  f.db.prepare('INSERT INTO workspace_release_attempt(workspace_id,receipt_json) VALUES(?,?)').run(f.record.id,JSON.stringify({kind:'completed'}));
   const done=workspaceTesting.finishSubmittedRelease(f.db,f.record,submitted,{...fast,observeUnit:()=>({ceased:false})});
   assert.equal(done.action,'release-completed');assert.equal(done.completed,true);
 }));

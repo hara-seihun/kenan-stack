@@ -6063,12 +6063,12 @@ function finishSubmittedRelease(database,record,submitted,{budgetMs=RELEASE_AWAI
     // Unit first, then the record: a unit seen ceased has already written everything it will write.
     const unitCeased=row?.state==='submitted'?observeUnit(row).ceased===true:false;
     const current=database.prepare('SELECT state FROM workspace WHERE id=?').get(record.id);
-    return {recordState:current?.state,pathExists:existsSync(record.path),submissionState:row?.state,unitCeased,terminal:row?.terminal_json?JSON.parse(row.terminal_json):null};
+    return {recordState:current?.state,pathExists:existsSync(record.path),submissionState:row?.state,unitCeased,settlementKind:releaseSettlement(database,record.id).kind,terminal:row?.terminal_json?JSON.parse(row.terminal_json):null};
   }catch{return {submissionState:'submitted'};}}});
   const settlement=releaseSettlement(database,record.id);
   if(outcome.kind==='completed')return {...submitted,action:'release-completed',completed:true,state:outcome.observed.submissionState,releaseSettlement:settlement};
   if(outcome.kind==='terminal')return {...submitted,ok:false,action:'release-retained',completed:false,state:'terminal-known',terminal:outcome.observed.terminal,releaseSettlement:settlement,
-    note:`The background release ended without removing the checkout. Read releaseSettlement and the unit log ${submitted.launch?.log??''} for the reason.`};
+    note:`The background release ended without a verified completed removal and settlement. Read releaseSettlement and the unit log ${submitted.launch?.log??''} for the reason.`};
   return {...submitted,note:`The release is still running in the background unit (accepted work, not a failure). Its completion raises host event ${submitted.launch?.event??'job:<agent>:'+submitted.unitName}; agent-workspace status --id ${record.id} --json shows the outcome.`};
 }
 
