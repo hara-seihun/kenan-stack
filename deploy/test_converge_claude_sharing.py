@@ -17,6 +17,12 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(sharing.patch_sources(desired, desired, broker), (selector, broker))
         self.assertIn('?? randomUUID());', broker)
 
+    def test_readiness_uses_the_firewall_authorized_identity_not_the_broker_uid(self):
+        dropin = sharing.readiness_dropin()
+        self.assertEqual(dropin.splitlines(), ['[Service]', 'ExecStartPost=', 'ExecStartPost=+/usr/bin/python3 /opt/kenan-claude-broker/deploy/wait-ready.py 25121 60'])
+        self.assertNotIn('User=', dropin)
+        self.assertNotIn('firewall', dropin)
+
     def test_conflicting_source_and_duplicate_anchors_are_not_replaced(self):
         with self.assertRaisesRegex(RuntimeError, 'selector changed'):
             sharing.patch_sources('different-installed-source', 'desired', sharing.OLD)

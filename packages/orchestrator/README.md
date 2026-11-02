@@ -284,3 +284,11 @@ expression, tests the emitted selector, writes an immutable manifest, switches
 the runtime link, and gracefully drains active streams before restart. It prints
 a rollback command and restores the old runtime if activation fails. Ordinary
 Pi Stack releases carry the source changes directly.
+
+The narrow installer also repairs the readiness probe's execution identity. The
+broker firewall accepts only root and the outer broker's user; a socket probe
+inheriting the Claude broker's unprivileged user was rejected even when the port
+was listening. Only the bounded readiness probe now runs as root through a
+systemd `ExecStartPost=+` drop-in. The broker remains unprivileged and the firewall
+does not gain any new allowed users. This repair is safe to repeat without
+replacing or restarting an already patched, healthy runtime.

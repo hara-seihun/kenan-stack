@@ -34,6 +34,25 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, timeout=240, **kwargs)
 
 
+def readiness_dropin():
+    # The firewall deliberately permits only root and the outer broker's UID.
+    # ExecStartPost otherwise inherits the unprivileged Claude broker UID and
+    # cannot connect to its own port, turning a healthy restart into a loop.
+    # Elevate only the bounded socket probe, not the broker or its firewall.
+    return '[Service]\nExecStartPost=\nExecStartPost=+/usr/bin/python3 /opt/kenan-claude-broker/deploy/wait-ready.py 25121 60\n'
+
+
+def install_readiness():
+    directory = Path('/etc/systemd/system/kenan-claude-broker.service.d')
+    directory.mkdir(mode=0o755, exist_ok=True)
+    path = directory / 'readiness.conf'
+    temporary = directory / f'.readiness-{os.getpid()}'
+    temporary.write_text(readiness_dropin())
+    temporary.chmod(0o644)
+    os.replace(temporary, path)
+    run(['systemctl', 'daemon-reload'])
+
+
 def main():
     if os.getuid() != 0:
         raise RuntimeError('Install requires root')
@@ -46,6 +65,12 @@ def main():
     current = base / 'current'
     old = current.resolve()
     selector, broker = patch_sources((old/'src/auth/account-selection.ts').read_text(),source.read_text(),(old/'src/model-broker.ts').read_text())
+    install_readiness()
+    if selector == (old/'src/auth/account-selection.ts').read_text() and broker == (old/'src/model-broker.ts').read_text():
+        run(['systemctl','start','kenan-claude-broker.service'])
+        run(['systemctl','is-active','--quiet','kenan-claude-broker.service'])
+        print(json.dumps({'sourceCommit':commit,'release':str(old),'runtimeUnchanged':True,'readinessRepaired':True}))
+        return
     dest = base / ('sharing-' + commit[:12])
     if dest.exists():
         raise RuntimeError('Release already exists; inspect its manifest before activating it again')
