@@ -165,12 +165,15 @@ export function terminalBackground(log){
   return Number.isInteger(value.exitCode)&&typeof value.endedAt==='string'&&['success','failed','oom','stopped'].includes(value.outcome)?value:null;
  }catch{return null;}finally{if(fd!==undefined)fs.closeSync(fd);}
 }
-export function backgroundStatus(spec,binding,uid,{execute=run}={}){
+export function backgroundStatus(spec,binding,uid,{execute=run,root=BACKGROUND_ROOT}={}){
+ let saved;try{saved=JSON.parse(fs.readFileSync(`${root}/${spec.unit}.json`,'utf8'));}catch{}
+ if(saved&&(saved.uid!==uid||saved.channel!==binding.channel))return {ok:false,code:'background_owner_mismatch',retry:false};
+ const receipt={unit:spec.unit,log:saved?.log??null};
  const observed=observeBackground(spec.unit,{execute});
- if(!observed)return {ok:true,unit:spec.unit,state:'unknown'};
- if(observed.LoadState==='not-found')return {ok:true,unit:spec.unit,state:'inactive'};
+ if(!observed)return {ok:true,...receipt,state:'unknown'};
+ if(observed.LoadState==='not-found')return {ok:true,...receipt,state:'inactive'};
  if(!sameOwner(ownerOf(observed),binding,uid))return {ok:false,code:'background_owner_mismatch',retry:false};
- return {ok:true,unit:spec.unit,state:ACTIVE.has(observed.ActiveState)&&observed.SubState!=='exited'?'active':'inactive'};
+ return {ok:true,...receipt,state:ACTIVE.has(observed.ActiveState)&&observed.SubState!=='exited'?'active':'inactive'};
 }
 // Reservations survive process death; an absent unit after a lost submission is
 // NOT proof of non-execution. Different commands require a real terminal marker

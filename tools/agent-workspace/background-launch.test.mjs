@@ -312,3 +312,10 @@ test('status accepts a non-executable control request while old launchers fail c
  assert.equal(controlSpec(request,binding,1000,1000).unit,spec.unit);assert.ok(serveActions.includes('status'));
  assert.throws(()=>controlSpec({...request,agentId:'foreign'},binding,1000,1000),/owner_mismatch/);
 });
+
+test('native status returns the owned original receipt, never another worker log glob',()=>withRoot(root=>{
+ fs.writeFileSync(path.join(root,spec.unit+'.json'),JSON.stringify({uid:1000,channel:binding.channel,log:'/original/exact.log'}));
+ const execute=()=>({status:0,stdout:'LoadState=not-found\n'});
+ assert.equal(backgroundStatus(spec,binding,1000,{root,execute}).log,'/original/exact.log');
+ assert.equal(backgroundStatus(spec,binding,1001,{root,execute}).code,'background_owner_mismatch');
+}));
