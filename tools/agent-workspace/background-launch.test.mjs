@@ -60,7 +60,7 @@ test('a lost submission reply is resolved by the unit and the tool call that cre
  const lost={status:null,error:{code:'ETIMEDOUT'}};
  assert.equal(settleBackground(lost,{...properties,LoadState:'loaded'},spec).ok,true);
  const absent=settleBackground(lost,{LoadState:'not-found'},spec);
- assert.equal(absent.code,'background_launch_outcome_unknown');assert.equal(absent.retry,true);assert.match(absent.detail,/same kenan-bg command again/);
+ assert.equal(absent.code,'background_launch_outcome_unknown');assert.equal(absent.retry,false);assert.match(absent.detail,/never permits replay/);
  assert.equal(settleBackground(lost,{...properties,LoadState:'loaded',Description:'foreign'},spec).code,'background_owner_mismatch');
  const earlier='kenan-tool-call:'+JSON.stringify({version:1,...binding,callId:'earlier-call',background:true,uid:1000});
  const r=settleBackground(lost,{...properties,LoadState:'loaded',Description:earlier},spec);assert.equal(r.code,'background_running');assert.equal(r.createdBy,'earlier-call');
@@ -78,7 +78,7 @@ test('the same command under an ended name returns the original log without exec
   const retry={...original,argv:[...original.argv]};retry.argv[3]='/tmp/new.log';
   const b=launchOnce(retry,{...binding,callId:'later-call'},1000,spec,()=>[],{root,execute});
   assert.equal(b.ok,true);assert.equal(b.reused,true);assert.equal(b.log,'/tmp/first.log');assert.equal(starts,1);
-  const other=launchOnce({...retry,cwd:'/different'},binding,1000,spec,()=>[],{root,execute});assert.equal(other.ok,true);assert.equal(other.log,'/tmp/new.log');assert.equal(starts,2);
+  const other=launchOnce({...retry,cwd:'/different'},binding,1000,spec,()=>[],{root,execute});assert.equal(other.code,'background_name_conflict');assert.equal(other.original.log,'/tmp/first.log');assert.equal(starts,1);
  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 // A fake systemd: systemd-run outcomes are scripted, and a created unit stays loaded with the creating call's description.
@@ -95,19 +95,18 @@ function fakeSystemd(outcomes){
 const wrapped=(log,cmd='/bin/true')=>({...input,argv:['/usr/local/bin/kenan-bg','--run','fixture',log,cmd],after:'/usr/local/bin/kenan-bg --after fixture '+log});
 const lost={reply:{status:null,error:{code:'ETIMEDOUT'}}};
 const withRoot=f=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'background-'));try{f(root);}finally{fs.rmSync(root,{recursive:true,force:true});}};
-test('a caller cut off before systemd answered: the same command starts the job exactly once, with the original log',()=>withRoot(root=>{
+test('a caller cut off before systemd answered remains uncertain and cannot replay from absence alone',()=>withRoot(root=>{
  const sd=fakeSystemd([lost]);
  assert.equal(launchOnce(wrapped('/tmp/first.log'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute,exists:()=>false}).code,'background_launch_outcome_unknown');
  const r=launchOnce(wrapped('/tmp/second.log'),{...binding,callId:'retry-call'},1000,spec,x=>[...x.argv,x.after],{root,execute:sd.execute,exists:()=>false});
- assert.equal(r.ok,true);assert.equal(r.log,'/tmp/first.log');assert.equal(sd.starts,2);
- assert.deepEqual(sd.argv[1].slice(3),['/tmp/first.log','/bin/true','/usr/local/bin/kenan-bg --after fixture /tmp/first.log']);
+ assert.equal(r.code,'background_launch_outcome_unknown');assert.equal(r.original.log,'/tmp/first.log');assert.equal(sd.starts,1);
 }));
 test('a cut-off launch whose job did start is reported, not run again',()=>withRoot(root=>{
  const sd=fakeSystemd([lost]);
  launchOnce(wrapped('/tmp/first.log'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
  // Started and already finished: its unit is collected but the wrapper created its log.
  const r=launchOnce(wrapped('/tmp/second.log'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute,exists:f=>f==='/tmp/first.log'});
- assert.equal(r.ok,true);assert.equal(r.reused,true);assert.equal(r.state,'ended');assert.equal(sd.starts,1);
+ assert.equal(r.code,'background_launch_outcome_unknown');assert.equal(sd.starts,1);
  // Started and still running.
  const sd2=fakeSystemd([{...lost,unit:'active'}]);
  withRoot(root2=>{
@@ -120,21 +119,28 @@ test('an earlier cut-off submission that lands after its retry is the same job, 
  const earlier='kenan-tool-call:'+JSON.stringify({version:1,...binding,background:true,uid:1000});
  const sd=fakeSystemd([lost,{reply:{status:1,stderr:'Unit already exists'},unit:'active',description:earlier}]);
  launchOnce(wrapped('/tmp/first.log'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute,exists:()=>false});
+ sd.units.set(spec.unit,{ActiveState:'active',Description:earlier});
  const laterSpec=backgroundSpec(input,{...binding,callId:'retry-call'},1000,1000);
  const r=launchOnce(wrapped('/tmp/second.log'),{...binding,callId:'retry-call'},1000,laterSpec,x=>x.argv,{root,execute:sd.execute,exists:()=>false});
  assert.equal(r.ok,true);assert.equal(r.state,'running');assert.equal(r.log,'/tmp/first.log');
 }));
-test('a name is free again for a different command once its job ended, and busy while it runs',()=>withRoot(root=>{
- const sd=fakeSystemd([]);
- assert.equal(launchOnce(wrapped('/tmp/a.log','/bin/true'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute}).ok,true);
- const busy=launchOnce(wrapped('/tmp/b.log','/bin/false'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
- assert.equal(busy.code,'background_running');assert.equal(sd.starts,1);
+test('terminal reconciliation permits different effects and keeps historical retries idempotent',()=>withRoot(root=>{
+ const sd=fakeSystemd([]),first=path.join(root,'a.log'),second=path.join(root,'b.log');
+ assert.equal(launchOnce(wrapped(first),binding,1000,spec,x=>x.argv,{root,execute:sd.execute}).ok,true);
+ const busy=launchOnce(wrapped(second,'/bin/false'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
+ assert.equal(busy.code,'background_running');assert.equal(busy.original.log,first);assert.equal(sd.starts,1);
  sd.units.delete(spec.unit);
- const fresh=launchOnce(wrapped('/tmp/b.log','/bin/false'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
- assert.equal(fresh.ok,true);assert.equal(fresh.log,'/tmp/b.log');assert.equal(sd.starts,2);
- // A retained failed unit is reset so the name can be used again.
+ const missing=launchOnce(wrapped(second,'/bin/false'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
+ assert.equal(missing.code,'background_name_conflict');assert.equal(sd.starts,1);
+ fs.writeFileSync(first,'[kenan-bg] end '+JSON.stringify({exitCode:0,outcome:'success',endedAt:new Date().toISOString()})+'\n');
+ const fresh=launchOnce(wrapped(second,'/bin/false'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
+ assert.equal(fresh.ok,true);assert.equal(fresh.log,second);assert.equal(sd.starts,2);
+ const historic=launchOnce(wrapped('/irrelevant/log'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute});
+ assert.equal(historic.reused,true);assert.equal(historic.state,'ended');assert.equal(historic.log,first);assert.equal(sd.starts,2);
+ // A retained failed unit is not collected and is not automatically reset to authorize reuse.
  sd.units.set(spec.unit,{ActiveState:'failed',Description:spec.description});
- assert.equal(launchOnce(wrapped('/tmp/c.log','/bin/echo'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute}).ok,true);assert.equal(sd.starts,3);
+ fs.writeFileSync(second,'[kenan-bg] end '+JSON.stringify({exitCode:1,outcome:'failed',endedAt:new Date().toISOString()})+'\n');
+ assert.equal(launchOnce(wrapped('/tmp/c.log','/bin/echo'),binding,1000,spec,x=>x.argv,{root,execute:sd.execute}).code,'background_name_conflict');assert.equal(sd.starts,2);
 }));
 
 test('the inherited flock stays held until the parent closes its descriptor',()=>{
@@ -283,4 +289,26 @@ test('a marked job process in a control group shared with others is killed alone
  const marker=jobMarker('kenan-bg-x.service','/l');s.env[20]=s.env[21]=marker;
  const r=stopBackground('kenan-bg-x.service',{marker,execute:s.execute,proc:s.proc,...s.clock});
  assert.equal(r.state,'stopped');assert.ok(s.alive.has(99));assert.ok(!s.log.some(l=>l.startsWith('cgroup.kill')));
+});
+
+import {backgroundStatus,terminalBackground} from './background-launch.mjs';
+test('native status uses one bounded query and uncertainty never becomes inactive',()=>{
+ let calls=0;
+ const execute=(cmd,args,opts)=>{calls++;assert.equal(opts.timeout,2000);assert.equal(args[1],'show');return {status:0,stdout:'LoadState=loaded\nDescription='+spec.description+'\nActiveState=active\nSubState=running\n'};};
+ assert.equal(backgroundStatus(spec,binding,1000,{execute}).state,'active');assert.equal(calls,1);
+ assert.equal(backgroundStatus(spec,binding,1000,{execute:()=>({error:{code:'ETIMEDOUT'}})}).state,'unknown');
+ assert.equal(backgroundStatus(spec,binding,1000,{execute:()=>({status:0,stdout:'LoadState=not-found\n'})}).state,'inactive');
+});
+test('terminal log lookup reads a bounded tail even for a huge sparse log',()=>withRoot(root=>{
+ const log=path.join(root,'huge.log'),fd=fs.openSync(log,'w');
+ fs.ftruncateSync(fd,2**30);const value={exitCode:0,outcome:'success',endedAt:'2026-11-02T21:00:00Z'};
+ fs.writeSync(fd,'\n[kenan-bg] end '+JSON.stringify(value)+'\n',2**30);fs.closeSync(fd);
+ assert.deepEqual(terminalBackground(log),value);assert.equal(terminalBackground(log+'.absent'),null);
+}));
+
+import {controlSpec,serveActions} from './background-launch.mjs';
+test('status accepts a non-executable control request while old launchers fail closed',()=>{
+ const request={...input,argv:[],after:''};assert.throws(()=>backgroundSpec(request,binding,1000,1000),/invalid_launch/);
+ assert.equal(controlSpec(request,binding,1000,1000).unit,spec.unit);assert.ok(serveActions.includes('status'));
+ assert.throws(()=>controlSpec({...request,agentId:'foreign'},binding,1000,1000),/owner_mismatch/);
 });

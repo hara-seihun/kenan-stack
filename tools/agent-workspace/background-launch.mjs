@@ -36,7 +36,7 @@ export function launchIdentity(input){
  return crypto.createHash('sha256').update(JSON.stringify({cwd:input.cwd,argv,umask:input.umask})).digest('hex');
 }
 export function observeBackground(unit,{execute=run}={}){
- const r=execute('/usr/bin/systemctl',['--system','show',unit,'--property=LoadState,Description,ActiveState,SubState,Result,ExecMainStatus'],{timeout:10000});
+ const r=execute('/usr/bin/systemctl',['--system','show',unit,'--property=LoadState,Description,ActiveState,SubState,Result,ExecMainStatus,MainPID,ControlGroup'],{timeout:2000});
  if(r.error||r.signal||!r.stdout?.includes('LoadState='))return null;
  return Object.fromEntries(r.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
 }
@@ -52,14 +52,14 @@ export function settleBackground(result,observed,spec){
   const owner=ownerOf(observed);
   if(!sameOwner(owner,wanted??{},wanted?.uid))return {ok:false,code:'background_owner_mismatch',retry:false};
   if(owner.callId!==wanted.callId)return {ok:false,code:'background_running',retry:false,createdBy:owner.callId,detail:'An earlier submission under this name created the unit.'};
-  if(observed.ActiveState==='failed')return {ok:false,code:'background_launch_failed',retry:true,detail:`The unit failed: ${observed.Result}; exec status ${observed.ExecMainStatus}.`};
+  if(observed.ActiveState==='failed')return {ok:false,code:'background_launch_failed',retry:false,detail:`The unit failed: ${observed.Result}; exec status ${observed.ExecMainStatus}.`};
   // Ours and loaded: it runs, or is starting and will run or fail; either way its end event is raised by ExecStopPost.
   return {ok:true,state:observed.ActiveState==='activating'?'starting':undefined};
  }
  if(result&&result.status!==null&&!result.error&&!result.signal)return {ok:false,code:'background_launch_refused',retry:true,detail:(result.stderr||'The system manager rejected unit creation.').trim().slice(0,4000)};
  // No reply and no unit yet. The reservation stays pending; the next identical launch reconciles it (finds the unit or
  // the job's log if it started, or submits it once if it never did).
- return {ok:false,code:'background_launch_outcome_unknown',retry:true,detail:`systemd gave no answer (${result?.error?.code||result?.signal||'no reply'}) and no unit exists yet. Run the same kenan-bg command again: it reports the job if it started, or starts it exactly once if it never did.`};
+ return {ok:false,code:'background_launch_outcome_unknown',retry:false,detail:`systemd gave no answer (${result?.error?.code||result?.signal||'no reply'}); reconcile the original unit and log. Absence alone never permits replay.`};
 }
 // kenan-bg stop. SIGTERM can't interrupt a long synchronous computation (a CPU-bound node --test child kept 2.8 GB
 // after a stop, 2026-10-31), and cpu-slot runs each job in its own scope outside this unit, where stopping the unit never
@@ -151,63 +151,79 @@ export function withLog(input,log){
  const argv=[...input.argv],old=argv[3];argv[3]=log;
  return {...input,argv,after:input.after.endsWith(' '+old)?input.after.slice(0,-old.length)+log:input.after};
 }
-// Only the leaf is created: a missing parent is an error, never a tree a root process invents (2026-10-28: creating
-// /var/lib/pi-stack recursively as root 0700 made every model call fail for 3.5 hours).
-// A name is reserved while its job runs. The reservation holds a pending state from just before systemd-run until its
-// reply; holding the lock proves the submitting process is gone, so a pending record is settled from what exists: the
-// unit (attributed by the tool call in its description) or the job's log (the wrapper creates it when the job starts).
-// Neither means the job never started, and it is submitted once more with its original log.
-export function launchOnce(input,binding,uid,spec,argsFor,{root=BACKGROUND_ROOT,execute=run,exists=fs.existsSync}={}){
+// Read only the tail: deployment logs can be gigabytes. Absence or a malformed
+// marker is uncertainty, never authority to reuse a name for different effects.
+export function terminalBackground(log){
+ if(!log)return null;
+ let fd;try{
+  fd=fs.openSync(log,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+  const stat=fs.fstatSync(fd);if(!stat.isFile())return null;
+  const size=Math.min(stat.size,65536),buf=Buffer.alloc(size);
+  fs.readSync(fd,buf,0,size,stat.size-size);
+  const lines=buf.toString('utf8').split('\n').filter(x=>x.startsWith('[kenan-bg] end '));
+  const value=JSON.parse(lines.at(-1)?.slice('[kenan-bg] end '.length));
+  return Number.isInteger(value.exitCode)&&typeof value.endedAt==='string'&&['success','failed','oom','stopped'].includes(value.outcome)?value:null;
+ }catch{return null;}finally{if(fd!==undefined)fs.closeSync(fd);}
+}
+export function backgroundStatus(spec,binding,uid,{execute=run}={}){
+ const observed=observeBackground(spec.unit,{execute});
+ if(!observed)return {ok:true,unit:spec.unit,state:'unknown'};
+ if(observed.LoadState==='not-found')return {ok:true,unit:spec.unit,state:'inactive'};
+ if(!sameOwner(ownerOf(observed),binding,uid))return {ok:false,code:'background_owner_mismatch',retry:false};
+ return {ok:true,unit:spec.unit,state:ACTIVE.has(observed.ActiveState)&&observed.SubState!=='exited'?'active':'inactive'};
+}
+// Reservations survive process death; an absent unit after a lost submission is
+// NOT proof of non-execution. Different commands require a real terminal marker
+// and a collected unit. Historical identities remain idempotent after name reuse.
+export function launchOnce(input,binding,uid,spec,argsFor,{root=BACKGROUND_ROOT,execute=run}={}){
  try{fs.mkdirSync(root,{mode:0o700});}catch(error){
   if(error.code==='ENOENT')return {ok:false,code:'background_state_parent_missing',retry:false,detail:`${path.dirname(root)} must exist before background launches can be recorded.`};
   if(error.code!=='EEXIST')throw error;
  }
  const key=spec.unit,file=`${root}/${key}.json`,fd=fs.openSync(`${root}/${key}.lock`,'a',0o600);
  try{
-  // flock locks the inherited open file description; our fd retains it after
-  // flock exits. Process death releases it automatically, without stale locks.
-  const lock=execute('/usr/bin/flock',['--exclusive','--wait','10','3'],{stdio:['ignore','pipe','pipe',fd],timeout:11000});
-  if(lock.status!==0||lock.error)return {ok:false,code:'background_launch_busy',retry:true,detail:'Another launch of this name is in progress; run the command again.'};
+  const lock=execute('/usr/bin/flock',['--exclusive','--wait','2','3'],{stdio:['ignore','pipe','pipe',fd],timeout:2500});
+  if(lock.status!==0||lock.error)return {ok:false,code:'background_launch_busy',retry:true,detail:'Another launch of this name is in progress; inspect its status.'};
   const identity=launchIdentity(input);let saved;
   try{saved=JSON.parse(fs.readFileSync(file,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
-  // Rename keeps a reader from ever seeing half a record. No fsync: the record only has to outlive a killed caller (the
-  // page cache does), and after a host crash no unit survives anyway. Four fsyncs cost up to 2.5 s on the busy RAID
-  // and pushed a launch past its caller's 10 s timeout (2026-10-31).
   const write=value=>{const tmp=file+'.tmp';fs.writeFileSync(tmp,JSON.stringify(value)+'\n',{mode:0o600});fs.renameSync(tmp,file);};
   const accept=(record,extra)=>{const response={ok:true,unit:spec.unit,log:record.log,identity:binding,...extra};write({...record,state:'accepted',response});return response;};
-  let launch=input,loaded=false;
+  let history=saved?.history??[];
   if(saved){
-   if(saved.channel!==binding.channel||saved.uid!==uid)return {ok:false,code:'background_name_conflict',retry:false,detail:'This name belongs to another owner.'};
+   const original={unit:spec.unit,log:saved.log,identity:saved.identity,channel:saved.channel,uid:saved.uid,state:saved.state,response:saved.response??null};
+   const conflict=detail=>({ok:false,code:'background_name_conflict',retry:false,detail,original});
+   if(saved.channel!==binding.channel||saved.uid!==uid)return conflict('This name belongs to another owner.');
+   const prior=history.find(x=>x.identity===identity);
+   if(prior)return {...prior.response,ok:true,reused:true,state:'ended'};
    const observed=observeBackground(spec.unit,{execute});
-   if(observed===null)return {ok:false,code:'background_launch_busy',retry:true,detail:'systemd did not answer the unit query; run the command again.'};
-   loaded=observed.LoadState!=='not-found';
-   if(loaded&&!sameOwner(ownerOf(observed),binding,uid))return {ok:false,code:'background_owner_mismatch',retry:false};
+   if(observed===null)return {...conflict('systemd did not answer; the original invocation remains uncertain.'),code:'background_launch_outcome_unknown'};
+   const loaded=observed.LoadState!=='not-found';
+   if(loaded&&!sameOwner(ownerOf(observed),binding,uid))return {...conflict('The retained unit has another owner.'),code:'background_owner_mismatch'};
    const same=saved.identity===identity;
    if(loaded&&ACTIVE.has(observed.ActiveState)){
-    if(!same)return {ok:false,code:'background_running',retry:false,detail:`A different command is still running under this name (log ${saved.log}). Pick another NAME, or kenan-bg stop it first.`};
+    if(!same)return {...conflict('A different command is still running under this name.'),code:'background_running'};
     return accept(saved,{reused:true,state:'running'});
    }
-   const ran=saved.state==='accepted'||(saved.state==='pending'&&(loaded||saved.log!=null&&exists(saved.log)));
-   // The same command under the same name has already run: a retry after a lost reply must not run it twice.
-   if(same&&ran)return accept(saved,{reused:true,state:'ended'});
-   if(same&&saved.state==='pending')launch=withLog(input,saved.log);
+   const terminal=terminalBackground(saved.log);
+   if(same&&(saved.state==='accepted'||terminal))return accept(saved,{reused:true,state:'ended'});
+   if(saved.state==='pending'&&!terminal)return {...conflict('The original submission has no terminal receipt; absence alone cannot authorize replay.'),code:'background_launch_outcome_unknown'};
+   if(!same){
+    if(!terminal||loaded)return conflict('A different command may reuse this name only after its terminal log and collected unit are reconciled.');
+    // Marked escaped children must also have ended; do not stop them here.
+    if(procFs.marked(jobMarker(spec.unit,saved.log)).some(pid=>procFs.start(pid)!==null))return {...conflict('Processes from the original job still exist outside its unit.'),code:'background_running'};
+    history=[...history,{identity:saved.identity,response:{...saved.response,ok:true,unit:spec.unit,log:saved.log,state:'ended'},terminal}];
+   }
   }
-  const log=launch.argv[1]==='--run'?launch.argv[3]:null;
-  const record={identity,channel:binding.channel,uid,callId:binding.callId,log,state:'pending'};
-  // A retained failed unit of an earlier job holds the name until it is reset.
-  if(loaded)execute('/usr/bin/systemctl',['--system','reset-failed',spec.unit],{timeout:10000});
+  const log=input.argv[1]==='--run'?input.argv[3]:null;
+  const record={identity,channel:binding.channel,uid,callId:binding.callId,log,state:'pending',history};
   write(record);
-  const result=submitBackground('/usr/bin/systemd-run',argsFor(launch),{execute});
-  // systemd-run's own success means it created this exact unit (an existing name is a refusal), so only an unclear or
-  // missing reply needs the extra manager query: under a CPU-starved agent slice each process costs up to a second.
+  const result=submitBackground('/usr/bin/systemd-run',argsFor(input),{execute});
   const observed=result?.status===0&&!result.error?null:observeBackground(spec.unit,{execute});
   const verdict=settleBackground(result,observed,spec);
   if(verdict.ok)return accept(record,verdict.state?{state:verdict.state}:{});
-  // An earlier queued submission of this same command won the name: that is this job.
-  if(verdict.code==='background_running'&&saved?.identity===identity&&verdict.createdBy===saved.callId)return accept({...record,callId:saved.callId},{reused:true,state:'running'});
   const response={...verdict,unit:spec.unit,log,identity:binding};
-  if(verdict.code==='background_running')response.detail='A different command started under this name first. Pick another NAME, or kenan-bg stop it first.';
-  if(verdict.code!=='background_launch_outcome_unknown')write({...record,state:'refused',response});
+  // A lost reply never becomes permission for a fresh effect on retry.
+  if(verdict.code==='background_launch_refused')write({...record,state:'refused',response});
   return response;
  }finally{fs.closeSync(fd);}
 }
@@ -227,6 +243,10 @@ function caller(pid){
 }
 // serve: one launch per connection, run by systemd in system.slice. Under a CPU-starved agent slice, starting sudo and
 // node inside the caller's own tool scope took up to 8 s (2026-10-31); the caller now only starts socat.
+export const serveActions=['launch','status'];
+export function controlSpec(input,binding,uid,gid){
+ return backgroundSpec({...input,argv:['/usr/bin/true'],after:'/usr/bin/true'},binding,uid,gid);
+}
 export function serve(instance){
  let response;
  try{
@@ -234,8 +254,9 @@ export function serve(instance){
   const peer=socketPeer(instance);
   const binding=caller(peer.pid);
   const input=JSON.parse(fs.readFileSync(0,'utf8'));
-  const spec=backgroundSpec(input,binding,peer.uid,gidOf(peer.pid));
-  response=launchOnce(input,binding,peer.uid,spec,argsFor(spec,peer.uid,gidOf(peer.pid)));
+  if(input.action&&!serveActions.includes(input.action))throw Error('background_invalid_command');
+  const spec=(input.action==='status'?controlSpec:backgroundSpec)(input,binding,peer.uid,gidOf(peer.pid));
+  response=input.action==='status'?backgroundStatus(spec,binding,peer.uid):launchOnce(input,binding,peer.uid,spec,argsFor(spec,peer.uid,gidOf(peer.pid)));
   if(!response.ok)response={ok:false,error:response};
  }catch(error){response={ok:false,error:{code:error.message}};}
  process.stdout.write(JSON.stringify(response)+'\n');
@@ -252,8 +273,13 @@ export function main(){
  const binding=caller();
  const uid=Number(process.env.SUDO_UID),gid=Number(process.env.SUDO_GID);
  const input=JSON.parse(fs.readFileSync(0,'utf8'));
- const spec=backgroundSpec(input,binding,uid,gid);
- if(process.argv[2]==='status'||process.argv[2]==='stop'){
+ const spec=(process.argv[2]==='status'?controlSpec:backgroundSpec)(input,binding,uid,gid);
+ if(process.argv[2]==='status'){
+  const response=backgroundStatus(spec,binding,uid);
+  if(!response.ok)throw Error(response.code);
+  console.log(response.state);return;
+ }
+ if(process.argv[2]==='stop'){
   const observed=run('/usr/bin/systemctl',['--system','show',spec.unit,'--property=Description,LoadState,SubState']);
   const properties=Object.fromEntries(observed.stdout.trim().split('\n').map(line=>{const at=line.indexOf('=');return [line.slice(0,at),line.slice(at+1)];}));
   let saved;try{saved=JSON.parse(fs.readFileSync(`${BACKGROUND_ROOT}/${spec.unit}.json`,'utf8'));}catch{}
