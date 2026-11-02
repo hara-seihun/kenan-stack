@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Install the small Claude sharing fix without replacing unrelated broker code.
+
+The installed broker predates main and carries its own qualified runtime changes.
+Copy that immutable runtime, apply only the reviewed selector and one affinity
+expression, and retain its dependencies. SIGTERM drains active requests before
+systemd starts the new release. The old release is the printed rollback.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+BASE_SELECTOR = '516883aa4bb97d30d149c28f2f163442aabe4dc3adc3baaf6248394d52e7019c'
+OLD = 'const affinity = scoped(listener.principal, body.prompt_cache_key ?? req.headers["session-id"] ?? req.headers["session_id"] ?? req.headers["x-claude-code-session-id"]);'
+NEW = OLD[:-2] + ' ?? randomUUID());'
+
+
+def patch_sources(selector, desired, broker):
+    if selector != desired and hashlib.sha256(selector.encode()).hexdigest() != BASE_SELECTOR:
+        raise RuntimeError('Installed selector changed; preserve it and integrate this fix explicitly')
+    if OLD in broker:
+        if broker.count(OLD) != 1:
+            raise RuntimeError('Affinity anchor is ambiguous')
+        broker = broker.replace(OLD, NEW)
+    elif NEW not in broker:
+        raise RuntimeError('Installed broker affinity changed; no unreviewed replacement')
+    return desired, broker
+
+
+def run(args, **kwargs):
+    return subprocess.run(args, check=True, timeout=240, **kwargs)
+
+
+def main():
+    if os.getuid() != 0:
+        raise RuntimeError('Install requires root')
+    root = Path(__file__).resolve().parents[1]
+    source = root / 'packages/orchestrator/src/auth/account-selection.ts'
+    for path in [source, Path(__file__)]:
+        run(['git', '-c', f'safe.directory={root}', '-C', str(root), 'diff', '--exit-code', 'HEAD', '--', str(path)], stdout=subprocess.DEVNULL)
+    commit = run(['git', '-c', f'safe.directory={root}', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    base = Path('/opt/kenan-claude-broker')
+    current = base / 'current'
+    old = current.resolve()
+    selector, broker = patch_sources((old/'src/auth/account-selection.ts').read_text(),source.read_text(),(old/'src/model-broker.ts').read_text())
+    dest = base / ('sharing-' + commit[:12])
+    if dest.exists():
+        raise RuntimeError('Release already exists; inspect its manifest before activating it again')
+    run(['cp', '-a', '--reflink=auto', str(old), str(dest)])
+    manifest = {'sourceCommit':commit,'base':str(old),'files':{}}
+    for relative, content in [('auth/account-selection',selector),('model-broker',broker)]:
+        ts = dest / ('src/' + relative + '.ts')
+        js = dest / ('dist/' + relative + '.js')
+        ts.write_text(content)
+        # The installed esbuild only erases TypeScript. All imports and the old
+        # runtime's unrelated code remain intact; there is no bundle or npm update.
+        program = "const{createRequire}=require('node:module');const fs=require('node:fs');const esbuild=createRequire(process.argv[1]+'/package.json')('esbuild');fs.writeFileSync(process.argv[3],esbuild.transformSync(fs.readFileSync(process.argv[2],'utf8'),{loader:'ts',format:'esm',target:'es2022'}).code);"
+        run(['/usr/local/bin/node','-e',program,str(old),str(ts),str(js)])
+        run(['/usr/local/bin/node','--check',str(js)])
+        manifest['files'][relative] = {'sourceSha256':hashlib.sha256(content.encode()).hexdigest(),'artifactSha256':hashlib.sha256(js.read_bytes()).hexdigest()}
+    (dest/'sharing-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    # Dry fixture acceptance of the actual emitted selector, before activation.
+    program = "const {Store}=await import(process.argv[1]+'/dist/store.js');const{chooseInteractiveAccount}=await import(process.argv[1]+'/dist/auth/account-selection.js');const s=Store.open(':memory:');for(const[id,p]of[['anthropic-2',68],['anthropic-5',69],['anthropic-6',46]]){s.upsertAccount({id,provider:'anthropic'});s.recordMeter(id,'anthropic-7d',p,Date.now()+86400000);}const seen=new Set();for(let n=0;n<9;n++){const a=chooseInteractiveAccount(s,{has:()=>true},'anthropic');seen.add(a.id);s.createLease('fixture-'+n,a.id,'interactive',undefined,Date.now()+n);s.endLease('fixture-'+n);}s.close();if(seen.size!==3)throw Error('Compiled selector did not share');"
+    run(['/usr/local/bin/node','--input-type=module','-e',program,str(dest)])
+    temporary = base / f'.current-{os.getpid()}'
+    temporary.symlink_to(dest)
+    os.replace(temporary,current)
+    try:
+        run(['systemctl','restart','kenan-claude-broker.service'])
+        run(['systemctl','is-active','--quiet','kenan-claude-broker.service'])
+    except Exception:
+        temporary.symlink_to(old);os.replace(temporary,current)
+        run(['systemctl','restart','kenan-claude-broker.service'])
+        raise
+    print(json.dumps({**manifest,'release':str(dest),'rollback':f'ln -sfn {old} /opt/kenan-claude-broker/current && systemctl restart kenan-claude-broker.service'}))
+
+
+if __name__ == '__main__':
+    main()

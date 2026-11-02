@@ -40,8 +40,17 @@ export function coolingInteractiveAccounts(store: Store, auth: SharedOAuthAuth |
 export function chooseInteractiveAccount(store: Store, auth: SharedOAuthAuth | undefined, family: string, exclude = new Set<string>(), { includeCooling = false, model, live = false }: { includeCooling?: boolean; model?: string; live?: boolean } = {}) {
   const spent = (id: string) => Math.max(0, ...bindingMeters(store, id, family, model).map(meter => Number(meter.used_percent)));
   const load = (id: string) => store.activeLeases(id).length;
+  // Claude's quota headers update only the account serving the request. Sorting
+  // by percent spent starves a received account indefinitely (46% beats 68%),
+  // leaving its meters stale while one subscription bears the entire load.
+  // Retained sessions stay sticky in the broker; new sessions share healthy
+  // accounts by active load and least recent admission. Exhaustion, grants,
+  // credentials, model entitlement and cooldown remain eligibility checks.
+  const lastAdmission = (id: string) => Number(store.db.prepare("SELECT COALESCE(MAX(started_at),0) AS at FROM lease WHERE account_id=?").get(id)?.at ?? 0);
   const eligible = eligibleInteractiveAccounts(store, auth, family, exclude, model)
-    .sort((a, b) => (live ? load(a.id) - load(b.id) || spent(a.id) - spent(b.id) : spent(a.id) - spent(b.id) || load(a.id) - load(b.id))
+    .sort((a, b) => (family === "anthropic"
+      ? load(a.id) - load(b.id) || lastAdmission(a.id) - lastAdmission(b.id) || spent(a.id) - spent(b.id)
+      : live ? load(a.id) - load(b.id) || spent(a.id) - spent(b.id) : spent(a.id) - spent(b.id) || load(a.id) - load(b.id))
       || a.id.localeCompare(b.id))[0];
   if (eligible || !includeCooling) return eligible;
   return coolingInteractiveAccounts(store, auth, family, exclude, model)[0];

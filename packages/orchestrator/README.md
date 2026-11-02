@@ -250,3 +250,37 @@ Codex sampling also reads available banked rate-limit resets on every pass. The 
 The same function is exported as `readUsageEvidence` from `pi-orchestrator/api`. [`pi-user-usage`](../../tools/user-usage/README.md) consumes the command to estimate a person's subscription-equivalent dollars from her recorded conversation usage. Token totals measure spending, not capacity; the paired provider meter readings supply the capacity estimate.
 
 Generated command and table lists live in [docs/reference.md](docs/reference.md). A fresh ledger gets the current schema directly. A schema change ships as a bounded transition command that is deleted once both hosts have run it, so there is no migration chain to maintain.
+
+## Converge Claude account receipt and fair admission
+
+On Converge, receive an already drained Claude transfer, grant it, and prove its
+actual serving in one resumable command:
+
+```sh
+sudo node deploy/receive-claude-account.mjs --packet /root/incoming/anthropic-N.json --alias anthropic-N --migration TRANSFER_ID
+```
+
+The root-only packet has `id`, `alias`, `migration` and an OAuth `credential`.
+The sender must have removed new admission and drained its account first. The
+receiver commits the credential and a non-secret receive marker in one auth-lock
+write, registers the account, publishes its Converge grant, and makes ordinary
+Opus requests through port 25100 until that account has a finished lease, fresh
+meter and a loaded grant. A failed grant or probe does not report success. Resume
+with the same packet: it never overwrites an imported token that may have rotated.
+A completed receive returns its saved proof without another model request. Keep
+sole refresh custody and reconcile the sender before removing the secret packet.
+
+New Claude sessions choose by active load and least recent admission, not lowest
+percentage spent. A transferred account can have a higher weekly usage than the
+local account without being ineligible. Exhausted windows, disabled accounts,
+missing credentials, grants, model support and cooldown still constrain admission.
+Explicit sessions remain sticky for cache locality; requests with no session get
+independent admission rather than sharing a global empty-session pin.
+
+`sudo python3 deploy/install-converge-claude-sharing.py` installs only this narrow
+fix on the older Converge Claude broker, preserving its unrelated qualified code
+and dependencies. It checks the installed selector's base, patches one affinity
+expression, tests the emitted selector, writes an immutable manifest, switches
+the runtime link, and gracefully drains active streams before restart. It prints
+a rollback command and restores the old runtime if activation fails. Ordinary
+Pi Stack releases carry the source changes directly.

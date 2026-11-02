@@ -671,3 +671,30 @@ test("a principal over her weekly allowance is refused before any provider call 
   f.regrant(["shared", "anthropic-shared"]);
   expect((await (await fetch(`${f.url}/v1/usage`)).json()).allowance).toBeNull();
 });
+
+test('headerless Claude calls share accounts, while an explicit session retains its account', async () => {
+  const used: string[] = [];
+  const f = await fixture(async (_url, init) => {
+    used.push(new Headers(init.headers).get('authorization')!);
+    return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {headers:{'content-type':'text/event-stream'}});
+  });
+  await withSharedAuth(join(f.root,'auth.json'),new AbortController().signal,(auth,save)=>{
+    for (const [id,spent] of [['anthropic-2',68],['anthropic-5',69],['anthropic-6',46]] as const) {
+      f.store.upsertAccount({id,provider:'anthropic'});
+      f.store.recordMeter(id,'anthropic-7d',spent,Date.now()+86400_000);
+      auth[id]={type:'oauth',access:`fixture-${id}`,refresh:'fixture',expires:Date.now()+3600000};
+    }
+    save();
+  });
+  f.regrant(['anthropic-2','anthropic-5','anthropic-6'],['anthropic/claude-opus-5-5']);
+  const post = async (session?:string) => {
+    const answer=await fetch(`${f.url}/v1/messages`,{method:'POST',headers:{'content-type':'application/json',...(session?{'x-claude-code-session-id':session}:{})},body:JSON.stringify({model:'claude-opus-5-5',stream:true,messages:[]})});
+    expect(answer.status).toBe(200);await answer.text();
+  };
+  for(let n=0;n<6;n++)await post();
+  expect(new Set(used).size).toBe(3);
+  const counts=[...new Set(used)].map(id=>used.filter(v=>v===id).length);
+  expect(counts).toEqual([2,2,2]);
+  await post('retained');const retained=used.at(-1);
+  await post('retained');expect(used.at(-1)).toBe(retained);
+});

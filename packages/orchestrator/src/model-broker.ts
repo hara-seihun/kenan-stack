@@ -217,7 +217,7 @@ export function createModelBroker(config: ModelBrokerConfig, availability: Model
         || store.latestMeters(account.id).some(meter => modelDrainsMeter(family, body.model, meter.meter_id)
           && Number(meter.used_percent) >= 100 && (!meter.reset_at || Number(meter.reset_at) > Date.now()))).map(account => account.id));
       if (ultrafast) exclude = await codexTierExclusions(store, shared, body.model, "ultrafast", exclude, signal, transport as typeof fetch);
-      const affinity = scoped(listener.principal, body.prompt_cache_key ?? req.headers["session-id"] ?? req.headers["session_id"] ?? req.headers["x-claude-code-session-id"]);
+      const affinity = scoped(listener.principal, body.prompt_cache_key ?? req.headers["session-id"] ?? req.headers["session_id"] ?? req.headers["x-claude-code-session-id"] ?? randomUUID());
       const retained = sticky.get(affinity);
       const account = eligibleInteractiveAccounts(store, shared, family, exclude, body.model).find(account => account.id === retained)
         ?? chooseInteractiveAccount(store, shared, family, exclude, { includeCooling: true, model: body.model });
