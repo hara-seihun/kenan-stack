@@ -5,9 +5,11 @@ import {rootScope} from './root-scope.mjs';
 import {procScope,callerToolCall} from './cache-queue.mjs';
 const unit='agent-tool-beta-11111111-1111-4111-8111-111111111111.scope',group='/user.slice/user-agents.slice/'+unit,pid=123;
 const identity={version:1,channel:'beta',agentId:'owner',callId:'native-call'};
-function fixture(){
+const globalUnit=unit,globalGroup=group,globalIdentity=identity;
+function fixture({unit:unitOverride,identity:identityOverride}={}){
+ const service=Boolean(unitOverride), unit=unitOverride??globalUnit,group=service?`/user.slice/user-agents.slice/user-agents-kenanbg.slice/${unit}`:globalGroup,identity=identityOverride??globalIdentity;
  const files=new Map([
-  ['/run/systemd/transient/'+unit,`# Root systemd transient scope\n[Unit]\nDescription=kenan-tool-call:${JSON.stringify(identity)}\nBindsTo=kenan@beta.service\n[Scope]\nSlice=user-agents.slice\n`],
+  ['/run/systemd/transient/'+unit,`# Root systemd transient scope\n[Unit]\nDescription=kenan-tool-call:${JSON.stringify(identity)}\n${service?"": "BindsTo=kenan@beta.service\n"}[${service?"Service":"Scope"}]\nSlice=${service?"user-agents-kenanbg.slice":"user-agents.slice"}\n${service?"User="+identity.uid+"\nExecStart=\nExecStart=/usr/bin/true\n":""}`],
   ['/sys/fs/cgroup'+group+'/cgroup.events','populated 1\nfrozen 0\n'],
   ['/sys/fs/cgroup'+group+'/cgroup.procs',pid+'\n'],
   [`/proc/${pid}/cgroup`,'0::'+group+'\n']
@@ -51,3 +53,22 @@ test('unsupported service and unavailable root metadata retain the existing mana
  let calls=0;const observed=procScope(pid,{read:()=>`0::${group}`,kernel:()=>f.observe(),query:()=>{calls++;return {status:0,stdout:`Description=kenan-tool-call:${JSON.stringify(identity)}\nControlGroup=${group}\nTransient=yes\nActiveState=active\n`};}});assert.equal(observed.agentId,'owner');assert.equal(calls,1);
 });
 test('invalid root evidence is refused, never replaced by another observation that grants identity',()=>{assert.equal(procScope(pid,{read:()=>`0::${group}`,kernel:()=>({kind:'refused',code:'untrusted'}),query:()=>assert.fail('no weaker route')}),null);});
+
+const bgAgent='22222222-2222-4222-8222-222222222222',bgUnit=`kenan-bg-${bgAgent}-release.service`,bgGroup=`/user.slice/user-agents.slice/user-agents-kenanbg.slice/${bgUnit}`;
+const bgIdentity={...identity,agentId:bgAgent,background:true,uid:1002};
+test('background release proves its exact root-created invocation without a blocking manager query',()=>{
+ const f=fixture({unit:bgUnit,identity:bgIdentity});
+ const observed=procScope(pid,{read:()=>`0::${bgGroup}`,kernel:(p,g,u)=>rootScope(p,g,u,{io:f.io}),query:()=>assert.fail('background release must not need a manager RPC')});
+ assert.equal(observed.agentId,bgAgent);
+ assert.equal(callerToolCall({pid,scope:()=>observed,uid:()=>1002}).agentId,bgAgent);
+ assert.equal(callerToolCall({pid,scope:()=>observed,uid:()=>1003}),null);
+});
+for(const [name,mutate] of [
+ ['foreign owner',f=>f.files.set('/run/systemd/transient/'+bgUnit,f.files.get('/run/systemd/transient/'+bgUnit).replace(bgAgent,'33333333-3333-4333-8333-333333333333'))],
+ ['wrong uid',f=>f.files.set('/run/systemd/transient/'+bgUnit,f.files.get('/run/systemd/transient/'+bgUnit).replace('User=1002','User=1003'))],
+ ['duplicate uid',f=>f.files.set('/run/systemd/transient/'+bgUnit,f.files.get('/run/systemd/transient/'+bgUnit)+'User=1002\n')],
+ ['writable metadata',f=>f.changes.set('/run/systemd/transient/'+bgUnit,{mode:0o100666})],
+ ['empty kernel group',f=>f.files.set('/sys/fs/cgroup'+bgGroup+'/cgroup.events','populated 0\n')],
+ ['changed invocation',f=>{let n=0;f.io.readlinkSync=()=>++n===1?'a'.repeat(32):'b'.repeat(32);}],
+ ['moved process',f=>f.files.set(`/proc/${pid}/cgroup`,'0::/foreign\n')]
+])test('background kernel identity refuses '+name,()=>{const f=fixture({unit:bgUnit,identity:bgIdentity});mutate(f);assert.equal(rootScope(pid,bgGroup,bgUnit,{io:f.io}).kind,'refused');});

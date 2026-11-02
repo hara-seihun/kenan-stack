@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 
 const native=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/;
+const background=/^kenan-bg-([a-f0-9-]{36})-[-A-Za-z0-9._]{1,60}\.service$/;
 const same=(a,b)=>a.dev===b.dev&&a.ino===b.ino&&a.size===b.size&&a.mtimeMs===b.mtimeMs&&a.ctimeMs===b.ctimeMs;
 
 // A populated kernel scope and systemd's root-owned transient description are
 // independent of the manager RPC queue. No argv, environment or writable file
-// supplies identity. Services still require the existing live manager query.
+// supplies identity. Background services use the same root and kernel proof.
 export function rootScope(pid,group,unit,{io=fs}={}){
- if(!Number.isSafeInteger(pid)||pid<=1||!native.test(unit)||group!==`/user.slice/user-agents.slice/${unit}`)return {kind:'unavailable'};
+ const service=background.exec(unit);
+ if(!Number.isSafeInteger(pid)||pid<=1||(!native.test(unit)&&!service)||group!==(service?`/user.slice/user-agents.slice/user-agents-kenanbg.slice/${unit}`:`/user.slice/user-agents.slice/${unit}`))return {kind:'unavailable'};
  const trusted=p=>{
   if(io.realpathSync(p)!==p)throw Error('scope-proof-symlink');
   const s=io.lstatSync(p);
@@ -24,7 +26,7 @@ export function rootScope(pid,group,unit,{io=fs}={}){
   }finally{io.closeSync(fd);}
  };
  try{
-  for(const p of ['/run','/run/systemd','/run/systemd/transient','/run/systemd/units','/sys','/sys/fs','/sys/fs/cgroup','/sys/fs/cgroup/user.slice','/sys/fs/cgroup/user.slice/user-agents.slice','/sys/fs/cgroup'+group])trusted(p);
+  for(const p of ['/run','/run/systemd','/run/systemd/transient','/run/systemd/units','/sys','/sys/fs','/sys/fs/cgroup','/sys/fs/cgroup/user.slice','/sys/fs/cgroup/user.slice/user-agents.slice',...(service?['/sys/fs/cgroup/user.slice/user-agents.slice/user-agents-kenanbg.slice']:[]),'/sys/fs/cgroup'+group])trusted(p);
   const invocation=()=>{
    const p='/run/systemd/units/invocation:'+unit,s=io.lstatSync(p);
    if(s.uid!==0||!s.isSymbolicLink())throw Error('scope-proof-untrusted-invocation');
@@ -37,12 +39,14 @@ export function rootScope(pid,group,unit,{io=fs}={}){
    if(!line||line.startsWith('#'))continue;
    if(/^\[[A-Za-z]+\]$/.test(line)){section=line.slice(1,-1);if(sections.has(section))throw Error('scope-proof-duplicate-section');sections.set(section,new Map());continue;}
    const at=line.indexOf('=');if(!section||at<1||/\r|\x00/.test(line)||line.endsWith('\\'))throw Error('scope-proof-invalid-unit');
-   const entries=sections.get(section),key=line.slice(0,at);if(entries.has(key))throw Error('scope-proof-duplicate-property');entries.set(key,line.slice(at+1));
+   const entries=sections.get(section),key=line.slice(0,at);if(entries.has(key)&&(!service||['Description','Slice','User','BindsTo'].includes(key)))throw Error('scope-proof-duplicate-property');entries.set(key,line.slice(at+1));
   }
   const description=sections.get('Unit')?.get('Description');
-  if(!description?.startsWith('kenan-tool-call:')||sections.get('Scope')?.get('Slice')!=='user-agents.slice')throw Error('scope-proof-invalid-description');
+  if(!description?.startsWith('kenan-tool-call:')||sections.get(service?'Service':'Scope')?.get('Slice')!==(service?'user-agents-kenanbg.slice':'user-agents.slice'))throw Error('scope-proof-invalid-description');
   const identity=JSON.parse(description.slice('kenan-tool-call:'.length));
-  if(typeof identity.channel!=='string'||!unit.startsWith(`agent-tool-${identity.channel}-`)||sections.get('Unit')?.get('BindsTo')!==`kenan@${identity.channel}.service`)throw Error('scope-proof-channel-mismatch');
+  if(service){
+   if(identity.background!==true||identity.agentId!==service[1]||!Number.isSafeInteger(identity.uid)||identity.uid<=0||sections.get('Service')?.get('User')!==String(identity.uid)||!/^[a-z][a-z0-9-]{0,23}$/.test(identity.channel??''))throw Error('scope-proof-background-mismatch');
+  }else if(typeof identity.channel!=='string'||!unit.startsWith(`agent-tool-${identity.channel}-`)||sections.get('Unit')?.get('BindsTo')!==`kenan@${identity.channel}.service`)throw Error('scope-proof-channel-mismatch');
   const kernel='/sys/fs/cgroup'+group;
   if(!/^populated 1$/m.test(read(kernel+'/cgroup.events'))||!read(kernel+'/cgroup.procs').split('\n').includes(String(pid)))throw Error('scope-proof-caller-not-populated');
   if(!io.readFileSync(`/proc/${pid}/cgroup`,'utf8').trim().split('\n').includes('0::'+group)||invocation()!==id)throw Error('scope-proof-caller-moved');
