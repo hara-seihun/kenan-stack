@@ -81,7 +81,7 @@ import {submitRelease} from './release-submission.mjs';
 import {releaseBudgetMs} from './release-budget.mjs';
 import {authorizeWorkspaceRelease} from "./release-authority.mjs";
 import { retireSourceMaterialization, validateMaterializationRequest, MaterializationError } from "./source-materialization.mjs";
-import { jobObserveCommand, observeWorkspaceJob } from "./job-observation.mjs";
+import { jobObserveCommand, observeWorkspaceJob, sourceStageContext } from "./job-observation.mjs";
 import { GrowthLifecycleError, digest, growthError, retainedGrowth, validateRetirement, validateReduction, validateRetainedHeadroom } from "./growth-lifecycle.mjs";
 
 import {readPermit,authenticatedAbandonCaller,validateAbandonPermit,sourceJobCgroupSnapshot,sha,refuse} from './source-job-abandon.mjs';
@@ -3734,7 +3734,8 @@ function createWorkspace(database, args, statePath) {
     if (preparation.state !== "ready") {
       print({ ok: true, state: "preparing", jobKind: "source", jobId: preparation.jobId, progressPath: preparation.progressPath, resultPath: preparation.resultPath,
         observeCommand: `agent-workspace source-status --job-id ${preparation.jobId} --json`,
-        nextAction: "Use source-status for authoritative terminal observation; repeat this exact create request to continue admission" }, true);
+        nextAction: "Use source-status for authoritative terminal observation; repeat this exact create request to continue admission",
+        ...(preparation.resultPath ? sourceStageContext(path.dirname(preparation.resultPath)) : {}) }, true);
       process.exitCode = 75;
       return;
     }

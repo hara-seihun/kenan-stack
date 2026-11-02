@@ -1,8 +1,19 @@
 import { lstatSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { observeSourceJob } from "./source-job.mjs";
+import { observeSourceJob, readSourceJobRequest } from "./source-job.mjs";
 
 const invalid = (code, message) => ({ state: "observation-error", jobKind: null, error: { code, message } });
+// Describe the retained operation without changing its identity or submitting work.
+export function sourceStageContext(directory) {
+  const request = readSourceJobRequest(directory);
+  if (!request.ok || request.value?.kind !== "completed-source-revalidation") return {};
+  return {
+    sourceStage: "completed-source-revalidation",
+    sourceCommit: request.value.sourceCommit,
+    sourceImport: false,
+    nextAction: "This is custody revalidation and original checkout admission, not another source import. Observe this job, then repeat the exact original create command to continue checkout; do not change its ref or destination.",
+  };
+}
 export const jobObserveCommand = jobId => `agent-workspace job-status --job-id ${jobId} --json`;
 
 function directoryExists(directory) {
@@ -36,7 +47,7 @@ export function observeWorkspaceJob(statePath, jobId, expectedKind = null) {
       error: { code: "job-kind-mismatch", message: `this is a ${jobKind} job; use ${observeCommand} for read-only observation` },
     };
     return { jobKind, ...(workspaceId === undefined ? {} : { workspaceId }),
-      ...observeSourceJob(directory), observeCommand };
+      ...observeSourceJob(directory), ...(jobKind === "source" ? sourceStageContext(directory) : {}), observeCommand };
   } catch (error) {
     return invalid("job-lookup-io", `job lookup failed (${error.code ?? "invalid-state"}); no work was submitted`);
   }

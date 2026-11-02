@@ -92,3 +92,20 @@ test("unknown, malformed and ambiguous identities are observation errors, never 
   for (const kind of ["source", "checkout"]) job(kind, id, { state: "ready", value: {} });
   assert.equal(observe("job-status", id).value.error.code, "job-identity-ambiguous");
 });
+
+
+test("completed-source revalidation explains the changed job identity without another import", () => {
+  const id = "8".repeat(64), commit = "a".repeat(40);
+  const directory = job("source", id, { state: "ready", value: { sourceCommit: commit } });
+  writeFileSync(path.join(directory, "request.json"), JSON.stringify({ kind: "completed-source-revalidation", sourceCommit: commit }));
+  const before = files(directory);
+  const result = observe("source-status", id);
+  assert.equal(result.exit, 0);
+  assert.equal(result.value.sourceStage, "completed-source-revalidation");
+  assert.equal(result.value.sourceCommit, commit);
+  assert.equal(result.value.sourceImport, false);
+  assert.match(result.value.nextAction, /exact original create command/);
+  assert.match(result.value.nextAction, /not another source import/);
+  assert.deepEqual(files(directory), before);
+  assert.equal(existsSync(state), false);
+});
