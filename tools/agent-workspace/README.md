@@ -1242,3 +1242,20 @@ that concurrency caused every historical missing object or repair existing
 corruption. Check existing connectivity before adopting a shared source. The
 November 1 missing-parent repair remains a separate observed recovery.
 Regression: `python3 tools/agent-workspace/serialized-git.test.py`.
+
+### Local donors with later mirror boundaries
+
+A shared checkout can predate a shallow boundary subsequently added to its actual
+alternate mirror. Source pricing and exact object import now use a private,
+short-lived bare Git view when a real mirror boundary has a demonstrably missing
+parent in that donor. The view borrows the donor's objects and copies only actual
+shallow metadata; it never edits the donor's files, refs, index or configuration.
+A complete donor is not truncated. Missing ancestors without matching mirror
+metadata still fail, and independent mirror closure and capacity accounting are
+unchanged. Source custody remains keyed to the original donor and requested ref,
+not the temporary view. The view is removed on both success and failure.
+
+The regression in `donor-view.test.mjs` covers exact pricing, transport, original
+source identity, unchanged donor metadata, absent boundary refusal, complete
+donors and cleanup. The native `legacy shared donor` regression in `test.mjs`
+proves an actual child admission through the normal CLI.

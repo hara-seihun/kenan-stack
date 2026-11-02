@@ -31,6 +31,9 @@ import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
 import { refPinPath, pinnedSourceCommit, clearRefPin } from "./ref-pin.mjs";
 import { movedToColdStorage } from "./cold-storage.mjs";
+
+import {withDonorView} from './donor-view.mjs';
+const donorViewOperations = {git, command: (repository, args, options) => command('git', ['-C', repository, ...args], options)};
 import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
 import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, hostMirrorBorrowers, markMirrorUse, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
@@ -2197,6 +2200,11 @@ function importBaseCommits(repository, sourceCommit, mirror) {
 }
 
 function sourceImportCapacity(repository, sourceCommit, mirror, sparsePatterns) {
+  return withDonorView(repository, mirror, sourceCommit, donorViewOperations,
+    source => sourceImportCapacityFrom(source, sourceCommit, mirror, sparsePatterns));
+}
+
+function sourceImportCapacityFrom(repository, sourceCommit, mirror, sparsePatterns) {
   if (mirror && existsSync(mirror) && hasObjectClosure(mirror, sourceCommit, sparsePatterns)) return { bytes: 0, baseCommits: [sourceCommit] };
   const baseCommits = importBaseCommits(repository, sourceCommit, mirror);
   const objects = [];
@@ -3169,14 +3177,21 @@ function copyMissingObjects(mirror, repository, commit) {
 }
 
 function fetchSource(mirror, repository, ref, sparsePatterns) {
-  let resolved = ref;
+  const commit = isLocalRepository(repository) && existsSync(path.join(mirror, 'shallow'))
+    ? git(repository, ['rev-parse', '--verify', `${ref}^{commit}`]) : ref;
+  return withDonorView(repository, mirror, commit, donorViewOperations,
+    source => fetchSourceFrom(mirror, source, ref, sparsePatterns, repository, source === repository ? ref : commit));
+}
+
+function fetchSourceFrom(mirror, repository, ref, sparsePatterns, identityRepository, transportRef) {
+  let resolved = transportRef;
   if (/^[0-9a-f]{4,39}$/u.test(ref)) {
     const source = existsSync(repository) ? ["-C", repository] : ["--git-dir", mirror];
     const commit = command("git", [...source, "rev-parse", "--verify", `${ref}^{commit}`]);
     if (commit.status !== 0) fail(`cannot resolve abbreviated source ${ref}; provide an unambiguous full commit or remote ref: ${commit.stderr}`);
     resolved = commit.stdout;
   }
-  const sourceRef = sourceRefFor(repository, ref);
+  const sourceRef = sourceRefFor(identityRepository, ref);
   // Negotiate from independently complete ancestry when there is one, else from the mirror's refs.
   // Git skips wanting a commit object it already has, so a present commit with missing trees or blobs is repaired only by --refetch.
   const commitPresent = /^[0-9a-f]{40,64}$/u.test(resolved) && command("git", ["--git-dir", mirror, "cat-file", "-e", `${resolved}^{commit}`]).status === 0;
@@ -3192,7 +3207,7 @@ function fetchSource(mirror, repository, ref, sparsePatterns) {
       && hasObjectClosure(mirror, resolved, sparsePatterns))) fetch(["--refetch"]);
   }
   publishSourcePhase({ phase: "verifying", commit: resolved });
-  return ensureSourceCustody(mirror, repository, ref, resolved, sparsePatterns);
+  return ensureSourceCustody(mirror, identityRepository, ref, resolved, sparsePatterns);
 }
 
 // Clone uses a temporary source remote, so Git does not create origin's fetch mapping.

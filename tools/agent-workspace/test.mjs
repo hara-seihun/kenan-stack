@@ -4359,3 +4359,35 @@ test("budgeted shared clones preserve real shallow ancestry for history and subs
     assert.equal(git(child.path, "rev-list", "--first-parent", "--max-count=128", "HEAD"), `${advanced}\n${head}`);
   } finally { f.close(); }
 });
+
+test("legacy shared donor missing its mirror boundary admits an exact child without donor edits", () => {
+  const f = fixture();
+  try {
+    writeFileSync(path.join(f.source, "file.txt"), "second\n");
+    git(f.source, "commit", "-am", "second");
+    git(f.source, "push", "origin", "main");
+    const shallow = path.join(f.root, "shallow");
+    execFileSync("git", ["clone", "--depth=1", `file://${f.remote}`, shallow]);
+    const head = git(shallow, "rev-parse", "HEAD");
+    const args = ["create", "--root", f.workspaces, "--name", "legacy-donor", "--repo", shallow,
+      "--ref", head, "--intent", "source-only", "--headroom-gib", "1", "--growth-mib", "8", "--json"];
+    const donor = JSON.parse(run(args, f.env));
+    // Simulate the legacy single-alternate checkout whose mirror gained a boundary later.
+    const alternates = path.join(donor.path, ".git", "objects", "info", "alternates");
+    writeFileSync(alternates, readFileSync(alternates, "utf8").split("\n")[0] + "\n");
+    rmSync(path.join(donor.path, ".git", "shallow"));
+    const tree = git(donor.path, "rev-parse", "HEAD^{tree}");
+    const advanced = git(donor.path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+      "commit-tree", tree, "-p", head, "-m", "new donor commit");
+    git(donor.path, "update-ref", "HEAD", advanced);
+    assert.throws(() => git(donor.path, "rev-list", "--first-parent", "HEAD"));
+    const before = readFileSync(path.join(donor.path, ".git", "objects", "info", "alternates"), "utf8");
+    const childArgs = args.map(arg => arg === "legacy-donor" ? "legacy-child" : arg === shallow ? donor.path : arg === head ? advanced : arg);
+    const child = JSON.parse(run(childArgs, f.env));
+    assert.equal(child.sourceCommit, advanced);
+    assert.equal(git(child.path, "rev-list", "--first-parent", "HEAD"), `${advanced}\n${head}`);
+    assert.equal(existsSync(path.join(donor.path, ".git", "shallow")), false);
+    assert.equal(git(donor.path, "rev-parse", "HEAD"), advanced);
+    assert.equal(readFileSync(path.join(donor.path, ".git", "objects", "info", "alternates"), "utf8"), before);
+  } finally { f.close(); }
+});
