@@ -3391,11 +3391,20 @@ function refreshCompletedSource(value, input, sourceCommit, receipt, key, origin
   }
   const continuationPath = `${receipt}.revalidation.json`;
   let request = existsSync(continuationPath) ? JSON.parse(readFileSync(continuationPath, "utf8")) : null;
+  // A cached price and its original job are two observations of the same proof.
+  // Keep the provenance when a later create reaches it through the price receipt.
+  const sourceJob = originalJobId ?? request?.originalJobId ?? null;
   const jobs = path.join(path.dirname(receipt), "jobs");
   if (request !== null && existsSync(path.join(jobs, sourceJobId(`${key}:revalidation`, request), "result.json"))) request = null;
   if (request === null) {
-    request = { kind: "completed-source-revalidation", input, sourceCommit, value,
-      receipt, originalJobId, args: args?.named.has("root") && args.named.has("name") ? [...args.named] : null, observedStamp: objectStoreStamp(input.mirror) };
+    // Capacity is observed again at actual admission, never priced into a reusable
+    // proof identity. Free space and stale-measurement ages change every call.
+    // The value's old stamp is likewise not an input: only the current mirror
+    // generation below invalidates closure evidence after real object changes.
+    const { admission, ...plan } = value.plan;
+    const pricingValue = { sourceCommit: value.sourceCommit, plan };
+    request = { kind: "completed-source-revalidation", input, sourceCommit, value: pricingValue,
+      receipt, originalJobId: sourceJob, args: args?.named.has("root") && args.named.has("name") ? [...args.named] : null, observedStamp: objectStoreStamp(input.mirror) };
     writePreparationReceipt(continuationPath, request);
   }
   const job = runSourceJob({ directory: jobs,

@@ -1259,3 +1259,12 @@ The regression in `donor-view.test.mjs` covers exact pricing, transport, origina
 source identity, unchanged donor metadata, absent boundary refusal, complete
 donors and cleanup. The native `legacy shared donor` regression in `test.mjs`
 proves an actual child admission through the normal CLI.
+
+Completed source revalidation hashes the immutable price, not the admission
+observation. Changing free space, stale allocation ages, or the old receipt's
+stamp cannot produce another proof job for the same current mirror generation.
+The original source job remains attached when a later create uses its cached
+price receipt. A current mirror generation still invalidates closure evidence;
+actual checkout admission still observes current capacity. Regression:
+`source-ready-reuse.test.mjs` exercises a real foreground timeout, changing
+admission observations, reuse of the completed proof, and immutable old results.

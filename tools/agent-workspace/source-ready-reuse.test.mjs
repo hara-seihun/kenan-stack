@@ -164,3 +164,42 @@ const r=spawnSync(${JSON.stringify(real)},a,{stdio:'inherit'});process.exit(r.st
   assert.equal(f.git(input.destination,'rev-parse','HEAD'),f.sourceCommit);
  }finally{if(churn){churn.kill('SIGKILL');await new Promise(r=>churn.once('exit',r));}f.close();}
 });
+
+test('identical creates reuse a completed proof despite changing free space and stale-measurement diagnostics', {timeout:30000}, async()=>{
+ const f=fixture(),oldPath=process.env.PATH;try{
+  const input={statePath:path.join(f.root,'state','registry.sqlite3'),root:f.root,destination:path.join(f.root,'writer'),repository:f.repository,ref:'HEAD',upstream:{fetch:f.repository,push:f.repository,explicitPush:false},mirror:f.mirror,intent:{intent:'source-only',growthBytes:536870912,headroomBytes:8589934592},sparsePatterns:[]};
+  const args={named:new Map([['repo',[f.repository]]])};
+  const request={...input,sourceCommit:f.sourceCommit,args:[...args.named],capacityPricingVersion:4};
+  const key=createHash('sha256').update(JSON.stringify(request)).digest('hex'),directory=path.join(f.root,'state','source-preparations');
+  const jobId='e'.repeat(64),job=path.join(directory,'jobs',jobId);fs.mkdirSync(job,{recursive:true});
+  const plan={sourceCommit:f.sourceCommit,constructionBytes:123456,growthBytes:536870912,headroomBytes:8589934592};
+  const admission=round=>({freeBytes:100000000000-round*4096,measurementFailures:[{code:'allocated-block-cache-stale',error:`allocated-block cache stale (age ${901+round} s; limit 900 s)`}]});
+  const original=JSON.stringify({state:'ready',value:{sourceCommit:f.sourceCommit,plan:{...plan,admission:admission(0)},stamp:'original'}});
+  fs.writeFileSync(path.join(job,'result.json'),original);
+  const pointer=JSON.stringify({initialStamp:'original',jobId});fs.writeFileSync(path.join(directory,key+'.job.json'),pointer);
+  const bin=path.join(f.root,'bin');fs.mkdirSync(bin);const real=execFileSync('which',['git'],{encoding:'utf8'}).trim();
+  fs.writeFileSync(path.join(bin,'git'),`#!${process.execPath}
+const {spawnSync}=require('node:child_process');const a=process.argv.slice(2);
+if(a.includes('rev-list'))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,2200);
+const r=spawnSync(${JSON.stringify(real)},a,{stdio:'inherit'});process.exit(r.status??1);
+`);fs.chmodSync(path.join(bin,'git'),0o755);process.env.PATH=bin+':'+oldPath;
+  const database=new Proxy({}, {get:()=>assert.fail('READY reuse must not import or mutate capacity')});
+  const first=w.prepareCreationSource(database,args,input);assert.equal(first.state,'pending');
+  const child=path.join(directory,'jobs',first.jobId,'result.json');
+  for(let n=0;n<100&&!fs.existsSync(child);n++)await new Promise(r=>setTimeout(r,50));
+  assert.ok(fs.existsSync(child));assert.equal(JSON.parse(fs.readFileSync(child)).state,'ready');
+  const childBytes=fs.readFileSync(child,'utf8');
+  // Admission is recomputed independently of pricing. Neither its current disk reading nor
+  // an older receipt's mirror stamp belongs to the immutable price used by the proof.
+  const completed=JSON.parse(fs.readFileSync(child)).value;
+  fs.writeFileSync(path.join(directory,key+'.json'),JSON.stringify({...completed,stamp:'older-receipt',plan:{...plan,admission:admission(1)}}));
+  fs.rmSync(path.join(f.mirror,'pi-workspace-closure'),{recursive:true,force:true});
+  const second=w.prepareCreationSource(database,args,input);
+  assert.equal(second.state,'ready','changed capacity observations must reuse the first ready proof');
+  const {admission:ignored,...actualPlan}=second.value.plan;assert.deepEqual(actualPlan,plan);
+  assert.equal(fs.readFileSync(child,'utf8'),childBytes,'original terminal proof is immutable');
+  assert.equal(fs.readFileSync(path.join(job,'result.json'),'utf8'),original);
+  assert.equal(fs.readFileSync(path.join(directory,key+'.job.json'),'utf8'),pointer);
+  assert.equal(fs.readdirSync(path.join(directory,'jobs')).length,2,'no duplicate source or proof job');
+ }finally{process.env.PATH=oldPath;f.close();}
+});
