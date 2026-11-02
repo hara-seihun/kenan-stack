@@ -170,3 +170,28 @@ for(const kind of ['generator','no-dependency'])test('swagger-autogen outputs ar
  if(kind==='generator'){assert.ok(result.cacheDisposition?.paths?.includes('src/docs/definitions'),JSON.stringify(result));assert.equal(fs.existsSync(path.join(f.source,'src/docs/swagger-output.json')),false);}
  else {assert.equal(result.cacheDisposition.paths?.includes('src/docs/definitions')??false,false,JSON.stringify(result));assert.equal(archived(result,'src/docs/definitions/A.json'),'{}');}
 }));
+
+for (const prefix of ['', 'infra/']) test('release removes ignored Terraform init output at '+(prefix || 'root'),()=>fixture(f=>{
+ fs.appendFileSync(path.join(f.source,'.gitignore'),'.terraform/\n.terraform.lock.hcl\n');
+ f.git('-C',f.source,'commit','-am','ignore init output');f.git('-C',f.source,'push','origin','main');
+ const directory=path.join(f.source,prefix);fs.mkdirSync(path.join(directory,'.terraform','providers'),{recursive:true});
+ fs.writeFileSync(path.join(directory,'.terraform','providers','cache'),'regenerable provider');
+ fs.writeFileSync(path.join(directory,'.terraform.lock.hcl'),'generated lock');
+ const result=f.release();assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));
+ assert.ok(result.cacheDisposition.paths.includes(prefix+'.terraform'));
+ assert.ok(result.cacheDisposition.paths.includes(prefix+'.terraform.lock.hcl'));
+}));
+for (const tracked of [false,true]) test('release preserves '+(tracked?'tracked':'unignored')+' Terraform lock source',()=>fixture(f=>{
+ const lock=path.join(f.source,'.terraform.lock.hcl');fs.writeFileSync(lock,'valuable lock');
+ if(tracked){f.git('-C',f.source,'add','.terraform.lock.hcl');f.git('-C',f.source,'commit','-m','track lock');}
+ const result=f.release();assert.equal(result.cacheDisposition.paths?.includes('.terraform.lock.hcl') ?? false,false);
+ if(tracked){assert.equal(result.physicalDisposition.kind,'retained',JSON.stringify(result));assert.equal(fs.readFileSync(lock,'utf8'),'valuable lock');}
+ else {assert.ok(result.workingTreeArchive,JSON.stringify(result));assert.equal(execFileSync('tar',['--zstd','-xOf',result.workingTreeArchive,'.terraform.lock.hcl'],{encoding:'utf8'}),'valuable lock');}
+}));
+test('cache stripping never detaches a committed Terraform lock even when ignore rules match',()=>fixture(f=>{
+ const lock=path.join(f.source,'.terraform.lock.hcl');fs.writeFileSync(lock,'committed lock');
+ fs.appendFileSync(path.join(f.source,'.gitignore'),'.terraform.lock.hcl\n');
+ f.git('-C',f.source,'add','-f','.terraform.lock.hcl');f.git('-C',f.source,'commit','-am','track ignored lock');
+ const removed=workspaceTesting.stripCaches({...f.record,cachePaths:[]},f.state,()=>{},()=>({errors:[],references:[]}));
+ assert.equal(removed.includes('.terraform.lock.hcl'),false);assert.equal(fs.readFileSync(lock,'utf8'),'committed lock');
+}));

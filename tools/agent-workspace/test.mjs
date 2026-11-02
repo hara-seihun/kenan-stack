@@ -2523,6 +2523,10 @@ test("creates and releases a clean review checkout", () => {
       "**/.lake",
       "target",
       "**/target",
+      ".terraform",
+      "**/.terraform",
+      ".terraform.lock.hcl",
+      "**/.terraform.lock.hcl",
       "ignored-output",
     ]);
     assert.equal(existsSync(created.path), true);

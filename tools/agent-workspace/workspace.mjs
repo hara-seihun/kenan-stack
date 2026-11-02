@@ -118,6 +118,10 @@ const DEFAULT_CACHE_PATHS = [
   // directory called `target` is unaffected.
   "target",
   "**/target",
+  ".terraform",
+  "**/.terraform",
+  ".terraform.lock.hcl",
+  "**/.terraform.lock.hcl",
 ];
 const DEFAULT_LEASE_SECONDS = 6 * 60 * 60;
 const DEFAULT_MAX_COUNT = 0;
@@ -1178,6 +1182,10 @@ function stripCaches(record, statePath, invalidateCapacity, observeLink) {
       continue;
     }
     if (holdsTrackedFiles(target)) continue;
+    // Init can create a dependency lock file, but an unignored lock file is source.
+    // Only ignored, untracked locks are regenerable; tracked locks stay protected above.
+    if (path.basename(target) === ".terraform.lock.hcl"
+      && command("git", ["-C", record.path, "check-ignore", "--quiet", "--", path.relative(record.path, target)]).status !== 0) continue;
     const cacheKey = createHash("sha256").update(path.relative(record.path, target)).digest("hex").slice(0, 12);
     const destination = gcDestination(statePath, record, `${path.basename(target)}-${cacheKey}`);
     invalidateCapacity();
