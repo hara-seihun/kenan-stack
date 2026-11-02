@@ -319,3 +319,19 @@ test('native status returns the owned original receipt, never another worker log
  assert.equal(backgroundStatus(spec,binding,1000,{root,execute}).log,'/original/exact.log');
  assert.equal(backgroundStatus(spec,binding,1001,{root,execute}).code,'background_owner_mismatch');
 }));
+
+test('a manager background release has the same exact root-authenticated identity as a UUID worker',()=>{
+ const manager={...binding,agentId:'manager:converge'},request={...input,agentId:manager.agentId};
+ const launch=backgroundSpec(request,manager,1000,1000),g='/user.slice/user-agents.slice/'+launch.unit;
+ assert.equal(launch.unit,'kenan-bg-manager:converge-fixture.service');
+ const seen=procScope(100,{read:()=>`0::${g}`,kernel:()=>({kind:'unavailable'}),query:()=>({status:0,stdout:Object.entries({...properties,Description:launch.description,ControlGroup:g}).map(([k,v])=>k+'='+v).join('\n')})});
+ assert.deepEqual(callerToolCall({pid:100,scope:()=>seen,uid:()=>1000,parent:()=>1}),manager);
+ const refused=releaseCaller({caller:()=>null,pid:100,cgroup:()=>`0::${g}`,argv:()=>['node'],parent:()=>1});
+ assert.equal(refused.error.code,'release-caller-unverified');
+ assert.throws(()=>backgroundSpec({...request,agentId:'manager:other'},manager,1000,1000),/owner_mismatch/);
+});
+
+test('the importable background launcher can be loaded from node standard input',()=>{
+ const result=spawnSync(process.execPath,['--input-type=module','-'],{input:`await import(${JSON.stringify(new URL('./background-launch.mjs',import.meta.url).href)});`,encoding:'utf8',timeout:5000});
+ assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
+});

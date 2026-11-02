@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 
 const native=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/;
-const background=/^kenan-bg-([a-f0-9-]{36})-[-A-Za-z0-9._]{1,60}\.service$/;
+const background=/^kenan-bg-([a-f0-9-]{36}|manager:[a-z][a-z0-9-]{0,63})-[-A-Za-z0-9._]{1,60}\.service$/;
 const same=(a,b)=>a.dev===b.dev&&a.ino===b.ino&&a.size===b.size&&a.mtimeMs===b.mtimeMs&&a.ctimeMs===b.ctimeMs;
 
 // A populated kernel scope and systemd's root-owned transient description are

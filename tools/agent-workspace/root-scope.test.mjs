@@ -72,3 +72,12 @@ for(const [name,mutate] of [
  ['changed invocation',f=>{let n=0;f.io.readlinkSync=()=>++n===1?'a'.repeat(32):'b'.repeat(32);}],
  ['moved process',f=>f.files.set(`/proc/${pid}/cgroup`,'0::/foreign\n')]
 ])test('background kernel identity refuses '+name,()=>{const f=fixture({unit:bgUnit,identity:bgIdentity});mutate(f);assert.equal(rootScope(pid,bgGroup,bgUnit,{io:f.io}).kind,'refused');});
+
+test('a full manager identity is proved by the exact populated background kernel scope',()=>{
+ const agentId='manager:converge',u=`kenan-bg-${agentId}-release.service`,g=`/user.slice/user-agents.slice/user-agents-kenanbg.slice/${u}`;
+ const f=fixture({unit:u,identity:{...bgIdentity,agentId}});
+ const observed=procScope(pid,{read:()=>`0::${g}`,kernel:(p,g,u)=>rootScope(p,g,u,{io:f.io}),query:()=>assert.fail('no manager RPC')});
+ assert.equal(callerToolCall({pid,scope:()=>observed,uid:()=>1002}).agentId,agentId);
+ f.files.set('/run/systemd/transient/'+u,f.files.get('/run/systemd/transient/'+u).replace(agentId,'manager:other'));
+ assert.equal(rootScope(pid,g,u,{io:f.io}).kind,'refused');
+});

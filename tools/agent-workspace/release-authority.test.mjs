@@ -15,7 +15,7 @@ const PARENT='11111111-1111-4111-8111-111111111111';
 const CHILD='22222222-2222-4222-8222-222222222222';
 const identity=agentId=>({agentId,channel:'beta',callId:'call-'+agentId});
 const authenticate=pairs=>({errors:[],confirmed:new Map(pairs.map(p=>[p.agentId+'\0'+p.callId,['beta']]))});
-const authority=(agentId,more={})=>({caller:()=>({ok:true,kind:'native',binding:identity(agentId)}),authenticate,...more});
+const authority=(agentId,more={})=>({delegate:()=>({allowed:false}),caller:()=>({ok:true,kind:'native',binding:identity(agentId)}),authenticate,...more});
 const args=entries=>({positional:[],named:new Map(entries.map(([k,v])=>[k,[String(v)]]))});
 function capture(action) {
   let out='';const write=process.stdout.write,exit=process.exitCode;
@@ -257,3 +257,62 @@ test('a tool call that never appears is refused after the bounded wait',()=>fixt
   const result=authorizeWorkspaceRelease(f.db,[f.record],f.state,authority(PARENT,{authenticate:never,confirmWaitMs:600}));
   assert.equal(result.error.code,'release-caller-unverified');assert.ok(Date.now()-started>=500);
 }));
+
+// November 2: manager-owned checkouts must be releasable by the worker doing its work.
+test('an authenticated delegated worker releases published manager custody without reassigning it',()=>fixture(f=>{
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run('manager:converge',f.record.id);
+ const result=f.invoke(authority(CHILD,{delegate:(binding,owner)=>{
+  assert.equal(binding.agentId,CHILD);assert.equal(owner,'manager:converge');return {allowed:true,kind:'custodian-child'};
+ }})).result;
+ assert.equal(result.action,'released',JSON.stringify(result));assert.equal(result.record.owner,'manager:converge');
+ assert.equal(fs.existsSync(f.source),false);
+ assert.equal(f.db.prepare('SELECT count(*) AS n FROM workspace_reassignment').get().n,0);
+}));
+test('delegated ordinary cleanup never grants reassignment or explicit end-retention authority',()=>fixture(f=>{
+ const deps=authority(CHILD,{delegate:()=>({allowed:true,kind:'custodian-goal'})});
+ const input={id:f.record.id,path:f.source,fromOwner:f.record.owner,fromSourceCommit:f.record.sourceCommit,fromState:'active',
+  owner:CHILD,sourceCommit:f.git('-C',f.source,'rev-parse','HEAD'),authorization:'a shared goal is not a source transfer'};
+ const before=f.snapshot();assert.equal(workspaceTesting.reassignWorkspace(f.db,input,deps).error.code,'release-owner-mismatch');assert.deepEqual(f.snapshot(),before);
+ const result=f.invoke(deps,[['end-retention',true],['owner',f.record.owner],['expected-plan-sha256','a'.repeat(64)]]);
+ assert.equal(result.result.error.code,'release-owner-mismatch');assert.deepEqual(f.snapshot(),before);
+}));
+test('delegated cleanup preserves dirty manager work in the normal recovery archive',()=>fixture(f=>{
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run('manager:converge',f.record.id);
+ fs.writeFileSync(path.join(f.source,'proof'),'unpublished manager work');
+ const result=f.invoke(authority(CHILD,{delegate:()=>({allowed:true})})).result;
+ assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));
+ assert.equal(execFileSync('tar',['--zstd','-xOf',result.workingTreeArchive,'proof'],{encoding:'utf8'}),'unpublished manager work');
+}));
+test('a shared goal does not cross an authenticated custody channel',()=>fixture(f=>{
+ bindNativeOwner(f.db,f.record.id,{...identity(PARENT),channel:'production'},'caller-scope',{});
+ const before=f.snapshot();
+ const result=f.invoke(authority(CHILD,{delegate:()=>assert.fail('cross-channel delegation is forbidden')})).result;
+ assert.equal(result.error.code,'release-owner-mismatch');assert.deepEqual(f.snapshot(),before);
+}));
+
+test('delegated cleanup still retains unpublished commits and their generated cache',()=>fixture(f=>{
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run('manager:converge',f.record.id);
+ fs.writeFileSync(path.join(f.source,'proof'),'unpublished committed manager work');f.git('-C',f.source,'commit','-am','private work');
+ const result=f.invoke(authority(CHILD,{delegate:()=>({allowed:true})})).result;
+ assert.equal(result.physicalDisposition.kind,'retained',JSON.stringify(result));
+ assert.equal(fs.readFileSync(path.join(f.source,'proof'),'utf8'),'unpublished committed manager work');
+ assert.equal(fs.existsSync(path.join(f.source,'node_modules','cache')),true);
+}));
+
+test('the actual native worker releases its own manager custody through the native assignment',t=>{
+ const self=nativeCaller();
+ if(self===null){t.skip('This proof requires an actual native tool scope.');return;}
+ // A Converge fixture: real parent/goal rows and exact native tool-call authentication,
+ // not an injected release caller or an owner-label authorization string.
+ fixture(f=>{
+  f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run('manager:converge',f.record.id);
+  unbindNativeOwner(f.db,f.record.id);
+  const result=spawnSync(process.execPath,[new URL(workspaceModule).pathname,'release','--path',f.source,'--json'],{
+   env:{...process.env,PI_WORKSPACE_STATE:f.state,KENAN_AGENT:self.agentId},encoding:'utf8',timeout:30000});
+  assert.equal(result.status,0,result.stdout+'\n'+result.stderr);
+  const response=JSON.parse(result.stdout);
+  assert.ok(['released','release-completed'].includes(response.action),result.stdout);
+  assert.equal(fs.existsSync(f.source),false);
+  assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,'manager:converge');
+ });
+});

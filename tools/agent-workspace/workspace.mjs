@@ -38,6 +38,7 @@ import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } f
 import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, hostMirrorBorrowers, markMirrorUse, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
 import {awaitSubmittedRelease,RELEASE_AWAIT_MS} from './release-await.mjs';
+import {releaseUnitCessation} from './release-unit.mjs';
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -4441,7 +4442,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   assertOnly(args, ["id", "path", "reap-expired", "preserve-runtime", "json", "end-retention", "owner", "expected-plan-sha256"]);
   const record = recordBy(database, selectorFrom(args, 'release'));
   const records = recordsInGroup(database, record);
-  const authority = authorizeWorkspaceRelease(database, records.length ? records : [record], statePath, {deadline:inspectionDeadline??Date.now()+30000,...authorityDependencies});
+  const authority = authorizeWorkspaceRelease(database, records.length ? records : [record], statePath, {deadline:inspectionDeadline??Date.now()+30000,allowDelegates:!bool(args,"end-retention"),...authorityDependencies});
   if (!authority.ok) {
     if (bool(args, "json")) print(authority, true);
     else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);
@@ -6007,13 +6008,6 @@ Records outlive the directory, so status explains what became of a checkout that
 
 export const workspaceTesting = { leaveReleaseDirectory, processReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
-// Whether a submission's background unit has ceased (never a guess: an observation error is "not ceased").
-function releaseUnitCessation(row) {
-  const observed=command('systemctl',['show','--property=LoadState','--property=ActiveState','--property=MainPID','--property=ControlPID',`${JSON.parse(row.launch_json??'null')?.started??`kenan-bg-${JSON.parse(row.binding_json).agentId}-${row.unit_name}`}.service`],{timeout:2000});
-  const fields=Object.fromEntries(String(observed.stdout??'').trim().split('\n').map(line=>line.split('=')));
-  return {ceased:!observed.error&&observed.status===0&&((fields.LoadState==='not-found')||(fields.MainPID==='0'&&fields.ControlPID==='0'&&['inactive','failed'].includes(fields.ActiveState)))};
-}
-
 // A detached physical release must not be pinned by its submitter's inherited cwd.
 // Resolve the selector and flags first, then move only this administrative process;
 // real shells, descriptors, executables and other writers remain in the census.
@@ -6030,13 +6024,13 @@ function releaseForegroundAttempt(database,args,statePath,selected,{deadline,rel
   try {
     return duringInspection(deadline,()=>{
       const members=recordsInGroup(database,record);
-      const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline,...releaseAuthorityDependencies});
+      const authority=authorizeWorkspaceRelease(database,members.length?members:[record],statePath,{deadline,allowDelegates:!bool(args,"end-retention"),...releaseAuthorityDependencies});
       if(!authority.ok&&authority.error?.code==='release-owner-mismatch')return allowAdoption?{adopt:authority}:{refused:authority,adoption};
       if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
       const foreground=authority.kind==='native'&&releaseScope?.background!==true;
       const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
       const submitted=lock(()=>{
-        if(!foreground){releaseCommand(database,args,statePath,{deadline,...releaseAuthorityDependencies});return;}
+        if(!foreground){releaseCommand(database,args,statePath,{deadline,allowDelegates:!bool(args,"end-retention"),...releaseAuthorityDependencies});return;}
         assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
         const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
           members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};

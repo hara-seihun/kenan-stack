@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {callerToolCall} from './cache-queue.mjs';
+import {NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
 const run=(cmd,args,opts={})=>spawnSync(cmd,args,{encoding:'utf8',timeout:10000,maxBuffer:2**20,...opts});
 // Cleanup shells commonly change directory before releasing their own checkout.
 // systemd still retains the original WorkingDirectory, even after that shell cd.
@@ -17,7 +18,7 @@ export function backgroundDirectory(input,home){
 }
 export function backgroundSpec(input,binding,uid,gid){
  if(!binding||!Number.isSafeInteger(uid)||uid<=0||!Number.isSafeInteger(gid)||gid<0)throw Error('background_native_caller_required');
- if(!/^[a-f0-9-]{36}$/.test(binding.agentId)||!/^[-A-Za-z0-9._]{1,60}$/.test(input.name??'')||input.agentId!==binding.agentId)throw Error('background_owner_mismatch');
+ if(!NATIVE_CUSTODIAN_ID.test(binding.agentId)||!/^[-A-Za-z0-9._]{1,60}$/.test(input.name??'')||input.agentId!==binding.agentId)throw Error('background_owner_mismatch');
  if(!Array.isArray(input.argv)||!input.argv.length||input.argv.some(x=>typeof x!=='string'||x.includes('\0'))||!input.argv[0].startsWith('/')||typeof input.after!=='string'||!input.after.startsWith('/')||input.after.includes('\0')||typeof input.cwd!=='string'||!input.cwd.startsWith('/')||!Array.isArray(input.env)||input.env.some(x=>typeof x!=='string'||!x.includes('=')||x.includes('\0'))||!/^0?[0-7]{3}$/.test(input.umask??''))throw Error('background_invalid_launch');
  const unit=`kenan-bg-${binding.agentId}-${input.name}.service`;
  const description='kenan-tool-call:'+JSON.stringify({version:1,...binding,background:true,uid});
@@ -305,4 +306,4 @@ export function main(){
  console.log(JSON.stringify(response));
 
 }
-if(process.argv[1]&&new URL(import.meta.url).pathname===fs.realpathSync(process.argv[1])){try{main();}catch(error){console.error(error.message);process.exitCode=2;}}
+if(process.argv[1]&&fs.existsSync(process.argv[1])&&new URL(import.meta.url).pathname===fs.realpathSync(process.argv[1])){try{main();}catch(error){console.error(error.message);process.exitCode=2;}}

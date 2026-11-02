@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import {observeReleaseDelegation} from './release-delegation.mjs';
 import {nativeCaller, nativeOwnerBinding, admissionReceipts, authenticateToolCalls, receiptBinding} from './native-owner.mjs';
 import {OWNER_AGENT_ID,NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
 import {serverChannel} from './cache-queue.mjs';
@@ -16,7 +17,7 @@ export function releaseCaller({caller=nativeCaller, pid=process.pid,
     const binding=caller({onError:error=>{diagnostic=error;}});
     if(binding!==null)return {ok:true, kind:'native', binding};
     for(let current=pid, depth=0;current>1&&depth<64;depth++) {
-      if(cgroup(current).includes('/agent-tool-')||/\/kenan-bg-(?:[a-f0-9]{8}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})-/.test(cgroup(current))||serverChannel(argv(current))!==null)
+      if(cgroup(current).includes('/agent-tool-')||/\/kenan-bg-(?:manager:[a-z0-9-]*|[a-f0-9]{8}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})-/.test(cgroup(current))||serverChannel(argv(current))!==null)
         return {...refused('release-caller-unverified','The native tool context exists, but its authenticated caller identity is unavailable.'+(diagnostic?` ${diagnostic.code}: ${diagnostic.detail}`:'')),...(diagnostic?{diagnostic}: {})};
       const up=parent(current);
       if(!Number.isSafeInteger(up)||up<1||up===current)
@@ -44,7 +45,7 @@ function ownerOf(database,record,statePath,deadline,authenticate) {
 // This observation is read-only. In particular it never binds an admission receipt, drops a
 // lease, starts a release journal or changes the checkout on a rejected request.
 export function authorizeWorkspaceRelease(database,records,statePath,{caller=releaseCaller,authenticate=authenticateToolCalls,
-  deadline=Date.now()+30000,confirmWaitMs=10000}={}) {
+  deadline=Date.now()+30000,confirmWaitMs=10000,allowDelegates=false,delegate=observeReleaseDelegation}={}) {
   const self=caller();
   if(!self.ok)return self;
   if(self.kind==='operator')return {ok:true,kind:'operator'};
@@ -79,11 +80,17 @@ export function authorizeWorkspaceRelease(database,records,statePath,{caller=rel
     return {...refused('release-caller-unverified',`The exact caller tool call is not uniquely authenticated in its native store (${code}; ${channels.length} channels).`),
       diagnostic:{code,channelCount:channels.length,errors}};
   }
+  const delegations=new Map();
   for(const record of records) {
     const owner=ownerOf(database,record,statePath,deadline,authenticate);
     if(!owner.ok)return owner;
     if(owner.agentId===null)return refused('release-owner-unbound',`${record.id}: This checkout has no authenticated native custodian. Use an explicit transfer by the existing non-native operator before releasing it.`);
-    if(owner.agentId!==binding.agentId||owner.channel!==null&&owner.channel!==binding.channel)
+    const sameChannel=owner.channel===null||owner.channel===binding.channel;
+    if(owner.agentId!==binding.agentId&&sameChannel&&allowDelegates){
+      if(!delegations.has(owner.agentId))delegations.set(owner.agentId,delegate(binding,owner.agentId,{deadline}));
+      if(delegations.get(owner.agentId)?.allowed===true)continue;
+    }
+    if(owner.agentId!==binding.agentId||!sameChannel)
       return refused('release-owner-mismatch',`${record.id}: The native caller ${binding.agentId} does not own this checkout; its custodian is ${owner.agentId}.`);
   }
   return {ok:true,kind:'native',binding};

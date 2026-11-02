@@ -34,7 +34,7 @@ export function procScope(pid,{read=p=>fs.readFileSync(`/proc/${p}/cgroup`,'utf8
  const rows=read(pid).trim().split('\n');
  const group=rows.find(r=>r.startsWith('0::'))?.slice(3),unit=group?.split('/').at(-1);
  const nativeScope=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/.test(unit??'');
- const nativeBackground=/^kenan-bg-[a-f0-9-]{36}-[-A-Za-z0-9._]{1,60}\.service$/.test(unit??'')&&group?.startsWith('/user.slice/user-agents.slice/');
+ const nativeBackground=/^kenan-bg-(?:[a-f0-9-]{36}|manager:[a-z][a-z0-9-]{0,63})-[-A-Za-z0-9._]{1,60}\.service$/.test(unit??'')&&group?.startsWith('/user.slice/user-agents.slice/');
  const fail=(code,detail)=>{onError({code,detail});return null;};
  if(!group||!nativeScope&&!nativeBackground)return fail('caller-scope-missing','The process is not in a recognized native tool scope.');
  const observed=kernel(pid,group,unit);
