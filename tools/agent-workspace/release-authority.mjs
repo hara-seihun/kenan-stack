@@ -61,6 +61,15 @@ export function authorizeWorkspaceRelease(database,records,statePath,{caller=rel
     authentication=authenticate([binding],{deadline});
     channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
   }
+  // Store timeouts cannot revoke a running root-authenticated native invocation.
+  // Reobserve the actual process, never an environment variable or cached grant.
+  // A healthy store's missing/foreign result remains a refusal.
+  if(authentication.errors.length&&authentication.errors.every(error=>/statement timeout|ETIMEDOUT|authentication deadline exhausted/.test(String(error)))){
+    const actual=nativeCaller();
+    if(actual&&actual.agentId===binding.agentId&&actual.callId===binding.callId&&actual.channel===binding.channel)
+      authentication={errors:[],confirmed:new Map([[binding.agentId+'\0'+binding.callId,[binding.channel]]])};
+  }
+  channels=authentication.confirmed.get(binding.agentId+'\0'+binding.callId)??[];
   if(authentication.errors.length||channels.length!==1||channels[0]!==binding.channel) {
     const code=authentication.errors.length?'caller-tool-store-unavailable':channels.length===0?'caller-tool-unconfirmed':channels.length>1?'caller-tool-channel-ambiguous':'caller-tool-channel-mismatch';
     // Keep the first bounded error line, not SQL context, quoted values or the private identity.

@@ -1268,3 +1268,14 @@ price receipt. A current mirror generation still invalidates closure evidence;
 actual checkout admission still observes current capacity. Regression:
 `source-ready-reuse.test.mjs` exercises a real foreground timeout, changing
 admission observations, reuse of the completed proof, and immutable old results.
+
+### Native caller lookup under load
+
+`bash tools/agent-workspace/install-call-index beta` (and `production`) installs the
+idempotent, concurrent `message_tool_call_ids` GIN index as the table-owning work
+role. The exact call ID narrows candidate messages before the full tool identity
+and owning conversation are checked. The lookup retries a statement timeout once
+within its original deadline. Only a freshly reobserved, identical root-bound
+running invocation can replace a timed-out store observation during release;
+healthy missing or foreign records, admission receipts, and arbitrary shell
+identities do not gain that fallback. The database index survives runtime restarts.

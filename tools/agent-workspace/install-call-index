@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run through a bounded pg heavy slot as the message table's owning database role.
+set -euo pipefail
+if (( EUID != 0 )); then exec sudo -n bash "$(realpath "$0")" "$@"; fi
+channel=${1:?channel required}
+[[ $channel =~ ^[a-z][a-z0-9-]{0,23}$ ]] || exit 64
+exec /usr/bin/psql -X -v ON_ERROR_STOP=1 -h /run/kenan/pg -U root -d "kenan_${channel//-/_}" <<'SQL'
+SET statement_timeout='120s';
+SET lock_timeout='2s';
+SET maintenance_work_mem='32MB';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS message_tool_call_ids ON message USING gin ((jsonb_path_query_array(parts, '$[*].callId'))) WHERE role='tool';
+SQL

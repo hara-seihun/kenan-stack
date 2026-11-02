@@ -124,12 +124,12 @@ export function toolCallAuthenticationSql(pairs){
  return `BEGIN READ ONLY; SET LOCAL statement_timeout='8000ms';
  WITH requested(agent_id,call_id) AS (VALUES ${values}),
  identities AS MATERIALIZED (SELECT v.agent_id,v.call_id,a.conversation_id FROM requested v JOIN agent a ON a.id::text=v.agent_id),
- conversations AS (SELECT DISTINCT conversation_id FROM identities),
- calls AS MATERIALIZED (SELECT c.conversation_id,p->>'callId' AS call_id FROM conversations c
-  CROSS JOIN LATERAL (SELECT parts FROM message WHERE conversation_id=c.conversation_id OFFSET 0) m
-  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(m.parts)='array' THEN m.parts ELSE '[]'::jsonb END) p WHERE p->>'type'='tool')
- SELECT coalesce(json_agg(json_build_object('agentId',v.agent_id,'callId',v.call_id)),'[]'::json) FROM identities v
- WHERE EXISTS (SELECT 1 FROM calls c WHERE c.conversation_id=v.conversation_id AND c.call_id=v.call_id); ROLLBACK;`;
+ matching AS (SELECT v.agent_id,v.call_id FROM identities v WHERE EXISTS (
+  SELECT 1 FROM message m WHERE m.role='tool'
+   AND jsonb_path_query_array(m.parts, '$[*].callId') @> jsonb_build_array(v.call_id)
+   AND m.conversation_id=v.conversation_id
+   AND m.parts @> jsonb_build_array(jsonb_build_object('type','tool','callId',v.call_id))))
+ SELECT coalesce(json_agg(json_build_object('agentId',agent_id,'callId',call_id)),'[]'::json) FROM matching; ROLLBACK;`;
 }
 
 // Which pairs the native store confirms, per channel. Any channel failure fails the whole
@@ -146,7 +146,9 @@ export function authenticateToolCalls(pairs,{deadline,channels=kenanChannels,exe
    for(const channel of channels()){
     if(!CHANNEL.test(channel))throw new Error('invalid Kenan Stack channel: '+channel);
     const remaining=deadline-Date.now();if(remaining<=0)throw new Error('authentication deadline exhausted before '+channel);
-    const result=execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,'--dbname',channelDatabase(channel),'--set=ON_ERROR_STOP=1','--command',toolCallAuthenticationSql(batch)],{encoding:'utf8',timeout:Math.min(10_000,remaining),maxBuffer:16<<20,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
+    const query=()=>execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,'--dbname',channelDatabase(channel),'--set=ON_ERROR_STOP=1','--command',toolCallAuthenticationSql(batch)],{encoding:'utf8',timeout:Math.max(1,Math.min(10_000,deadline-Date.now())),maxBuffer:16<<20,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
+    let result=query();
+    if((result.error?.code==='ETIMEDOUT'||/statement timeout/.test(result.stderr??''))&&deadline-Date.now()>1000)result=query();
     if(result.status!==0||result.error)throw new Error('native tool-call observation unavailable: '+channel+': '+String(result.error?.code??result.stderr??result.status).trim().slice(0,1500));
     let rows;try{rows=JSON.parse(String(result.stdout).trim());}catch{throw new Error('native tool-call observation malformed: '+channel);}
     if(!Array.isArray(rows))throw new Error('native tool-call observation malformed: '+channel);

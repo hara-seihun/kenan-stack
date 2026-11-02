@@ -211,3 +211,22 @@ test('receipt migration refuses oversized pair sets and expired traversal deadli
   assert.equal(admissionReceipts(state,WS,REQUEST,{deadline:Date.now()-1}).code,'receipt-deadline');
  }finally{fs.rmSync(path.dirname(state),{recursive:true,force:true});}
 });
+
+test('exact authentication uses the tool-call GIN expression before inspecting complete message parts',()=>{
+ const sql=toolCallAuthenticationSql([{agentId:A,callId:'exact-call'}]);
+ assert.match(sql,/jsonb_path_query_array\(m.parts, '\$\[\*\].callId'\) @> jsonb_build_array\(v.call_id\)/);
+ assert.match(sql,/m.role='tool'/);assert.match(sql,/m.conversation_id=v.conversation_id/);
+ assert.doesNotMatch(sql,/jsonb_array_elements|OFFSET 0|calls AS MATERIALIZED/);
+});
+test('an exact statement timeout is retried once and the retry stays in the original channel',()=>{
+ let calls=0;const pairs=[{agentId:A,callId:'exact-call'}];
+ const io={deadline:Date.now()+30000,channels:()=>['beta'],user:()=> 'kenan',execute:(name,args)=>{
+  assert.equal(args[args.indexOf('--dbname')+1],'kenan_beta');
+  return ++calls===1?{status:1,stderr:'ERROR: canceling statement due to statement timeout'}:{status:0,stdout:JSON.stringify(pairs)};
+ }};
+ const found=authenticateToolCalls(pairs,io);assert.equal(calls,2);assert.deepEqual(found.errors,[]);assert.deepEqual(found.confirmed.get(A+'\0exact-call'),['beta']);
+});
+test('persistent timeout remains unknown after one bounded retry',()=>{
+ let calls=0;const found=authenticateToolCalls([{agentId:A,callId:'exact-call'}],{deadline:Date.now()+30000,channels:()=>['beta'],user:()=> 'kenan',execute:()=>{calls++;return {status:1,stderr:'statement timeout'};}});
+ assert.equal(calls,2);assert.equal(found.errors.length,1);assert.equal(found.confirmed.size,0);
+});
