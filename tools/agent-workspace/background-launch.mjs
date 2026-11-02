@@ -57,8 +57,8 @@ export function settleBackground(result,observed,spec){
   return {ok:true,state:observed.ActiveState==='activating'?'starting':undefined};
  }
  if(result&&result.status!==null&&!result.error&&!result.signal)return {ok:false,code:'background_launch_refused',retry:true,detail:(result.stderr||'The system manager rejected unit creation.').trim().slice(0,4000)};
- // No reply and no unit yet. The reservation stays pending; the next identical launch reconciles it (finds the unit or
- // the job's log if it started, or submits it once if it never did).
+ // No reply and no unit yet. The reservation stays pending until its original
+ // effect is reconciled; an absent unit does not authorize another submission.
  return {ok:false,code:'background_launch_outcome_unknown',retry:false,detail:`systemd gave no answer (${result?.error?.code||result?.signal||'no reply'}); reconcile the original unit and log. Absence alone never permits replay.`};
 }
 // kenan-bg stop. SIGTERM can't interrupt a long synchronous computation (a CPU-bound node --test child kept 2.8 GB
@@ -285,10 +285,8 @@ export function main(){
   let saved;try{saved=JSON.parse(fs.readFileSync(`${BACKGROUND_ROOT}/${spec.unit}.json`,'utf8'));}catch{}
   const marker=saved?.log&&saved.uid===uid&&saved.channel===binding.channel?jobMarker(spec.unit,saved.log):null;
   if(properties.LoadState==='not-found'){
-   // A launch whose caller was cut off before systemd answered: the job never started, and the same command starts it.
-   if(process.argv[2]==='status'){console.log(saved?.state==='pending'&&saved.log&&!fs.existsSync(saved.log)?'not-started':'inactive');process.exitCode=3;}
-   // The unit is gone, but a cpu-slot scope it started may still run: a repeated stop finds it by the job's marker.
-   else{const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;}
+   // The unit is gone, but a scope it started may still run: find it by the original marker.
+   const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;
    return;
   }
   if(observed.status!==0||properties.Description!==spec.description) {
@@ -296,10 +294,7 @@ export function main(){
    let prior;try{prior=JSON.parse((properties.Description??'').slice('kenan-tool-call:'.length));}catch{}
    if(!prior?.background||prior.agentId!==binding.agentId||prior.channel!==binding.channel||prior.uid!==uid)throw Error('background_owner_mismatch');
   }
-  if(process.argv[2]==='status'&&properties.SubState==='exited'){console.log('inactive');return;}
-  if(process.argv[2]==='stop'){const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;return;}
-  const result=run('/usr/bin/systemctl',['--system','is-active',spec.unit]);
-  process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status;return;
+  const r=stopBackground(spec.unit,{marker});console.log(JSON.stringify(r));process.exitCode=r.state==='stopped'?0:1;return;
  }
  if(process.argv[2]!=='launch')throw Error('background_invalid_command');
  const response=launchOnce(input,binding,uid,spec,argsFor(spec,uid,gid));
