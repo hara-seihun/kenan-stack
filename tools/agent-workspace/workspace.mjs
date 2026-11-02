@@ -1724,6 +1724,8 @@ function freezeSourceCommand(database,args) {
     // Managed imports serialize mirror mutation with this same resource key.
     // Keep it through eligibility, preservation refs and physical freeze.
     const alternateFile=path.join(input.path,".git","objects","info","alternates");
+    // A frozen source keeps exactly its mirror: objects borrowed from a local origin move into the mirror first.
+    if(existsSync(alternateFile)&&readFileSync(alternateFile,"utf8").trim().includes("\n")) stabilizeObjectCustody(input.path,alternateFile,true,registryPaths.get(database),{borrowOrigin:false});
     const alternate=existsSync(alternateFile)?readFileSync(alternateFile,"utf8").trim():null;
     const freeze=()=>{
     let objectCustody=prepareFrozenObjectCustody({path:input.path,head:input.head,id:input.id,statePath:registryPaths.get(database),dryRun:true});
@@ -2842,15 +2844,40 @@ function renameAlternate(file, objectSource) {
   } finally { rmSync(temporary, { force: true }); }
 }
 
-function stabilizeObjectCustody(workspace, alternates, execute, statePath) {
+// A clone whose origin is a local bare repository (a research remote) also borrows that
+// repository's objects, listed after its mirror, so `git fetch origin` moves only refs.
+// 2026-11-02: a Seinari clone borrowing only its mirror fetched 143,207 objects it already
+// had on disk (115 s); with the remote's objects borrowed the same fetch took 0.24 s. The
+// remote has no alternates of its own and is never pruned (its upkeep repacks with -d
+// only, which keeps every object), and the mirror still holds the clone's source commit.
+function localOriginObjects(workspace) {
+  const url = command("git", ["-C", workspace, "config", "--local", "--get", "remote.origin.url"]);
+  if (url.status !== 0) return null;
+  const location = url.stdout.startsWith("file://") ? url.stdout.slice("file://".length) : url.stdout;
+  if (!path.isAbsolute(location) || !existsSync(location)) return null;
+  const bare = command("git", ["--git-dir", location, "rev-parse", "--is-bare-repository"]);
+  if (bare.status !== 0 || bare.stdout !== "true") return null;
+  const objects = path.join(realpathSync(location), "objects");
+  if (!existsSync(objects) || existsSync(path.join(objects, "info", "alternates"))) return null;
+  return objects;
+}
+
+function stabilizeObjectCustody(workspace, alternates, execute, statePath, { borrowOrigin = true } = {}) {
   if (!statePath) fail("reference clone custody requires the owning workspace registry");
   const mirrorRoot = path.join(path.dirname(statePath), "mirrors");
   const objectDirectory = path.dirname(path.dirname(alternates));
   const stores = readFileSync(alternates, "utf8").split("\n").filter(Boolean)
     .map(value => path.resolve(objectDirectory, value));
-  if (stores.every(store => existsSync(store) && path.basename(store) === "objects"
+  const origin = borrowOrigin ? localOriginObjects(workspace) : null;
+  const durableMirror = store => existsSync(store) && path.basename(store) === "objects"
     && path.dirname(path.dirname(store)) === mirrorRoot
-    && !existsSync(path.join(store, "info", "alternates")))) return "durable-mirror";
+    && !existsSync(path.join(store, "info", "alternates"));
+  if (stores.some(durableMirror) && stores.every(store => durableMirror(store) || store === origin)) {
+    if (origin === null || stores.includes(origin)) return "durable-mirror";
+    if (!execute) return "would-borrow-origin";
+    renameAlternate(alternates, [...stores, origin].join("\n"));
+    return "durable-mirror-borrowing-origin";
+  }
   if (!execute) return "would-import-durable-mirror";
   const upstream = repositoryRemotes(workspace);
   const mirror = mirrorFor(statePath, upstream.fetch);
@@ -2867,7 +2894,7 @@ function stabilizeObjectCustody(workspace, alternates, execute, statePath) {
       run("git", ["--git-dir", mirror, "fetch", "--no-tags", "--no-auto-maintenance", workspace,
         ...refs.slice(index, index + 128)], { timeout: 120_000 });
     }
-    renameAlternate(alternates, path.join(mirror, "objects"));
+    renameAlternate(alternates, [path.join(mirror, "objects"), ...(origin === null ? [] : [origin])].join("\n"));
   });
   return "imported-durable-mirror";
 }
@@ -3220,8 +3247,11 @@ function prepareSharedSourceClone(destination, repository, sourceCommit, input, 
   const rawDirectory = git(destination, ["rev-parse", "--absolute-git-dir"]);
   if (rawDirectory !== path.join(destination, ".git")) fail("pending shared source is not an independent clone");
   const alternates = path.join(rawDirectory, "objects", "info", "alternates");
-  if (existsSync(alternates) && readFileSync(alternates, "utf8") !== `${objectSource}\n`) {
-    fail("pending shared source object store differs; use maintain --path with --execute to import its current refs before resuming");
+  if (existsSync(alternates)) {
+    const [first, ...borrowed] = readFileSync(alternates, "utf8").split("\n").filter(Boolean);
+    if (first !== objectSource || borrowed.length > 1 || (borrowed.length === 1 && borrowed[0] !== localOriginObjects(destination))) {
+      fail("pending shared source object store differs; use maintain --path with --execute to import its current refs before resuming");
+    }
   }
   const head = command("git", ["-C", destination, "rev-parse", "--verify", "HEAD"]);
   if (head.status !== 0 && (existsSync(path.join(rawDirectory, "index")) || readdirSync(destination).some(name => name !== ".git"))) {

@@ -1385,7 +1385,7 @@ for (const seed of ["remote", "local"]) test(`priced sparse remote URL reuses ${
       : ["--repo", f.source, "--intent", "source-only", "--headroom-gib", "1", "--growth-mib", "8"];
     const imported = JSON.parse(run(["create", "--root", f.workspaces, "--name", "seed", ...seedArgs,
       "--ref", commit, ...selection, "--json"], seed === "local" ? f.env : env));
-    const mirror = path.dirname(readFileSync(path.join(imported.path, ".git", "objects", "info", "alternates"), "utf8").trim());
+    const mirror = path.dirname(readFileSync(path.join(imported.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]);
     const expected = workspaceTesting.sourceCapacityPlan(mirror, commit,
       { intent: "source-only", headroomBytes: 1024 ** 3, growthBytes: 8 * 1024 ** 2 },
       statfsSync(f.workspaces).bsize, mirror, ["/AGENTS.md", "/canon/real-model/binary-whole-map/"]);
@@ -1421,7 +1421,7 @@ process.exit(result.status ?? 1);
     assert.equal(readFileSync(path.join(created.path, "canon", "real-model", "binary-whole-map", "result.md"), "utf8"), "selected result\n");
     assert.equal(existsSync(path.join(created.path, "excluded.bin")), false);
     assert.equal(git(created.path, "config", "--local", "--get", "remote.origin.url"), repository);
-    assert.equal(path.dirname(readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").trim()), mirror);
+    assert.equal(path.dirname(readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]), mirror);
     assert.deepEqual(JSON.parse(run(args, offline)), created);
     const db = new DatabaseSync(f.env.PI_WORKSPACE_STATE);
     db.prepare("DELETE FROM workspace_capacity WHERE workspace_id=?").run(created.id);
@@ -1450,7 +1450,7 @@ for (const repair of ["local-priced", "remote-unestimated"]) test(`${sparse ? "s
     const selection = sparse ? ["--sparse-pattern", "/selected/"] : [];
     const base = ["create", "--root", f.workspaces, "--repo", repository, "--ref", commit, ...selection, "--json"];
     const seed = JSON.parse(run([...base, "--name", "seed", "--min-free-gib", "0"], f.env));
-    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").trim());
+    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]);
     // Keep the commit and source ref, but remove one reachable object from actual custody.
     const objects = git(f.source, "rev-list", "--objects", "--no-object-names", commit).split("\n");
     for (const id of objects) {
@@ -1521,7 +1521,7 @@ test("sparse custody admission never walks history or reads a large excluded blo
     git(f.source, "push", "origin", "main");
     const seed = JSON.parse(run(["create", "--root", f.workspaces, "--name", "seed", "--repo", repository,
       "--ref", commit, "--min-free-gib", "0", "--json"], f.env));
-    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").trim());
+    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]);
     const objects = git(f.source, "rev-list", "--objects", "--no-object-names", commit).split("\n");
     for (const id of objects) {
       mkdirSync(path.join(mirror, "objects", id.slice(0, 2)), { recursive: true });
@@ -1561,7 +1561,7 @@ test("fresh durable source import retains its received pack instead of unpacking
     const created = JSON.parse(run(["create", "--root", f.workspaces, "--name", "packed-import", "--repo", `file://${f.remote}`,
       "--ref", commit, "--min-free-gib", "0", "--json"], f.env));
     assert.equal(created.state, "active");
-    const objects = readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").trim();
+    const objects = readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0];
     const packs = readdirSync(path.join(objects, "pack")).filter(name => name.endsWith(".pack"));
     assert.ok(packs.length > 0, "a first import must retain Git's received pack");
     for (const pack of packs) assert.equal(existsSync(path.join(objects, "pack", pack.replace(/\.pack$/u, ".idx"))), true);
@@ -1660,7 +1660,7 @@ test("repeated full custody admission reuses verified closure without another hi
     const commit = git(f.source, "rev-parse", "HEAD");
     const args = ["create", "--root", f.workspaces, "--repo", repository, "--ref", commit, "--json"];
     const seed = JSON.parse(run([...args, "--name", "full-seed", "--min-free-gib", "0"], f.env));
-    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").trim());
+    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]);
     rmSync(f.source, { recursive: true });
     rmSync(f.remote, { recursive: true });
     const offline = forbidGitOperations(f, ["rev-list", "fetch", "ls-remote"], { mirrorOnly: true });
@@ -1670,7 +1670,7 @@ test("repeated full custody admission reuses verified closure without another hi
       assert.equal(created.state, "active");
       assert.equal(created.capacity.sourceImportBytes, 0);
       assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "source\n");
-      assert.equal(path.dirname(readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").trim()), mirror);
+      assert.equal(path.dirname(readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0]), mirror);
     }
     const operations = readFileSync(offline.PI_WORKSPACE_TEST_GIT_LOG, "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.equal(operations.some(args => args.includes("--git-dir") && args.includes("rev-list")), false);
@@ -1700,7 +1700,7 @@ test("budgeted source creation shares existing objects and records immutable spa
     assert.equal(existsSync(path.join(created.path, "excluded.bin")), false);
     assert.equal(readFileSync(path.join(created.path, "file.txt"), "utf8"), "source\n");
     assert.equal(existsSync(path.join(created.path, ".git", "objects", "info", "alternates")), true);
-    const alternate = readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").trim();
+    const alternate = readFileSync(path.join(created.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0];
     assert.equal(alternate.startsWith(path.join(f.root, "state", "mirrors")), true);
     assert.equal(existsSync(path.join(alternate, "info", "alternates")), false);
     assert.equal(created.capacity.sourceImportBytes > 0, true);
@@ -1710,7 +1710,7 @@ test("budgeted source creation shares existing objects and records immutable spa
     assert.deepEqual(JSON.parse(run(args, f.env)).capacity, created.capacity);
     const shared = JSON.parse(run(args.map(arg => arg === "priced" ? "priced-peer" : arg), f.env));
     assert.equal(shared.capacity.sourceImportBytes, 0);
-    assert.equal(readFileSync(path.join(shared.path, ".git", "objects", "info", "alternates"), "utf8").trim(), alternate);
+    assert.equal(readFileSync(path.join(shared.path, ".git", "objects", "info", "alternates"), "utf8").split("\n")[0], alternate);
     const fullArgs = args.filter((arg, index) => arg !== "--sparse-pattern" && args[index - 1] !== "--sparse-pattern")
       .map(arg => arg === "priced" ? "priced-full" : arg);
     const full = JSON.parse(run(fullArgs, f.env));
@@ -1814,7 +1814,7 @@ for (const custody of ["creation", "registration", "maintenance"]) test(`${custo
       assert.equal(readFileSync(alternateFile, "utf8"), previous);
       const [applied] = JSON.parse(run(["maintain", "--path", borrower, "--execute", "--json"], f.env));
       assert.equal(applied.objectCustody, "imported-durable-mirror");
-      const mirror = path.dirname(readFileSync(alternateFile, "utf8").trim());
+      const mirror = path.dirname(readFileSync(alternateFile, "utf8").split("\n")[0]);
       git(mirror, "repack", "-a", "-d");
       git(mirror, "prune", "--expire=now");
     }
@@ -4262,7 +4262,7 @@ test("qualified ancestral custody prices and fetches only receiver delta", () =>
     const intent = { intent: "source-only", headroomBytes: 1024 ** 3, growthBytes: 8 * 1024 ** 2 };
     const seed = JSON.parse(run(["create", "--root", f.workspaces, "--name", "delta-seed", "--repo", f.source, "--ref", base,
       "--intent", "source-only", "--headroom-gib", "1", "--growth-mib", "8", "--json"], f.env));
-    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git/objects/info/alternates"), "utf8").trim());
+    const mirror = path.dirname(readFileSync(path.join(seed.path, ".git/objects/info/alternates"), "utf8").split("\n")[0]);
     git(f.source, "checkout", "-b", "sibling");
     writeFileSync(path.join(f.source, "sibling.txt"), "other branch\n");
     git(f.source, "add", "."); git(f.source, "commit", "-m", "divergent sibling");
