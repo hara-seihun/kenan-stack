@@ -3,7 +3,7 @@
  * A sender must already have removed admission and drained the account. This tool
  * never logs a credential, deletes a packet or changes the sender's custody.
  */
-import { readFileSync, writeFileSync, renameSync, statSync, chownSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, statSync, chownSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
@@ -93,5 +93,5 @@ export async function main(args) {
     console.log(JSON.stringify(result));
   } finally {store.close();release();}
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)
   main(process.argv.slice(2)).catch(error=>{console.error(error.message);process.exitCode=1;});

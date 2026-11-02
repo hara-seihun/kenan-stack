@@ -2,6 +2,11 @@ import { expect, it } from 'vitest';
 // @ts-expect-error The receiving CLI is a standalone Node deployment module.
 import { receiveClaudeAccount, readClaudeAdmission } from '../../../deploy/receive-claude-account.mjs';
 import { Store } from '../src/store.js';
+import { mkdtempSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 it('receives, grants and probes together; resume never overwrites a rotated token',async()=>{
   const auth: Record<string, any> = {}, events: string[] = [];
@@ -50,4 +55,14 @@ it('does not mistake an ended failed lease or a sibling account for successful a
     store.setControl('broker-grant:converge',JSON.stringify({accounts:[]}));
     expect(readClaudeAdmission(store,alias,now)).toBeUndefined();
   }finally{store.close();}
+});
+
+it('runs the installed command through its symlink rather than silently doing nothing',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'receive-link-'));
+  try{
+    const link=join(directory,'kenan-claude-account-receive');
+    symlinkSync(fileURLToPath(new URL('../../../deploy/receive-claude-account.mjs',import.meta.url)),link);
+    const result=spawnSync(process.execPath,[link],{encoding:'utf8'});
+    expect(result.status).toBe(1);expect(result.stderr).toContain('Usage:');
+  }finally{rmSync(directory,{recursive:true,force:true});}
 });
