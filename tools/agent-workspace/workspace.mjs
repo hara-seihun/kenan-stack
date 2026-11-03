@@ -2818,7 +2818,10 @@ function withResourceLock(statePath, key, action, deadline, { mode = "exclusive"
   let releaseRecord = null;
   try {
     const effectiveDeadline=maintenanceContext?.journal.deadline ?? deadline;
-    const waitMs = effectiveDeadline === undefined ? budgetMs : Math.max(0, Math.min(100, effectiveDeadline - Date.now()-250));
+    // Maintenance yields quickly between journal steps. Ordinary deadline-bound
+    // operations may wait through brief contention, within their remaining budget.
+    const waitMs = effectiveDeadline === undefined ? budgetMs
+      : Math.max(0, Math.min(maintenanceContext ? 100 : budgetMs, effectiveDeadline - Date.now()-250));
     const started = Date.now();
     const result = spawnSync("flock", [mode === "shared" ? "--shared" : "--exclusive", "--wait", String(waitMs / 1000), "3"], {
       stdio: ["ignore", "pipe", "pipe", descriptor], encoding: "utf8", timeout: waitMs + 1000,
