@@ -21,7 +21,7 @@ if [[ ${5:-} != locked ]]; then
  sudo install -m644 "$repo/tools/agent-workspace/admission-tmpfiles.conf" /etc/tmpfiles.d/agent-workspace.conf
  # The installed sampler has a 240-second execution budget. Admission waiting
  # must outlast a legitimate shared holder; the separate drain stays bounded.
- if sudo flock --exclusive --nonblock --conflict-exit-code 75 /srv/pi/.pi-stack-deploy.lock flock --exclusive --wait 30 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock.turnstile timeout 400 flock --exclusive --wait 300 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock "$0" "$repo" "$base" "$expected" "$receipt" locked; then
+ if sudo flock --exclusive --nonblock --conflict-exit-code 75 /srv/pi/.pi-stack-deploy.lock flock --exclusive --wait 30 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock.turnstile timeout 400 flock --exclusive --wait 300 --conflict-exit-code 75 /run/lock/agent-workspace-admission.lock /bin/bash "$0" "$repo" "$base" "$expected" "$receipt" locked; then
   exit 0
  else
   status=$?

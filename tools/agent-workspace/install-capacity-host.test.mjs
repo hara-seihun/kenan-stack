@@ -23,3 +23,8 @@ test('installation allows the existing 240-second sampler to finish without kill
  assert.ok(Number(wait)>240);assert.ok(Number(outer)>=Number(wait)+80);
  assert.match(source,/no PID or systemd unit is killed/);
 });
+
+test('locked installer reentry uses Bash even when the committed script is not executable',()=>{
+ const source=readFileSync(new URL('./install-capacity-host',import.meta.url),'utf8');
+ assert.match(source,/agent-workspace-admission\.lock" \/bin\/bash "\$0" "\$repo" "\$base" "\$expected" "\$receipt" locked/);
+});
