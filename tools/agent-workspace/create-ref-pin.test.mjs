@@ -100,6 +100,9 @@ test('one create call waits for its background jobs and returns the active works
 test('accepted pins survive time, rewritten or unavailable refs, and clear only at transfer', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'ref-pin-'));
   try {
+    const abbreviated = path.join(root, 'abbreviated.json');
+    assert.equal(pinnedSourceCommit({ file: abbreviated, resolve: () => 'abcdef12' }), 'abcdef12');
+    assert.equal(existsSync(abbreviated), false);
     const file = path.join(root, 'pin.json'), a = 'a'.repeat(40), b = 'b'.repeat(40);
     assert.equal(pinnedSourceCommit({ file, resolve: () => a, now: 1000 }), a);
     const original = readFileSync(file, 'utf8');

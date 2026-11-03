@@ -20,6 +20,9 @@ export function pinnedSourceCommit({ file, resolve, now = Date.now() }) {
     if (error.code !== "ENOENT") throw error;
   }
   const resolved = resolve();
+  // A remote abbreviated object name is resolved by the mirror preparation.
+  // It is already an explicit caller identity, not a mutable ref pin.
+  if (!/^[0-9a-f]{40}$/u.test(resolved)) return resolved;
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${randomUUID()}`;
   writeFileSync(temporary, JSON.stringify({ sourceCommit: resolved, at: now }), { mode: 0o600 });
