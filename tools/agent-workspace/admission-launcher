@@ -1,9 +1,22 @@
 #!/bin/sh
-# Stable host admission: resolve the selected implementation only AFTER admission.
+# Stable host admission: mutations resolve the implementation AFTER admission.
 # The brief turnstile prevents new readers from starving a pending publisher.
 set -eu
 lock=${AGENT_WORKSPACE_ADMISSION_LOCK:-/run/lock/agent-workspace-admission.lock}
 selected=${AGENT_WORKSPACE_SELECTED_ROOT:-/srv/pi/tools/agent-workspace}
+# These exact commands only inspect retained job receipts and systemd state. Pin
+# the complete component path once: selection is atomic and old trees are retained.
+# Do not extend this exception to generic status (which opens the registry).
+case ${1:-} in
+ job-status|source-status)
+  component=$(readlink -f -- "$selected")
+  # The launcher is installed before component selection. Older generations may
+  # still persist interrupted progress, so they must keep normal admission.
+  if [ -f "$component/read-only-job-observation-v1" ]; then
+   exec "$component/main" "$@"
+  fi
+  ;;
+esac
 deadline=$(( $(date +%s) + 20 ))
 busy() {
  printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication is draining or selecting tools. No command ran; the shared 20-second admission budget expired.","commandStarted":false,"waitBudgetSeconds":20}}'

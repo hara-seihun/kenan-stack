@@ -124,16 +124,22 @@ export function finishSourceJob(directory, result) {
 
 // Interruption is durable progress, not an immutable terminal result: explicit
 // same-identity recovery remains possible. Never settle an uncertain control RPC.
+function interruptedSourceJob() {
+  return { state: "interrupted", error: { code: "source-job-interrupted",
+    message: "source job stopped without a terminal result; repeat the original create request to resume" } };
+}
+
 export function recordSourceJobInterruption(directory, attempt) {
   const result = readTerminal(directory);
   if (result) return result;
-  const value = { state: "interrupted", error: { code: "source-job-interrupted",
-    message: "source job stopped without a terminal result; repeat the original create request to resume" } };
+  const value = interruptedSourceJob();
   atomicJson(path.join(directory, "progress.json"), { ...value, attempt: attempt.number,
     unit: attempt.unit, updatedAt: new Date().toISOString() });
   return value;
 }
 
+// Observation is strictly read-only, including stopped attempts. Only explicit
+// submission/recovery records interruption progress under its own lock.
 export function observeSourceJob(directory) {
   try {
     const result = readTerminal(directory);
@@ -150,7 +156,7 @@ export function observeSourceJob(directory) {
     if (completed) return completed;
     if (!observed.ok) return controlObservation(observed, path.basename(directory), directory);
     if (observed.state !== "running" && observed.state !== "stopping")
-      return recordSourceJobInterruption(directory, attempt.value);
+      return interruptedSourceJob();
     const progress = readJson(path.join(directory, "progress.json"));
     return { state: "pending", phase: observed.state, progress: progress.present ? progress.value : null };
   } catch (error) { return { state: "failed", error: ioError(error) }; }

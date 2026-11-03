@@ -109,3 +109,15 @@ test("completed-source revalidation explains the changed job identity without an
   assert.deepEqual(files(directory), before);
   assert.equal(existsSync(state), false);
 });
+
+test('stopped attempts return interruption without persisting progress or creating registry',()=>{
+ const original=readFileSync(path.join(bin,'systemctl'),'utf8');
+ try{
+  writeFileSync(path.join(bin,'systemctl'),"#!/bin/sh\nprintf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nResult=success\\nExecMainStatus=0\\n'\n");
+  for(const [kind,command,digit] of [['source','source-status','c'],['checkout','job-status','d']]){
+   const id=digit.repeat(64),directory=job(kind,id,null),before=files(directory);
+   const result=observe(command,id);assert.equal(result.exit,2);assert.equal(result.value.state,'interrupted');assert.deepEqual(files(directory),before);
+  }
+  assert.equal(existsSync(state),false);
+ }finally{writeFileSync(path.join(bin,'systemctl'),original);}
+});

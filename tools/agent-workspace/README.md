@@ -16,6 +16,19 @@ Recursive cache declarations discover matching symlink entries but never travers
 
 The focused regression is `node --test tools/agent-workspace/cache-symlink.test.mjs`. The native proof is `node tools/agent-workspace/cache-symlink-installed.mjs`; it uses a disposable checkout, proves that a read-only descriptor through the link protects the real target, then releases the checkout after the reader exits while preserving the external bytes. It does not use test safety overrides.
 
+## Job observation during tool publication
+
+Only exact `job-status` and `source-status` commands bypass publication admission.
+The stable launcher pins the selected immutable component directory once before
+execution. The `read-only-job-observation-v1` contract in that immutable component
+allows the exception only after the read-only implementation has been selected;
+older generations retain admission even if the newer launcher is installed first. Publication atomically selects a successor and retains the old tree,
+so imports cannot switch underneath an observer. These commands return before
+opening the registry and only read retained job receipts and systemd status.
+Stopped unfinished attempts are reported as interrupted without writing progress;
+explicit same-request recovery still records that transition under its own lock.
+Generic `status`, submission, recovery and all other commands keep normal admission.
+
 ## Complete repricing observation
 
 Ordinary `reprice-capacity` reads only the target's fresh identity-bound allocation sample and the device's reservation ledger. It never reads or refreshes another workspace's allocation cache, walks another checkout, performs a fleet consumer census, or waits for another checkout's lock. Other reservations retain their full outstanding growth and pending construction promises, shared maximum headroom, source-import promises and execution reservations. These are conservative reservation bounds, not fabricated current allocation samples; actual physical use is separately reflected in the fresh filesystem free-space observation. The receipt labels this `otherReservationsObservation: "conservative-ledger-promises"` and `otherAllocationSamplesRead: false`. A refusal is final for this call, not a restart of a fleet sampling loop. Explicit `resume-growth` keeps its separate existing admission behavior.

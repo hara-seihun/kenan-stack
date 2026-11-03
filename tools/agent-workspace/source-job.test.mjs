@@ -409,7 +409,7 @@ test("existing attempt completion during timed-out status wins without restart",
   } finally { f.restore(); }
 });
 
-test("read-only job observation durably settles orphaned starting without terminalizing or replaying", () => {
+test("read-only job observation reports orphaned starting without writing, terminalizing or replaying", () => {
   const f = fixture();
   try {
     runSourceJob(f.options);
@@ -417,9 +417,10 @@ test("read-only job observation durably settles orphaned starting without termin
     state.units = {};
     f.update(state);
     const directory = f.jobDirectory();
+    const progress = readFileSync(path.join(directory,"progress.json"),"utf8");
     const result = observeSourceJob(directory);
     assert.equal(result.state, "interrupted");
-    assert.equal(JSON.parse(readFileSync(path.join(directory,"progress.json"))).state,"interrupted");
+    assert.equal(readFileSync(path.join(directory,"progress.json"),"utf8"),progress);
     assert.equal(existsSync(path.join(directory,"result.json")),false);
     assert.equal(f.state().submissions.length,1);
     assert.ok(f.state().submissions[0].includes("--property=TimeoutStartSec=120"));

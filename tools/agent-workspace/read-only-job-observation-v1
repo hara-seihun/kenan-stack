@@ -1,0 +1,1 @@
+This immutable component implements job-status and source-status without registry access, receipt writes, submission, or recovery.
