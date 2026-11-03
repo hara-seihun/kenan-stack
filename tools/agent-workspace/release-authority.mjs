@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {observeReleaseDelegation} from './release-delegation.mjs';
-import {nativeCaller, nativeOwnerBinding, admissionReceipts, authenticateToolCalls, receiptBinding} from './native-owner.mjs';
+import {nativeCaller, nativeOwnerBinding, admissionReceipts, authenticateToolCalls, receiptBinding, isBoundGoalLabel} from './native-owner.mjs';
 import {OWNER_AGENT_ID,NATIVE_CUSTODIAN_ID} from './owner-liveness.mjs';
 import {serverChannel} from './cache-queue.mjs';
 
@@ -29,9 +29,13 @@ export function releaseCaller({caller=nativeCaller, pid=process.pid,
   } catch(error) {return refused('release-caller-unverified',String(error.message));}
 }
 
-function ownerOf(database,record,statePath,deadline,authenticate) {
-  if(NATIVE_CUSTODIAN_ID.test(record.owner))return {ok:true,agentId:record.owner,channel:null};
+function ownerOf(database,record,statePath,deadline,authenticate,goalLabel) {
   const binding=nativeOwnerBinding(database,record.id);
+  if(NATIVE_CUSTODIAN_ID.test(record.owner)){
+   if(binding.state==='set'&&binding.agentId!==record.owner&&goalLabel(record.owner,binding,{deadline}))
+    return {ok:true,agentId:binding.agentId,channel:binding.channel};
+   return {ok:true,agentId:record.owner,channel:null};
+  }
   if(binding.state==='set')return {ok:true,agentId:binding.agentId,channel:binding.channel};
   const request=database.prepare('SELECT creation_request FROM workspace WHERE id=?').get(record.id)?.creation_request;
   const receipt=admissionReceipts(statePath,record.id,request,{deadline});
@@ -45,7 +49,7 @@ function ownerOf(database,record,statePath,deadline,authenticate) {
 // This observation is read-only. In particular it never binds an admission receipt, drops a
 // lease, starts a release journal or changes the checkout on a rejected request.
 export function authorizeWorkspaceRelease(database,records,statePath,{caller=releaseCaller,authenticate=authenticateToolCalls,
-  deadline=Date.now()+30000,confirmWaitMs=10000,allowDelegates=false,delegate=observeReleaseDelegation}={}) {
+  deadline=Date.now()+30000,confirmWaitMs=10000,allowDelegates=false,delegate=observeReleaseDelegation,goalLabel=isBoundGoalLabel}={}) {
   const self=caller();
   if(!self.ok)return self;
   if(self.kind==='operator')return {ok:true,kind:'operator'};
@@ -82,7 +86,7 @@ export function authorizeWorkspaceRelease(database,records,statePath,{caller=rel
   }
   const delegations=new Map();
   for(const record of records) {
-    const owner=ownerOf(database,record,statePath,deadline,authenticate);
+    const owner=ownerOf(database,record,statePath,deadline,authenticate,goalLabel);
     if(!owner.ok)return owner;
     if(owner.agentId===null)return refused('release-owner-unbound',`${record.id}: This checkout has no authenticated native custodian. Use an explicit transfer by the existing non-native operator before releasing it.`);
     const sameChannel=owner.channel===null||owner.channel===binding.channel;

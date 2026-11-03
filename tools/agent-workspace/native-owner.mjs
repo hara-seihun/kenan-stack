@@ -76,12 +76,46 @@ export function nativeOwnerBinding(database,workspaceId){
  return row===undefined?{state:'unset'}:{state:'set',agentId:row.agent_id,channel:row.channel,callId:row.call_id,source:row.source,boundAt:row.bound_at};
 }
 
+// Native workers cannot grant another identity custody by putting it in --owner.
+// Managers retain their explicit native delegation route; reassign also unbinds
+// the old caller before transferring to a native recipient.
+export function admissionOwner(owner,binding,fallback='unowned'){
+ if(binding===null)return owner??fallback;
+ if(owner===undefined)return binding.agentId;
+ if(NATIVE_CUSTODIAN_ID.test(owner)&&owner!==binding.agentId&&!binding.agentId.startsWith('manager:')){
+  const error=new Error('--owner names another native identity. Use the authenticated worker ID, omit --owner, or have the manager delegate custody. Goal IDs are not worker IDs.');
+  error.code='workspace-owner-mismatch';throw error;
+ }
+ return owner;
+}
+
 // The id owner liveness classifies: a native registered owner is itself canonical; otherwise the
 // authenticated binding; otherwise the registered label, which classifies as unknown.
-export function canonicalNativeOwner(database,record){
- if(OWNER_AGENT_ID.test(record.owner))return record.owner;
+export function canonicalNativeOwner(database,record,{goalLabel=isBoundGoalLabel}={}){
  const binding=nativeOwnerBinding(database,record.id);
+ if(OWNER_AGENT_ID.test(record.owner)){
+  if(binding.state==='set'&&binding.agentId!==record.owner&&goalLabel(record.owner,binding))return binding.agentId;
+  return record.owner;
+ }
  return binding.state==='set'?binding.agentId:record.owner;
+}
+
+// A goal UUID is a recoverable legacy label only when the native store proves
+// the bound creator belongs to that exact goal and no agent owns that identity.
+export function isBoundGoalLabel(owner,binding,{deadline=Date.now()+6000,execute=boundedCommand,user=()=>userInfo().username}={}){
+ try{
+  if(!OWNER_AGENT_ID.test(owner)||!validBinding(binding))return false;
+  const role=user(),remaining=deadline-Date.now();
+  if(!/^[a-z_][a-z0-9_-]{0,31}$/.test(role)||remaining<=0)return false;
+  const sql=`BEGIN READ ONLY; SET LOCAL statement_timeout='4000ms';
+   SELECT EXISTS(SELECT 1 FROM agent a
+    WHERE a.goal_id::text='${owner}' AND a.id::text='${binding.agentId}')
+    AND NOT EXISTS(SELECT 1 FROM agent WHERE id::text='${owner}'); ROLLBACK;`;
+  const result=execute('psql',['-X','-qAt','--no-password','--host',KENAN_PG_SOCKET_DIR,'--username',role,
+   '--dbname',channelDatabase(binding.channel),'--set=ON_ERROR_STOP=1','--command',sql],
+   {encoding:'utf8',timeout:Math.min(6000,remaining),maxBuffer:4096,env:{...process.env,PGCONNECT_TIMEOUT:'2'}});
+  return !result.error&&!result.signal&&result.status===0&&result.stdout.trim()==='t';
+ }catch{return false;}
 }
 
 // Admission receipts of one workspace's checkout jobs. Every job that carries a caller identity

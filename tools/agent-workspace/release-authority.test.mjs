@@ -316,3 +316,10 @@ test('the actual native worker releases its own manager custody through the nati
   assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,'manager:converge');
  });
 });
+
+test('historical goal UUID labels do not strand the authentic creator or authorize that UUID',()=>fixture(f=>{
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(CHILD,f.record.id);
+ const records=[{...f.record,owner:CHILD}];
+ assert.equal(authorizeWorkspaceRelease(f.db,records,f.state,authority(PARENT,{goalLabel:()=>true})).ok,true);
+ assert.equal(authorizeWorkspaceRelease(f.db,records,f.state,authority(CHILD,{goalLabel:()=>true})).error.code,'release-owner-mismatch');
+}));

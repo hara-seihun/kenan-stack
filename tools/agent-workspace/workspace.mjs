@@ -76,7 +76,7 @@ import { procScope, currentStackQueueReferences } from "./cache-queue.mjs";
 import { qualificationReferences } from "./qualification-references.mjs";
 import { privilegedCommand, stackQualificationReferences } from "./operator-observation.mjs";
 import { NATIVE_CUSTODIAN_ID, OWNER_AGENT_ID, observeOwnerLiveness, classifyOwner, pendingWakeReferences, parentCustody } from "./owner-liveness.mjs";
-import { nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
+import { admissionOwner, nativeCaller, bindNativeOwner, reassignNativeOwner, nativeOwnerBinding, canonicalNativeOwner, admissionReceipts, authenticateToolCalls, receiptBinding, ensureNativeOwnerTable } from "./native-owner.mjs";
 import {adoptEndedActions} from "./actions-adoption.mjs";
 import {submitRelease} from './release-submission.mjs';
 import {releaseBudgetMs} from './release-budget.mjs';
@@ -1597,6 +1597,8 @@ function registerCommand(database, args) {
   const mode = one(args, "mode", "writer");
   if (!["writer", "review"].includes(mode)) fail("--mode must be writer or review");
   const selectedPath = path.resolve(required(args, "path"));
+  const caller = nativeCaller();
+  const owner = admissionOwner(one(args,"owner"),caller);
   const record = register(database, {
     path: selectedPath,
     retained: bool(args,"retained"),
@@ -1605,8 +1607,8 @@ function registerCommand(database, args) {
     root: one(args, "root"),
     kind: one(args, "kind", "agent"),
     mode,
-    owner: one(args, "owner", "unowned"),
-    nativeCaller: nativeCaller(),
+    owner,
+    nativeCaller: caller,
     groupId: one(args, "group"),
     sourceCommit: one(args, "source-commit"),
     assertMetadata: Object.fromEntries([
@@ -3607,6 +3609,12 @@ function creationRequest(args, repository) {
 }
 
 function createCommand(database, args, statePath) {
+  // Freeze the authenticated default into the durable request before source or
+  // checkout preparation detaches. Background replay uses that exact owner.
+  const caller = nativeCaller();
+  const owner = admissionOwner(one(args,"owner"),caller,safeName(required(args,"name")));
+  args = {...args,named:new Map(args.named)};
+  args.named.set("owner",[owner]);
   assertOnly(args, ["root", "name", "repo", "ref", "branch", "kind", "mode", "owner", "group", "strategy", "lease-seconds", "cache", "max-count", "min-free-gib", "min-free-inodes-percent", "creation-timeout-seconds", "sparse-pattern", "intent", "headroom-gib", "growth-mib", "json"]);
   const destination = path.join(path.resolve(required(args, "root")), safeName(required(args, "name")));
   const pending = database.prepare("SELECT id,creation_request FROM workspace WHERE path=? AND state='creating'").get(destination);
@@ -6244,6 +6252,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     return;
   }
   if (commandName === "create") {
+    admissionOwner(one(args,"owner"),nativeCaller());
     const budgetMs = creationTimeout(args);
     const repository = repositoryLocation(required(args, "repo"), currentDirectory());
     if (process.env.PI_WORKSPACE_CREATE_CHILD !== statePath) {
@@ -6422,7 +6431,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code === "workspace-owner-mismatch" || error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),
@@ -6431,6 +6440,6 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
       }
     }
     process.stderr.write(`agent-workspace: ${error instanceof Error ? error.message : String(error)}\n${error instanceof ResourceBusyError && error.detail ? `agent-workspace: lock detail ${JSON.stringify(error.detail)}\n` : ""}`);
-    process.exit(error instanceof ResourceBusyError ? 75 : (error instanceof CliError || error instanceof SourceHandoffError || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) ? 2 : 1);
+    process.exit(error instanceof ResourceBusyError ? 75 : (error.code === "workspace-owner-mismatch" || error instanceof CliError || error instanceof SourceHandoffError || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) ? 2 : 1);
   }
 }

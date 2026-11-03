@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
-import {nativeCaller,bindNativeOwner,unbindNativeOwner,reassignNativeOwner,nativeOwnerBinding,canonicalNativeOwner,admissionReceipts,authenticateToolCalls,receiptBinding,toolCallAuthenticationSql} from './native-owner.mjs';
+import {isBoundGoalLabel,admissionOwner,nativeCaller,bindNativeOwner,unbindNativeOwner,reassignNativeOwner,nativeOwnerBinding,canonicalNativeOwner,admissionReceipts,authenticateToolCalls,receiptBinding,toolCallAuthenticationSql} from './native-owner.mjs';
 
 const A='11111111-1111-4111-8111-111111111111',B='22222222-2222-4222-8222-222222222222';
 const REQUEST='{"op":"create","name":"task"}',WS='ws-1';
@@ -229,4 +229,31 @@ test('an exact statement timeout is retried once and the retry stays in the orig
 test('persistent timeout remains unknown after one bounded retry',()=>{
  let calls=0;const found=authenticateToolCalls([{agentId:A,callId:'exact-call'}],{deadline:Date.now()+30000,channels:()=>['beta'],user:()=> 'kenan',execute:()=>{calls++;return {status:1,stderr:'statement timeout'};}});
  assert.equal(calls,2);assert.equal(found.errors.length,1);assert.equal(found.confirmed.size,0);
+});
+
+test('admission defaults to the authenticated worker and refuses foreign native and goal UUIDs',()=>{
+ const caller={agentId:A,channel:'beta',callId:'c1'};
+ assert.equal(admissionOwner(undefined,caller),A);
+ assert.equal(admissionOwner(A,caller),A);
+ assert.equal(admissionOwner('task-name',caller),'task-name');
+ assert.throws(()=>admissionOwner(B,caller),{code:'workspace-owner-mismatch'});
+ assert.throws(()=>admissionOwner('manager:converge',caller),{code:'workspace-owner-mismatch'});
+ assert.equal(admissionOwner(B,{...caller,agentId:'manager:converge'}),B);
+ assert.equal(admissionOwner(B,null),B,'non-native operators retain their explicit route');
+});
+
+test('a legacy goal label requires the exact goal relationship, no native owner and a successful read',()=>{
+ const binding={agentId:A,channel:'beta',callId:'c1'};
+ const probe=result=>isBoundGoalLabel(B,binding,{user:()=> 'kenan',execute:(_cmd,args)=>{
+  const sql=args.at(-1);assert.match(sql,/a.goal_id::text=/);assert.match(sql,/NOT EXISTS/);
+  assert.ok(sql.includes(A)&&sql.includes(B));return result;
+ }});
+ assert.equal(probe({status:0,stdout:'t\n'}),true);
+ for(const result of [{status:0,stdout:'f\n'},{status:1,stdout:'t'},{status:0,stdout:'t',error:new Error('timeout')}])assert.equal(probe(result),false);
+});
+
+test('canonical liveness repairs only a proven legacy goal label, never an actual foreign agent',()=>{
+ const d=db();bindNativeOwner(d,WS,{agentId:A,channel:'beta',callId:'c1'},'caller-scope');
+ assert.equal(canonicalNativeOwner(d,{id:WS,owner:B},{goalLabel:()=>true}),A);
+ assert.equal(canonicalNativeOwner(d,{id:WS,owner:B},{goalLabel:()=>false}),B);
 });

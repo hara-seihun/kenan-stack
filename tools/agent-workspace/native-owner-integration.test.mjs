@@ -88,7 +88,8 @@ test('release action pages prefer positively ended owners over live owners',()=>
  const live='11111111-1111-4111-8111-111111111111';
  f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(live,f.record.id);
  const dir=path.join(f.root,'checkout-z');f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');
- const ended=f.run(['register','--path',dir,'--root',f.root,'--owner',AGENT,'--json']);
+ const ended=f.run(['register','--path',dir,'--root',f.root,'--owner','fixture-ended','--json']);
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(AGENT,ended.id);unbindNativeOwner(f.db,ended.id);f.bind();
  f.observe('stopped');const observation=JSON.parse(fs.readFileSync(path.join(f.root,'native.json')));observation.agents.push({id:live,channel:'beta',role:'worker',state:'running',archived:false});fs.writeFileSync(path.join(f.root,'native.json'),JSON.stringify(observation));
  const result=f.run(['release-ended-owners','--root',f.root,'--execute','--max-records','1','--json']);
  assert.equal(result.results[0].record.id,ended.id,JSON.stringify(result));assert.equal(fs.existsSync(dir),false);assert.equal(fs.existsSync(f.source),true);
@@ -98,7 +99,8 @@ test('ended retained source cannot monopolize later timer action pages',()=>fixt
  const records=[f.record];f.bind();fs.writeFileSync(path.join(f.source,'valuable'),'dirty');
  for(let i=0;i<3;i++){
   const dir=path.join(f.root,'checkout-'+i);f.git('clone',path.join(f.root,'remote.git'),dir);f.git('-C',dir,'checkout','main');fs.writeFileSync(path.join(dir,'valuable'),'dirty');
-  records.push(f.run(['register','--path',dir,'--root',f.root,'--owner',AGENT,'--json']));
+  const record=f.run(['register','--path',dir,'--root',f.root,'--owner','fixture-ended','--json']);
+  f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(AGENT,record.id);unbindNativeOwner(f.db,record.id);records.push(record);
  }
  f.observe('stopped');const examined=[];
  for(let i=0;i<4;i++){
