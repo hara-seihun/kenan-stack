@@ -23,12 +23,9 @@ export function awaitSubmittedRelease({read, budgetMs = RELEASE_AWAIT_MS, interv
   }
 }
 
-// A background release records its terminal receipt as its last registry write, and its
-// systemd unit deactivates a moment later. A repeated ordinary release that read the
-// terminal row inside that window saw a live unit, did not continue, and replayed the
-// stale retained receipt (worker bf3e2308, November 3: the unit deactivated 221 ms after
-// its receipt). Once the receipt is terminal, the caller waits briefly for the same unit to
-// cease before deciding. The wait is read-only and never launches or changes custody.
+// A terminal receipt can be visible just before its worker unit deactivates.
+// Wait briefly, read-only, for that same unit to cease before deciding whether
+// its retained release may continue. An unknown or still-active effect is never relaunched.
 export const RELEASE_CESSATION_AWAIT_MS = 5_000;
 export function awaitUnitCessation({observe, budgetMs = RELEASE_CESSATION_AWAIT_MS, intervalMs = 100, now = Date.now, sleep = sleepSync}) {
   const until = now() + budgetMs;

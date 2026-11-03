@@ -95,10 +95,8 @@ test('a launched release whose unit ended without a terminal record continues on
  assert.equal(count(),2);assert.equal(retry.action,'release-submitted');assert.equal(retry.requestId,first.requestId);
 }));
 
-// bf3e2308, 2026-11-03: the first ordinary release exited 0 but retained the checkout on a
-// short-lived cwd process. The caller repeated the ordinary release at once, inside the
-// 221 ms between the terminal receipt and the unit's deactivation, and got the stale
-// retained receipt back instead of a re-inspection through the documented continuation.
+// A terminal retained receipt does not by itself prove the unit has ceased.
+// Repetition waits through a short shutdown window, then reruns full inspection.
 test('a repeated release right after a retained terminal receipt waits for the unit to deactivate and continues',()=>fixture((base,count)=>{
  const first=submitRelease(base);
  base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0,finishedAt:1}));
