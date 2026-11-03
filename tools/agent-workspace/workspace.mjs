@@ -3733,16 +3733,12 @@ function createWorkspace(database, args, statePath) {
   } else {
     if (existsSync(destination)) fail(`workspace already exists: ${destination}`);
     mkdirSync(root, { recursive: true });
-    const resolvedCommit = resolveRequestedSource(repository, ref);
-    const pinnedCommit = resolvedCommit === ref ? resolvedCommit : pinnedSourceCommit({ file: pinFile, resolved: resolvedCommit,
-      isAncestor: (pinned, resolved) => {
-        const local = existsSync(repository);
-        const result = command("git", [...(local ? ["-C", repository] : ["--git-dir", mirror]), "merge-base", "--is-ancestor", pinned, resolved]);
-        return result.status === 0 ? true : result.status === 1 || local ? false : null;
-      } });
+    let pinnedCommit;
     markMirrorUse(mirror);
-    const preparation = withResourceLock(statePath, `source-preparation:${destination}`, () =>
-      prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns, sourceCommit: pinnedCommit }));
+    const preparation = withResourceLock(statePath, `source-preparation:${destination}`, () => {
+      pinnedCommit = pinnedSourceCommit({ file: pinFile, resolve: () => resolveRequestedSource(repository, ref) });
+      return prepareCreationSource(database, args, { statePath, root, destination, repository, ref, upstream, mirror, intent, sparsePatterns, sourceCommit: pinnedCommit });
+    });
     if (preparation.state !== "ready") {
       print({ ok: true, state: "preparing", jobKind: "source", jobId: preparation.jobId, progressPath: preparation.progressPath, resultPath: preparation.resultPath,
         observeCommand: `agent-workspace source-status --job-id ${preparation.jobId} --json`,

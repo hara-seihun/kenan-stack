@@ -1,11 +1,11 @@
 import './scratch-env.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
-import { pinnedSourceCommit, REF_PIN_MAX_AGE_MS } from './ref-pin.mjs';
+import { pinnedSourceCommit, clearRefPin } from './ref-pin.mjs';
 
 const entry = new URL('./workspace.mjs', import.meta.url).pathname;
 const git = (dir, ...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', timeout: 10_000 }).trim();
@@ -41,33 +41,47 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' }).s
   return { root, source, release, env, close: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-function create(f, name, env) {
-  const args = ['create', '--root', path.join(f.root, 'workspaces'), '--name', name, '--repo', f.source, '--min-free-gib', '0', '--json'];
+function create(f, name, env, capacity = []) {
+  const args = ['create', '--root', path.join(f.root, 'workspaces'), '--name', name, '--repo', f.source, ...(capacity.length ? capacity : ['--min-free-gib', '0']), '--json'];
   try { return { status: 0, receipt: JSON.parse(execFileSync(entry, args, { env, encoding: 'utf8', timeout: 60_000 })) }; }
   catch (error) { return { status: error.status, receipt: JSON.parse(error.stdout) }; }
 }
 
-test('repeating a create of a moving ref keeps its first preparation instead of starting a new one', () => {
+for (const capacity of [[], ['--intent', 'source-only', '--headroom-gib', '8', '--growth-mib', '512']]) test(`repeating a create of a moving ref retains its original preparation (${capacity.length ? 'priced' : 'unestimated'})`, () => {
   const f = fixture();
   try {
     const env = { ...f.env, PI_WORKSPACE_CREATE_WAIT_SECONDS: '0' };
     const first = git(f.source, 'rev-parse', 'HEAD');
-    const started = create(f, 'moving', env);
+    const started = create(f, 'moving', env, capacity);
     assert.equal(started.status, 75);
     assert.equal(started.receipt.state, 'preparing');
+    const preparationRoot = path.join(path.dirname(env.PI_WORKSPACE_STATE), 'source-preparations');
+    const pinDirectory = path.join(preparationRoot, 'ref-pins');
+    const pinFile = path.join(pinDirectory, readdirSync(pinDirectory)[0]);
+    const pin = JSON.parse(readFileSync(pinFile, 'utf8'));
+    writeFileSync(pinFile, JSON.stringify({ ...pin, at: Date.now() - 24 * 60 * 60 * 1000 }));
     for (let round = 0; round < 2; round++) {
+      if (round === 1) git(f.source, 'checkout', '--orphan', 'rewritten');
       writeFileSync(path.join(f.source, 'file.txt'), `moved ${round}\n`);
       git(f.source, 'commit', '-qam', `moved ${round}`);
-      const repeated = create(f, 'moving', env);
+      const repeated = create(f, 'moving', env, capacity);
       // Where the job runs without the gated git (a user-manager unit), preparation may already be done.
       if (repeated.receipt.state === 'preparing')
         assert.equal(repeated.receipt.jobId, started.receipt.jobId, 'a moved HEAD must not start another source job');
     }
+    const forecasts = readdirSync(preparationRoot).filter(file => file.endsWith('.forecast.json'));
+    assert.equal(forecasts.length, 1, 'exact retries must not create another source forecast');
+    assert.equal(JSON.parse(readFileSync(path.join(preparationRoot, forecasts[0]), 'utf8')).inputs.sourceCommit, first);
     writeFileSync(f.release, 'go');
-    const done = create(f, 'moving', { ...f.env, PI_WORKSPACE_CREATE_WAIT_SECONDS: '50' });
+    const done = create(f, 'moving', { ...f.env, PI_WORKSPACE_CREATE_WAIT_SECONDS: '50' }, capacity);
     assert.equal(done.status, 0, JSON.stringify(done.receipt));
     assert.equal(done.receipt.sourceCommit, first, 'the workspace is admitted at the commit the first call resolved');
     assert.equal(readFileSync(path.join(done.receipt.path, 'file.txt'), 'utf8'), 'first\n');
+    if (capacity.length) {
+      assert.equal(done.receipt.capacity.growthBytes, 512 * 1024 ** 2);
+      assert.equal(done.receipt.capacity.headroomBytes, 8 * 1024 ** 3);
+    }
+    assert.equal(existsSync(pinFile), false, 'workspace reservation takes over the original source custody');
   } finally { f.close(); }
 });
 
@@ -83,14 +97,19 @@ test('one create call waits for its background jobs and returns the active works
   } finally { f.close(); }
 });
 
-test('a pin is reused only while recent and still an ancestor of the ref', () => {
+test('accepted pins survive time, rewritten or unavailable refs, and clear only at transfer', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'ref-pin-'));
   try {
-    const file = path.join(root, 'pin.json'), a = 'a'.repeat(40), b = 'b'.repeat(40), c = 'c'.repeat(40);
-    assert.equal(pinnedSourceCommit({ file, resolved: a, isAncestor: () => assert.fail(), now: 1000 }), a);
-    assert.equal(pinnedSourceCommit({ file, resolved: b, isAncestor: () => true, now: 2000 }), a);
-    assert.equal(pinnedSourceCommit({ file, resolved: b, isAncestor: () => null, now: 2000 }), a);
-    assert.equal(pinnedSourceCommit({ file, resolved: b, isAncestor: () => false, now: 3000 }), b, 'a rewritten ref repins');
-    assert.equal(pinnedSourceCommit({ file, resolved: c, isAncestor: () => true, now: 3000 + REF_PIN_MAX_AGE_MS }), c, 'an old pin expires');
+    const file = path.join(root, 'pin.json'), a = 'a'.repeat(40), b = 'b'.repeat(40);
+    assert.equal(pinnedSourceCommit({ file, resolve: () => a, now: 1000 }), a);
+    const original = readFileSync(file, 'utf8');
+    for (const now of [0, 2000, 1000 + 24 * 60 * 60 * 1000]) {
+      assert.equal(pinnedSourceCommit({ file, resolve: () => assert.fail('accepted retry must not resolve mutable HEAD'), now }), a);
+      assert.equal(readFileSync(file, 'utf8'), original);
+    }
+    clearRefPin(file);
+    assert.equal(pinnedSourceCommit({ file, resolve: () => b }), b);
+    writeFileSync(file, '{broken');
+    assert.throws(() => pinnedSourceCommit({ file, resolve: () => assert.fail() }), SyntaxError);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
