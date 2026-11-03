@@ -1,7 +1,8 @@
 import {createHash,randomUUID} from 'node:crypto';
+import {awaitUnitCessation,RELEASE_CESSATION_AWAIT_MS} from './release-await.mjs';
 // A submission is custody of work, never proof of physical release. Its original
 // authenticated binding is immutable, including across a repeated foreground call.
-export function submitRelease({database,record,request,binding,launch,settlement,observe=()=>({ceased:false}),custodyLineage=[]}) {
+export function submitRelease({database,record,request,binding,launch,settlement,observe=()=>({ceased:false}),custodyLineage=[],cessationBudgetMs=RELEASE_CESSATION_AWAIT_MS,now,sleep}) {
  database.exec(`CREATE TABLE IF NOT EXISTS workspace_release_submission (
   workspace_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, request_json TEXT NOT NULL,
   binding_json TEXT NOT NULL, unit_name TEXT NOT NULL, state TEXT NOT NULL, launch_json TEXT)`);
@@ -10,6 +11,13 @@ export function submitRelease({database,record,request,binding,launch,settlement
  const requestText=JSON.stringify(request);
  let row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
  if(row && record.state==='released' && settlement.kind==='completed')return {ok:true,action:'already-released',record,releaseSettlement:settlement};
+ // Observe the original unit once per call. A terminal receipt means its worker has written
+ // everything it will write, so wait briefly for that unit to finish deactivating; a merely
+ // submitted unit may still be doing real work, so it is observed once, never awaited here.
+ let originalCessation;
+ const originalCeased=()=>(originalCessation??=row.state==='terminal-known'
+  ?awaitUnitCessation({observe:()=>observe(row),budgetMs:cessationBudgetMs,...(now?{now}:{}),...(sleep?{sleep}:{})})
+  :observe(row)).ceased===true;
  const originalRequest=row?(JSON.parse(row.continuations_json??'[]').at(-1)?.request??JSON.parse(row.request_json)):null;
  // A completed, retained ordinary release may safely continue with the documented
  // non-destructive runtime-preservation flag. Preserve original custody and wait
@@ -19,7 +27,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
   JSON.stringify({...originalRequest,flags:undefined})===JSON.stringify({...request,flags:undefined}) &&
   !originalRequest.flags.some(([key])=>key==='preserve-runtime') &&
   JSON.stringify(request.flags)===JSON.stringify([...originalRequest.flags,['preserve-runtime',['true']]].sort(([a],[b])=>a.localeCompare(b))) &&
-  observe(row).ceased===true;
+  originalCeased();
  // Custody adopted from an ended owner (release-ended-owners) continues that owner's
  // submission: same request identity and unit history, new authenticated custodian. Only
  // after the original unit ceased with a known launch, and never over an unsettled physical
@@ -30,7 +38,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
   request.owner===record.owner && binding.agentId===record.owner && originalRequest.owner!==record.owner &&
   lineage.has(record.owner) && lineage.has(originalRequest.owner) && lineage.has(JSON.parse(row.binding_json).agentId) &&
   JSON.stringify({...originalRequest,owner:undefined,flags:undefined})===JSON.stringify({...request,owner:undefined,flags:undefined}) &&
-  observe(row).ceased===true);
+  originalCeased());
  if(row && JSON.stringify(originalRequest)!==requestText && !preservingContinuation && !adoptedContinuation)return {ok:false,error:{code:'release-submission-conflict',detail:'Reconcile the original submission before changing its candidate, custodian or release flags.'},requestId:row.request_id,
   nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],
    settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
@@ -57,7 +65,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
  // A launched unit that ended without recording a terminal result (it died on an error with no
  // receipt, such as 'database is locked' on 2026-10-30) left nothing to replay: once the unit
  // ceased, a repeated release continues. Release resumes any owned retention it left itself.
- else if(['terminal-known','submitted'].includes(row?.state)||reusedContinuation)continueKnown=observe(row).ceased===true;
+ else if(['terminal-known','submitted'].includes(row?.state)||reusedContinuation)continueKnown=originalCeased();
  if(!row||continueKnown){
   const requestId=row?.request_id??randomUUID(),name=row?.unit_name??'aw-release-'+createHash('sha256').update(record.id+requestText).digest('hex').slice(0,32);
   // Background launches are idempotent per name, so every continuation launches under its

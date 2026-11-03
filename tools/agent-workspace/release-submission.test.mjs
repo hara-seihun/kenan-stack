@@ -1,7 +1,9 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';
 const {submitRelease}=await import(process.env.WORKSPACE_SUBMISSION_MODULE??'./release-submission.mjs');
+// A fake clock keeps the bounded cessation wait instant for units that never cease.
+function clock(){let time=0;return {now:()=>time,sleep:ms=>{time+=ms;}};}
 function fixture(fn){const database=new DatabaseSync(':memory:');try{let launches=0;const record={id:'fixture',path:'/fixture/source',owner:'owner',state:'active'};
- const base={database,record,request:{id:'fixture',owner:'owner',flags:[['preserve-runtime',['true']]]},binding:{agentId:'owner',channel:'beta',callId:'full|original'},settlement:{kind:'none'},launch:()=>{launches++;return {started:'root-unit',log:'/durable/log'};}};fn(base,()=>launches);}finally{database.close();}}
+ const base={database,record,request:{id:'fixture',owner:'owner',flags:[['preserve-runtime',['true']]]},binding:{agentId:'owner',channel:'beta',callId:'full|original'},settlement:{kind:'none'},...clock(),launch:()=>{launches++;return {started:'root-unit',log:'/durable/log'};}};fn(base,()=>launches);}finally{database.close();}}
 test('duplicate foreground release adopts original request, unit and full binding without a competing launch',()=>fixture((base,count)=>{
  const first=submitRelease(base);assert.equal(first.completed,false);assert.equal(first.action,'release-submitted');
  const again=submitRelease({...base,binding:{...base.binding,callId:'a later call'}});
@@ -91,4 +93,33 @@ test('a launched release whose unit ended without a terminal record continues on
  const live=submitRelease({...base,observe:()=>({ceased:false})});assert.equal(count(),1);assert.equal(live.completed,false);
  const retry=submitRelease({...base,observe:()=>({ceased:true})});
  assert.equal(count(),2);assert.equal(retry.action,'release-submitted');assert.equal(retry.requestId,first.requestId);
+}));
+
+// bf3e2308, 2026-11-03: the first ordinary release exited 0 but retained the checkout on a
+// short-lived cwd process. The caller repeated the ordinary release at once, inside the
+// 221 ms between the terminal receipt and the unit's deactivation, and got the stale
+// retained receipt back instead of a re-inspection through the documented continuation.
+test('a repeated release right after a retained terminal receipt waits for the unit to deactivate and continues',()=>fixture((base,count)=>{
+ const first=submitRelease(base);
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0,finishedAt:1}));
+ const retained={kind:'completed',result:{physicalDisposition:{kind:'retained',reason:'1 process by cwd'}}};
+ let observations=0;const deactivating=()=>({ceased:++observations>3});
+ const retry=submitRelease({...base,binding:{...base.binding,callId:'repeated ordinary call'},settlement:retained,observe:deactivating});
+ assert.equal(retry.action,'release-submitted');assert.equal(count(),2,'the documented continuation launches once');
+ assert.equal(retry.requestId,first.requestId);assert.deepEqual(retry.originalBinding,base.binding);
+ assert.deepEqual(retry.previousReleaseSettlement,retained);assert.equal(observations,4);
+ const row=base.database.prepare('SELECT * FROM workspace_release_submission').get();
+ assert.deepEqual(JSON.parse(row.continuations_json)[0].priorTerminal,{exitCode:0,finishedAt:1});
+}));
+test('a terminal receipt whose unit never ceases keeps the bounded wait and never relaunches',()=>fixture((base,count)=>{
+ submitRelease(base);
+ base.database.prepare("UPDATE workspace_release_submission SET state='terminal-known',terminal_json=?").run(JSON.stringify({exitCode:0}));
+ const time=clock();let observations=0;
+ const live=submitRelease({...base,...time,settlement:{kind:'completed',result:{physicalDisposition:{kind:'retained'}}},observe:()=>{observations++;return {ceased:false};}});
+ assert.equal(count(),1);assert.equal(live.completed,false);assert.ok(time.now()>=5000,'the wait spans its whole budget');assert.ok(observations>1);
+}));
+test('a still-submitted unit is observed once and never awaited by the submission',()=>fixture((base,count)=>{
+ submitRelease(base);let observations=0;
+ submitRelease({...base,sleep:()=>assert.fail('no wait for a running unit'),observe:()=>{observations++;return {ceased:false};}});
+ assert.equal(observations,1);assert.equal(count(),1);
 }));
