@@ -81,3 +81,15 @@ test('a full manager identity is proved by the exact populated background kernel
  f.files.set('/run/systemd/transient/'+u,f.files.get('/run/systemd/transient/'+u).replace(agentId,'manager:other'));
  assert.equal(rootScope(pid,g,u,{io:f.io}).kind,'refused');
 });
+
+// Persistent Bash scopes intentionally survive a channel restart and omit BindsTo.
+// Root metadata, invocation identity and current kernel membership remain required.
+test('persistent native scope authenticates without a service lifetime binding',()=>{
+ const f=fixture(),file='/run/systemd/transient/'+unit;
+ f.files.set(file,f.files.get(file).replace('BindsTo=kenan@beta.service\n','RuntimeMaxSec=35s\n'));
+ const proof=f.observe();assert.equal(proof.kind,'authenticated-kernel-scope');assert.deepEqual(proof.identity,identity);
+ const scope=()=>procScope(pid,{read:()=>`0::${group}`,kernel:(p,g,u)=>rootScope(p,g,u,{io:f.io}),query:()=>assert.fail('no RPC needed')});
+ assert.equal(callerToolCall({pid,scope,parent:()=>9,argv:()=>['node','/srv/kenan/beta/dist/server/main.js'],uid:()=>0}).agentId,identity.agentId);
+ assert.equal(callerToolCall({pid,scope,parent:()=>9,argv:()=>['node','/srv/kenan/production/dist/server/main.js'],uid:()=>0}),null);
+ f.files.set('/sys/fs/cgroup'+group+'/cgroup.procs','321\n');assert.equal(f.observe().kind,'refused');
+});

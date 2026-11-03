@@ -46,7 +46,7 @@ export function rootScope(pid,group,unit,{io=fs}={}){
   const identity=JSON.parse(description.slice('kenan-tool-call:'.length));
   if(service){
    if(identity.background!==true||identity.agentId!==service[1]||!Number.isSafeInteger(identity.uid)||identity.uid<=0||sections.get('Service')?.get('User')!==String(identity.uid)||!/^[a-z][a-z0-9-]{0,23}$/.test(identity.channel??''))throw Error('scope-proof-background-mismatch');
-  }else if(typeof identity.channel!=='string'||!unit.startsWith(`agent-tool-${identity.channel}-`)||sections.get('Unit')?.get('BindsTo')!==`kenan@${identity.channel}.service`)throw Error('scope-proof-channel-mismatch');
+  }else if(typeof identity.channel!=='string'||!unit.startsWith(`agent-tool-${identity.channel}-`)||(sections.get('Unit')?.has('BindsTo')&&sections.get('Unit').get('BindsTo')!==`kenan@${identity.channel}.service`))throw Error('scope-proof-channel-mismatch');
   const kernel='/sys/fs/cgroup'+group;
   if(!/^populated 1$/m.test(read(kernel+'/cgroup.events'))||!read(kernel+'/cgroup.procs').split('\n').includes(String(pid)))throw Error('scope-proof-caller-not-populated');
   if(!io.readFileSync(`/proc/${pid}/cgroup`,'utf8').trim().split('\n').includes('0::'+group)||invocation()!==id)throw Error('scope-proof-caller-moved');
