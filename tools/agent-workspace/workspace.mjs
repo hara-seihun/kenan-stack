@@ -4,6 +4,7 @@ import {fileURLToPath} from 'node:url';
 import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache-symlink.mjs';
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
 import {persistAllocationSample} from './allocation-sample-store.mjs';
+import {probeCreationFence} from './creation-fence.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
 import {ownerFutureWrites,observeCapacityChildren,capacityOwnerProjection} from './capacity-owner-forecast.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
@@ -2238,10 +2239,7 @@ function creationFenceBusy(database, workspacePath) {
   const file = path.join(directory, createHash("sha256").update(`checkout:${path.resolve(workspacePath)}`).digest("hex"));
   const descriptor = openSync(file, "a", 0o600);
   try {
-    const result = spawnSync("flock", ["--exclusive", "--nonblock", "3"], { stdio: ["ignore", "pipe", "pipe", descriptor], timeout: 1000 });
-    if (result.status === 0) return false;
-    if (result.status === 1) return true;
-    fail("capacity estimate unknown: cannot inspect pending creation fence");
+    return probeCreationFence(descriptor);
   } finally { closeSync(descriptor); }
 }
 
