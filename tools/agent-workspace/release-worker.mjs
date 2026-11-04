@@ -3,10 +3,11 @@ import {spawnSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 import {nativeCaller} from './native-owner.mjs';
 import {runReleaseWorker} from './release-retry.mjs';
-const [cli,state,...argv]=process.argv.slice(2);
+const [cli,state,callersJson,...argv]=process.argv.slice(2);
 // The immutable worker inherits only the root-created background identity; main
 // authenticates it normally. Busy acquisition never begins a physical transition.
-const outcome=await runReleaseWorker(()=>spawnSync(process.execPath,[cli,...argv],{encoding:'utf8',env:{...process.env,PI_WORKSPACE_STATE:state},timeout:180000,maxBuffer:8<<20}));
+const releaseCallers=JSON.parse(callersJson);
+const outcome=await runReleaseWorker(()=>spawnSync(process.execPath,[cli,...argv],{encoding:'utf8',env:{...process.env,PI_WORKSPACE_STATE:state},timeout:180000,maxBuffer:8<<20}),{releaseCallers});
 const {known,receipt:lastReceipt,result}=outcome;
 process.stdout.write(result.stdout??'');process.stderr.write(result.stderr??'');
 process.exitCode=outcome.exitCode;

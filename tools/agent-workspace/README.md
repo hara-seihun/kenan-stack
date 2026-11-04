@@ -1326,3 +1326,7 @@ Resolve conflicts normally or use `git cherry-pick --abort`; it never resets ano
 Run the affected tests, then `bash tools/agent-workspace/deploy`. Deployment still checks
 ancestry and unrelated tool changes and refuses a stale baseline if another writer deployed
 first. Keep the installed source repository intact when retiring source workspaces.
+
+### Releasing from a shell inside the checkout
+
+The ordinary release command can run while its parent shell has the checkout as its current directory. After authenticating the release, the submission captures those ancestor processes with their UID and kernel start time in the durable worker command. If only those processes retain the checkout by their current directory, the worker rechecks the complete release for up to two minutes, allowing the submitting command and shell to exit. It never ignores a reference or deletes under a live shell. Other processes, writable files, executables, containers, services, dirty source and unpublished commits retain their existing protections. A shell that stays inside the checkout past that bound leaves an honest retained result; leave the directory and repeat the same release request. In shell batches, prefer `checkout=$PWD; cd /home/kenan; agent-workspace release --path "$checkout" --json` so the caller does not retain its own checkout.

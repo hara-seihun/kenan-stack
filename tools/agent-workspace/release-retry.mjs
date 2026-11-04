@@ -1,3 +1,4 @@
+import {transientReleaseCaller} from './release-caller.mjs';
 import {setTimeout} from 'node:timers/promises';
 
 // Retry only a typed transient lock refusal. An unknown child outcome must first
@@ -36,7 +37,7 @@ export function observationTimeout(receipt) {
 export function registryBusy(result,receipt) {
  return receipt===null&&result.status===1&&/database (?:table )?is locked/.test(String(result.stderr??''));
 }
-export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budgetMs=120000,referencePollMs=2000}={}) {
+export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budgetMs=120000,referencePollMs=2000,releaseCallers=[]}={}) {
  const deadline=now()+budgetMs;
  for(;;) {
   const result=run();let receipt;
@@ -53,7 +54,7 @@ export async function runReleaseWorker(run,{sleep=setTimeout,now=Date.now,budget
   if(observationTimeout(receipt) && result.status===2 && now()+referencePollMs<deadline) {
    await sleep(referencePollMs);continue;
   }
-  if(transientToolCallReference(receipt) && [0,2,75].includes(result.status) && now()+referencePollMs<deadline) {
+  if((transientToolCallReference(receipt)||transientReleaseCaller(receipt,releaseCallers)) && [0,2,75].includes(result.status) && now()+referencePollMs<deadline) {
    await sleep(referencePollMs);continue;
   }
   return {result,receipt,exitCode:result.status,known:Boolean(receipt)&&[0,2].includes(result.status)};

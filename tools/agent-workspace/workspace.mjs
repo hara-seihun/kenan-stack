@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {captureReleaseCallers} from './release-caller.mjs';
 import {fileURLToPath} from 'node:url';
 import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache-symlink.mjs';
 import {reapEndedOwners,ownerPage} from './owner-reaper.mjs';
@@ -6092,12 +6093,13 @@ function releaseForegroundAttempt(database,args,statePath,selected,{deadline,rel
         assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
         const request={id:record.id,path:record.path,owner:record.owner,sourceCommit:record.sourceCommit,
           members:(members.length?members:[record]).map(member=>member.id).sort(),flags:[...args.named].filter(([key])=>!['id','path','json'].includes(key)).sort(([a],[b])=>a.localeCompare(b))};
+        const releaseCallers=captureReleaseCallers(record.path);
         leaveReleaseDirectory();
         return submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
           custodyLineage:[...endedCustodyLineage(database,record)],
           observe:releaseUnitCessation,launch:name=>{
             const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
-            const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,...argv],{timeout:5000,cwd:path.dirname(statePath),env:{KENAN_BG_IDENTITY:'1'}});
+            const launched=command('/usr/local/bin/kenan-bg',[name,'--',process.execPath,new URL('./release-worker.mjs',import.meta.url).pathname,new URL(import.meta.url).pathname,statePath,JSON.stringify(releaseCallers),...argv],{timeout:5000,cwd:path.dirname(statePath),env:{KENAN_BG_IDENTITY:'1'}});
             if(launched.status!==0||launched.error)return {ok:false,code:'release-launch-outcome-unknown',status:launched.status,detail:launched.error?.code??'Observe the exact unit before any continuation.'};
             try{return JSON.parse(launched.stdout);}catch{return {ok:false,code:'release-launch-response-invalid'};}
           }});
