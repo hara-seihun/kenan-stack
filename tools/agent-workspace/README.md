@@ -98,6 +98,11 @@ goes into the same archive and is listed as `ignored`; the 1 GiB limit covers bo
 The background `reconcile` sweep still keeps a checkout with ignored output; only an explicit
 `release` disposes of it. Cause: rf-joint (2026-10-31) was fully published but kept for one
 ignored `jointsim.so`. Regression: "release drops ignored build products…" in `test.mjs`.
+## Short foreground release and custody observation
+
+An ordinary native release observes its existing background job for at most five seconds before returning the accepted request, job event and status command. Physical safety inspection continues in that same job. A pending response or a caller timeout is not permission to replay the release; observe the original job and retained journal.
+
+`custody-status` keeps the checkout and group fences when reading a binding, but shares a one-second acquisition budget across them. If a release or another writer holds either fence, it returns exit 75 and JSON with `custody-observation-busy`, the lock-holder observation and the ordinary `status` command. It never returns an unlocked binding or changes custody. The focused regression is `node --test tools/agent-workspace/custody-observation.test.mjs tools/agent-workspace/release-await.test.mjs`.
 
 ## Authenticated ordinary release custody
 

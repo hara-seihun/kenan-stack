@@ -1,7 +1,7 @@
 import './scratch-env.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {awaitSubmittedRelease,awaitUnitCessation} from './release-await.mjs';
+import {awaitSubmittedRelease,awaitUnitCessation,RELEASE_AWAIT_MS} from './release-await.mjs';
 const removed={recordState:'released',pathExists:false,submissionState:'submitted'};
 test('foreground completion waits for the durable settlement after physical removal',()=>{
  let reads=0,time=0;
@@ -47,4 +47,12 @@ test('older terminal receipts keep their log and settlement fallback without inv
 test('references without a cwd match never claim that changing directory resolves them', () => {
  const report = retainedReleaseReport({}, {result:{inspection:{processes:[{matches:['argument']}]}}}, {});
  assert.equal(report.hint,undefined);
+});
+
+test('a slow release returns pending within the short foreground budget without another launch',()=>{
+ let time=0,reads=0;
+ const observed={recordState:'active',pathExists:true,submissionState:'submitted',unitCeased:false};
+ const result=awaitSubmittedRelease({read:()=>{reads++;return observed;},now:()=>time,sleep:ms=>{time+=ms;}});
+ assert.equal(result.kind,'pending');assert.equal(result.observed,observed);
+ assert.equal(time,RELEASE_AWAIT_MS);assert.ok(time<=5000);assert.ok(reads>1);
 });

@@ -6,7 +6,9 @@
 //  - "terminal": the background unit ended without releasing (retained or refused; exit 2);
 //  - "pending": still running when the observation budget ended (exit 75, accepted work).
 // The observation is read-only; it never launches, retries or changes custody.
-export const RELEASE_AWAIT_MS = 30_000;
+// Leave room for native authentication and launch within a short foreground tool
+// budget. Slow physical inspection keeps its original background job and event.
+export const RELEASE_AWAIT_MS = 5_000;
 const pause = new Int32Array(new SharedArrayBuffer(4));
 export const sleepSync = ms => { Atomics.wait(pause, 0, 0, ms); };
 

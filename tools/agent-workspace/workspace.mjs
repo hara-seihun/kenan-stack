@@ -6352,7 +6352,24 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args,"terminal-safety"),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
-    else if (commandName === "custody-status") { assertOnly(args,["id","path","json"]); const r=growthSelected(database,args); withWorkspaceLock(database,r.path,()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId); }
+    else if (commandName === "custody-status") {
+      assertOnly(args,["id","path","json"]);
+      const r=growthSelected(database,args),deadline=Date.now()+1000;
+      // A release holds this fence throughout its physical safety inspection. A
+      // read-only observer must not disappear behind its default 30-second wait.
+      // Keep the fence: an unlocked binding could race with removal or reassignment.
+      try {
+        duringInspection(deadline,()=>withWorkspaceLock(database,r.path,
+          ()=>print({ok:true,binding:cacheBinding(database,r.id)},true),r.groupId,deadline));
+      } catch(error) {
+        if(!(error instanceof ResourceBusyError))throw error;
+        print({ok:false,error:{code:'custody-observation-busy',detail:error.message},
+          effect:'none',lock:error.detail,
+          nextAction:{observe:['agent-workspace','status','--id',r.id,'--json'],
+            explanation:'The checkout has an active lock holder. Observe its existing release or operation; do not replay effects.'}},true);
+        process.exitCode=75;
+      }
+    }
     else if (commandName === "thaw-source") thawSourceCommand(database,args);
     else if (commandName === "source-handoff") sourceHandoffCommand(database,args);
     else if (commandName === "freeze-source") freezeSourceCommand(database,args);
