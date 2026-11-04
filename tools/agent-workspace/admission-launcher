@@ -17,6 +17,33 @@ case ${1:-} in
   fi
   ;;
 esac
+# Custody commands get one durable attempt when publication owns either fence.
+# They do not run an old implementation and do not take a reader slot while queued.
+continuation=$(dirname "$(readlink -f -- "$0")")/agent-workspace-admission-continuation
+[ -f "$continuation" ] || continuation=$(dirname "$(readlink -f -- "$0")")/admission-continuation.py
+if [ "${1:-}" = admission-status ]; then
+ [ "${2:-}" = --job-id ] && [ -n "${3:-}" ] || exit 64
+ exec /usr/bin/python3 "$continuation" status "$3"
+fi
+case ${1:-} in
+ heartbeat|release)
+  exec 9>"$lock.turnstile"
+  if ! flock --shared --nonblock 9; then
+   exec 9>&-
+   exec /usr/bin/python3 "$continuation" submit "$@"
+  fi
+  exec 8>"$lock"
+  if ! flock --shared --nonblock 8; then
+   flock --unlock 9
+   exec 9>&-
+   exec 8>&-
+   exec /usr/bin/python3 "$continuation" submit "$@"
+  fi
+  flock --unlock 9
+  exec 9>&-
+  exec "$selected/main" "$@"
+  ;;
+esac
 deadline=$(( $(date +%s) + 20 ))
 busy() {
  printf '%s\n' '{"ok":false,"error":{"code":"workspace-admission-lock-busy","detail":"Tool publication is draining or selecting tools. No command ran; the shared 20-second admission budget expired.","commandStarted":false,"waitBudgetSeconds":20}}'

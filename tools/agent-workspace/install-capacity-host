@@ -19,6 +19,9 @@ fi
 if [[ ${5:-} != locked ]]; then
  # Install stable discovery from this committed source before fencing. All future
  # CLI calls share admission; detached originals are drained below, never killed.
+ helper_hash=$(sha256sum "$repo/tools/agent-workspace/admission-continuation.py" | cut -d' ' -f1)
+ sudo install -Dm755 "$repo/tools/agent-workspace/admission-continuation.py" "/usr/local/libexec/agent-workspace-admission-jobs/$helper_hash.py"
+ sudo ln -sfn "agent-workspace-admission-jobs/$helper_hash.py" /usr/local/libexec/agent-workspace-admission-continuation
  sudo install -Dm755 "$repo/tools/agent-workspace/admission-launcher" /usr/local/libexec/agent-workspace-admission
  sudo touch /run/lock/agent-workspace-admission.lock /run/lock/agent-workspace-admission.lock.turnstile
  sudo chmod 0666 /run/lock/agent-workspace-admission.lock /run/lock/agent-workspace-admission.lock.turnstile

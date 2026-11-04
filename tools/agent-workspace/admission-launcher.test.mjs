@@ -28,7 +28,7 @@ for(const stages of ['turnstile','shared'])test(`one absolute admission budget c
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'workspace-budget-')),lock=path.join(root,'lock'),ready=path.join(root,'ready'),selected=path.join(root,'selected');fs.mkdirSync(selected);fs.writeFileSync(path.join(selected,'main'),'#!/bin/sh\necho forbidden\n',{mode:0o755});
  const held=stages==='turnstile'?lock+'.turnstile':lock;
  const holder=spawn('flock',['-x',held,'sh','-c',`touch '${ready}';sleep 24`]);
- try{const end=Date.now()+3000;while(!fs.existsSync(ready)&&Date.now()<end)await new Promise(r=>setTimeout(r,5));assert.equal(fs.existsSync(ready),true);const started=Date.now();const result=spawnSync('/bin/sh',[new URL('./admission-launcher',import.meta.url).pathname,'heartbeat','--json'],{env:{...process.env,AGENT_WORKSPACE_ADMISSION_LOCK:lock,AGENT_WORKSPACE_SELECTED_ROOT:selected},encoding:'utf8',timeout:23000});const elapsed=Date.now()-started;assert.equal(result.status,75,result.stderr);assert.ok(elapsed>=18000&&elapsed<23000,String(elapsed));const value=JSON.parse(result.stdout);assert.equal(value.error.code,'workspace-admission-lock-busy');assert.equal(value.error.commandStarted,false);assert.equal(value.error.waitBudgetSeconds,20);assert.doesNotMatch(result.stdout,/forbidden/);
+ try{const end=Date.now()+3000;while(!fs.existsSync(ready)&&Date.now()<end)await new Promise(r=>setTimeout(r,5));assert.equal(fs.existsSync(ready),true);const started=Date.now();const result=spawnSync('/bin/sh',[new URL('./admission-launcher',import.meta.url).pathname,'create','--json'],{env:{...process.env,AGENT_WORKSPACE_ADMISSION_LOCK:lock,AGENT_WORKSPACE_SELECTED_ROOT:selected},encoding:'utf8',timeout:23000});const elapsed=Date.now()-started;assert.equal(result.status,75,result.stderr);assert.ok(elapsed>=18000&&elapsed<23000,String(elapsed));const value=JSON.parse(result.stdout);assert.equal(value.error.code,'workspace-admission-lock-busy');assert.equal(value.error.commandStarted,false);assert.equal(value.error.waitBudgetSeconds,20);assert.doesNotMatch(result.stdout,/forbidden/);
  }finally{holder.kill('SIGTERM');await new Promise(r=>holder.exitCode===null?holder.once('exit',r):r());fs.rmSync(root,{recursive:true,force:true});}
 });
 
@@ -45,7 +45,7 @@ test('only exact job observers bypass publication; generic status and mutations 
    assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,command+'\n');
   }
   fs.unlinkSync(path.join(selected,'read-only-job-observation-v1'));
-  for(const command of ['job-status','source-status','status','create','heartbeat','release','source-prepare','job-status-extra','--json']){
+  for(const command of ['job-status','source-status','status','create','source-prepare','job-status-extra','--json']){
    const result=spawnSync('/bin/sh',[new URL('./admission-launcher',import.meta.url).pathname,command,'job-status','--json'],{env,encoding:'utf8',timeout:3000});
    assert.equal(result.status,75,result.stderr);assert.equal(JSON.parse(result.stdout).error.commandStarted,false);
   }

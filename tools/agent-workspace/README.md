@@ -1330,3 +1330,28 @@ first. Keep the installed source repository intact when retiring source workspac
 ### Releasing from a shell inside the checkout
 
 The ordinary release command can run while its parent shell has the checkout as its current directory. After authenticating the release, the submission captures those ancestor processes with their UID and kernel start time in the durable worker command. If only those processes retain the checkout by their current directory, the worker rechecks the complete release for up to two minutes, allowing the submitting command and shell to exit. It never ignores a reference or deletes under a live shell. Other processes, writable files, executables, containers, services, dirty source and unpublished commits retain their existing protections. A shell that stays inside the checkout past that bound leaves an honest retained result; leave the directory and repeat the same release request. In shell batches, prefer `checkout=$PWD; cd /home/kenan; agent-workspace release --path "$checkout" --json` so the caller does not retain its own checkout.
+
+
+### Custody commands during tool publication
+
+The stable launcher submits a single durable user-systemd continuation when
+`heartbeat` or `release` encounters a publisher or a shared admission holder.
+It returns exit 75 with `state: pending`, an admission job ID, a result path and
+an `agent-workspace admission-status --job-id ID --json` observation command.
+This is accepted custody, not a completed heartbeat or release. Do not repeat
+the original command while that job is pending. The service survives caller
+exit, waits at most 600 seconds across both kernel fences, and resolves the
+selected immutable component only after acquiring shared admission. It never
+runs an unselected mutation or enters ahead of the publisher's turnstile.
+Uncontended commands retain their normal synchronous behavior.
+
+The private request retains the exact arguments, working directory and explicit
+workspace configuration, but no unrelated caller environment or credentials.
+The immutable helper has one activation claim and no restart policy. An
+interrupted or unacknowledged submission requires reconciliation of its unit,
+retained progress and output before a fresh attempt; it is never automatically
+replayed. A completed admission job contains the native command's exit code and
+stdout/stderr paths. Release may itself return another native durable job, which
+must still be observed. No lease or cleanup success is inferred from submission.
+`admission-status` observes only the retained admission job and its service; it
+does not enter the mutable workspace registry.
