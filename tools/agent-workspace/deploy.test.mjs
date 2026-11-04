@@ -54,6 +54,7 @@ test('component deployment retains other tools and fences unrelated source and p
     assert.equal(readlinkSync(path.join(destination, 'node_modules')), path.join(temporary, 'dependencies'));
     assert.equal(readFileSync(path.join(destination, 'other/body'), 'utf8'), 'other tool unchanged\n');
     assert.equal(readFileSync(path.join(selected, 'agent-workspace/README.md'), 'utf8'), original);
+    assert.equal(git(repository, 'ls-tree', 'HEAD', '--', 'tools/agent-workspace/background-launch.mjs').split(' ')[0], (execFileSync('stat', ['-c', '%a', path.join(destination, 'agent-workspace/background-launch.mjs')], {encoding: 'utf8'}).trim() === '755' ? '100755' : '100644'));
     const receipt = JSON.parse(readFileSync(path.join(destination, 'agent-workspace/.component-release.json')));
     assert.equal(receipt.baseline, baseline);
     assert.equal(git(receipt.sourceRepository, 'rev-parse', `refs/agent-workspace/deployed/${commit}`), commit);
