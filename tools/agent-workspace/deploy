@@ -40,7 +40,6 @@ rm -rf "$stage/agent-workspace"
 # This recovered historical marker was superseded by the immutable component receipt.
 rm -f "$stage/.agent-workspace-component.json"
 rsync -a --chmod=D755 --exclude=deploy "$root/tools/agent-workspace/" "$stage/agent-workspace/"
-chmod 755 "$stage/agent-workspace/workspace.mjs" "$stage/agent-workspace/background-launch.mjs"
 node "$stage/agent-workspace/main" --help >/dev/null
 printf '%s\n' "$commit" > "$stage/.pi-stack-commit"
 # Household operators (the kenan-operators group; a host without it has none) run root
