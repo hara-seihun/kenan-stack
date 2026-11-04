@@ -119,11 +119,13 @@ test('ordinary retired-growth continuation does not override a separately retain
  const result=f.release();assert.equal(result.action,'none');assert.equal(result.ordinaryReleaseContinuation,undefined);assert.equal(fs.existsSync(f.source),true);
 }));
 
-test('ordinary release refuses a measurement-held checkout lock promptly with an explicit continuation',()=>fixture(f=>{
- const crypto=process.getBuiltinModule('node:crypto');const lock=path.join(f.root,'locks',crypto.createHash('sha256').update('checkout:'+f.source).digest('hex'));
+for(const kind of ['checkout','group'])test('ordinary release refuses a measurement-held '+kind+' lock promptly with an explicit continuation',()=>fixture(f=>{
+ if(kind==='group')f.db.prepare('UPDATE workspace SET group_id=? WHERE id=?').run('measurement-group',f.record.id);
+ const key=kind==='checkout'?'checkout:'+f.source:'group:measurement-group';
+ const crypto=process.getBuiltinModule('node:crypto');const lock=path.join(f.root,'locks',crypto.createHash('sha256').update(key).digest('hex'));
  fs.mkdirSync(path.dirname(lock),{recursive:true});const ready=path.join(f.root,'lock-ready');
  const child=spawn('flock',['--exclusive',lock,process.execPath,'-e',`require('fs').writeFileSync(${JSON.stringify(ready)},'held');setTimeout(()=>{},2500)`],{stdio:'ignore'});
  try{const until=Date.now()+2000;while(!fs.existsSync(ready)&&Date.now()<until)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);assert.ok(fs.existsSync(ready));
- const start=Date.now(),r=f.release();assert.ok(Date.now()-start<1800);assert.equal(r.error.code,'release-resource-busy');assert.equal(r.completed,false);assert.equal(r.nextAction.observe[0],'agent-workspace');assert.ok(fs.existsSync(f.source));
+ const start=Date.now(),r=f.release();assert.ok(Date.now()-start<1800);assert.equal(r.error.code,'release-resource-busy');assert.equal(r.lock.lock,key);assert.ok(r.lock.waitedMs<1200,JSON.stringify(r.lock));assert.equal(r.completed,false);assert.equal(r.nextAction.observe[0],'agent-workspace');assert.ok(fs.existsSync(f.source));
  }finally{child.kill('SIGTERM');}
 }));

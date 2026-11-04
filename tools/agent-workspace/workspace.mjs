@@ -6049,7 +6049,13 @@ function releaseForegroundAttempt(database,args,statePath,selected,{deadline,rel
       if(!authority.ok&&authority.error?.code==='release-owner-mismatch')return allowAdoption?{adopt:authority}:{refused:authority,adoption};
       if(!authority.ok){if(bool(args,'json'))print(authority,true);else process.stderr.write(`agent-workspace: ${authority.error.code}: ${authority.error.detail}\n`);process.exitCode=2;return;}
       const foreground=authority.kind==='native'&&releaseScope?.background!==true;
-      const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,deadline):withWorkspaceLock(database,record.path,action,record.groupId,deadline);
+      // Initial acquisition must yield promptly to measurement or another release.
+      // This is not the physical inspection deadline: once acquired, action()
+      // still receives the full release budget. Share one short acquisition
+      // deadline across the group and checkout locks rather than waiting once
+      // per lock (or until the measurement finishes and silently proceeding).
+      const acquisitionDeadline=Math.min(deadline,Date.now()+1000);
+      const lock=action=>foreground?withResourceLock(statePath,`release-submit:${record.id}`,action,acquisitionDeadline):withWorkspaceLock(database,record.path,action,record.groupId,acquisitionDeadline);
       const submitted=lock(()=>{
         if(!foreground){releaseCommand(database,args,statePath,{deadline,allowDelegates:!bool(args,"end-retention"),...releaseAuthorityDependencies});return;}
         assertOnly(args,['id','path','reap-expired','preserve-runtime','json','end-retention','owner','expected-plan-sha256']);
