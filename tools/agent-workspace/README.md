@@ -295,10 +295,11 @@ This ledger is native workspace state, `workspace_capacity` in the same registry
 A completed unestimated clone can opt into an explicit priced allowance, and a source-only or budgeted checkout can expand to a budgeted install/build allowance, without changing its source, files, lease, owner, state or original creation request:
 
 ```sh
-agent-workspace measure-capacity --path /absolute/checkout --budget-ms 40000 --json
 agent-workspace reprice-capacity --path /absolute/checkout \
   --intent budgeted --headroom-gib 8 --growth-mib 512 --json
 ```
+
+Ordinary repricing reuses a fresh allocation sample, or automatically refreshes only the selected checkout with bounded, resumable allocation slices before retrying the identical requested price. It releases checkout and device locks before sampling. If its foreground budget runs out, exit 75 includes a durable job identity: that job continues sampling and applies the original request automatically through normal admission. Use the returned `job-status` command to observe completion. The continuation binds the original workspace and capacity plan, rejects a changed plan, and records its operation identity atomically with repricing to prevent duplicate growth charges after interruption. A failed sample or exhausted continuation remains an explicit failure and never changes the original allowance. Explicit reductions and growth resumption retain their separate evidence requirements.
 
 Use source-only when the continuing work is only source edits; choose budgeted and enough growth for continuing installs/builds. Here `growth-mib` declares **additional remaining writes**, not a replacement total that forgets consumed growth. The tool requires a fresh successful root-identity-bound sample and immutable Git source custody. It forecasts the original source at its recorded sparse selection from the existing object store (no history import or import charge), uses that conservative checkout-only source upper bound as baseline, and sets the growth budget to measured growth plus the requested remaining allowance. Admission applies the same 64 MiB/1% measurement margin. Repricing all completed unestimated rows removes their shared 30 GiB guard in favor of the maximum explicitly requested floor; other rows retain their own floors and remaining growth.
 

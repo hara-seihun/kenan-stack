@@ -6,6 +6,7 @@ import {persistAllocationSample} from './allocation-sample-store.mjs';
 import {staleAllocationForecast} from './stale-allocation.mjs';
 import {ownerFutureWrites,observeCapacityChildren,capacityOwnerProjection} from './capacity-owner-forecast.mjs';
 import {admitWithRefresh} from './admission-refresh.mjs';
+import {repriceWithSample} from './reprice-refresh.mjs';
 import {nativeTerminalRootPaths,rootTerminalSafety} from './root-terminal-growth.mjs';
 import {assertIdleGrowth,assertIdleObservation} from './idle-growth.mjs';
 import {withContentObservation,pruneInodeContent} from './inode-content.mjs';
@@ -4614,12 +4615,12 @@ function settleEndedOwnerFutureGrowth(verdicts) {
 // here, before any lifecycle lock, through the host's supported UID-preserving read-capability
 // route (falling back to an unprivileged walk). Only the measurement cache changes; retirement
 // still validates freshness, root identity and its own terminal writer observation.
-function refreshEndedOwnerSample(database, record, deadline, statePath, {incremental=false} = {}) {
+function refreshEndedOwnerSample(database, record, deadline, statePath, {incremental=false, targeted=false} = {}) {
   const row = database.prepare(`SELECT w.id,w.path,w.state,w.created_at,w.group_id,c.device_id,c.plan_json FROM workspace w
     JOIN workspace_capacity c ON c.workspace_id=w.id WHERE w.id=?`).get(record.id);
   if (!row) return { kind: "unpriced" };
   const plan = JSON.parse(row.plan_json);
-  if (!["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan)) return { kind: "not-needed" };
+  if (!targeted && (!["source-only", "budgeted"].includes(plan.intent) || retainedGrowth(plan))) return { kind: "not-needed" };
   if (cachedWorkspaceAllocation(database, record.id, record.path, row.device_id).ok) return { kind: "fresh" };
   // Admission must not spend its whole budget restarting one large tree. Keep
   // durable traversal progress and give the next deciding reservation a turn.
@@ -5017,6 +5018,17 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     const row = database.prepare("SELECT device_id,plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
     if (row === undefined) fail("capacity repricing requires an existing capacity plan");
     const oldPlan = JSON.parse(row.plan_json);
+    const continuation = process.env.PI_WORKSPACE_REPRICE_CONTINUATION;
+    if (continuation) {
+      const binding = JSON.parse(continuation);
+      const root=lstatSync(record.path);
+      if (binding.id !== record.id || binding.owner !== record.owner || binding.path !== record.path ||
+          binding.sourceCommit !== record.sourceCommit || binding.durableSourceCommit !== record.durableSourceCommit ||
+          binding.device !== String(root.dev) || binding.inode !== String(root.ino))
+        growthError("reprice-binding-changed", "continuation workspace identity, source or owner changed");
+      if (oldPlan.repricing?.operationId === binding.operationId) { print(creationRecord(database, record.id), bool(args,"json")); return; }
+      if (digest(row.plan_json) !== binding.planSha256) growthError("reprice-binding-changed", "capacity plan changed before continuation; no repricing applied");
+    }
     const retired = retainedGrowth(oldPlan);
     if (retainedParent(database,record.path)) growthError("growth-admission-required", "shared Git parent requires resume-growth admission");
     if (retired !== resume) growthError("growth-admission-required", retired ? "use explicit resume-growth admission" : "growth is not retired");
@@ -5039,7 +5051,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     if (resume) { delete plan.growthLifecycle; delete plan.retainedHeadroom; }
     withResourceLock(statePath, `capacity:${row.device_id}`, () => {
       const measurement = cachedWorkspaceAllocation(database, record.id, record.path, row.device_id);
-      if (!measurement.ok) fail(`capacity repricing requires a fresh allocated-block sample: ${measurement.error}; run measure-capacity first`);
+      if (!measurement.ok) throw Object.assign(new Error(`capacity repricing requires a fresh allocated-block sample: ${measurement.error}`), {code:"reprice-sample-required"});
       const sampleText = database.prepare("SELECT measurement_json FROM workspace_capacity_measurement WHERE workspace_id=?").get(record.id).measurement_json;
       const sample = JSON.parse(sampleText);
       // Recheck actual allocation under the same filesystem fence. Keep the bound
@@ -5075,6 +5087,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
       }
       plan.repricing = { priorIntent: oldPlan.intent, sampledGrowthBytes, accountedGrowthBytes, remainingGrowthBytes: intent.growthBytes,
         measurementStartedAt: sample.startedAt, measurementCompletedAt: sample.completedAt, marginBytes: measurement.marginBytes };
+      if (continuation) plan.repricing.operationId = JSON.parse(continuation).operationId;
       if (reducing) {
         plan.repricing.reduction = { ...reduction, sha256: reductionSha256 };
         plan.repricing.currentMeasurement = currentSample;
@@ -5116,11 +5129,29 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
     }, deadline);
     print(creationRecord(database, record.id), bool(args, "json"));
   }, selected.groupId, deadline));
-  // Ordinary increases use the same sampled projection as CREATE, but never
-  // run unrelated tree refresh loops inside their bounded observation budget.
-  // Explicit resume keeps its existing refusal-driven admission route.
-  return !resume ? decide() : withCapacityRefresh(database, statePath, device, decide,
+  // Ordinary increases preserve CREATE's projection without unrelated tree walks.
+  // Only this workspace's own missing sample is refreshed outside both locks.
+  const admit = () => !resume ? decide() : withCapacityRefresh(database, statePath, device, decide,
     {budgetMs: Math.max(0, deadline - Date.now())});
+  if (reducing || resume) return admit();
+  return repriceWithSample({decide:admit, deadline,
+    refresh: () => refreshEndedOwnerSample(database, selected, deadline, statePath, {incremental:true,targeted:true}),
+    defer: observations => {
+      if (process.env.PI_WORKSPACE_REPRICE_CONTINUATION) growthError("reprice-sample-incomplete", "bounded continuation could not finish sampling; allocation and original plan retained");
+      const planJson=database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(selected.id).plan_json;
+      const normalized=[...args.named].filter(([flag])=>flag!=="budget-ms").flatMap(([flag,values])=>values.map(value=>`--${flag}=${value}`));
+      const current=recordBy(database,{id:selected.id}),root=lstatSync(current.path);
+      const request={id:current.id,owner:current.owner,path:current.path,sourceCommit:current.sourceCommit,
+        durableSourceCommit:current.durableSourceCommit,device:String(root.dev),inode:String(root.ino),
+        planSha256:digest(planJson),args:normalized};
+      const operationId=digest(JSON.stringify(request));
+      const binding={...request,operationId};
+      const job=runSourceJob({directory:path.join(path.dirname(statePath),"source-preparations","jobs"),key:`reprice:${operationId}`,request,
+        command:[process.execPath,new URL("reprice-job.mjs",import.meta.url).pathname,statePath,...normalized],
+        env:{PI_WORKSPACE_REPRICE_CONTINUATION:JSON.stringify(binding)},waitMs:0,restartInterrupted:true,restartAbnormal:true});
+      print({...job,jobKind:"source",operationKind:"reprice",sampling:observations,nextAction:`Observe agent-workspace job-status --job-id ${job.jobId} --json; the original pricing request is executing automatically.`},bool(args,"json"));
+      if(job.state!=="ready")process.exitCode=job.state==="failed"?1:75;
+    }});
 }
 
 

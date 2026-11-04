@@ -1026,8 +1026,7 @@ test("fenced capacity repricing preserves live unestimated work and journals sam
     const before = db.prepare("SELECT * FROM workspace WHERE id=?").get(created.id);
     const args = ["reprice-capacity", "--id", created.id, "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", "8", "--json"];
     db.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(created.id);
-    assert.throws(() => run(args, f.env), /requires a fresh allocated-block sample/);
-    run(["measure-capacity", "--id", created.id, "--json"], f.env);
+
     db.prepare("UPDATE workspace SET state='creating' WHERE id=?").run(created.id);
     assert.throws(() => run(args, f.env), /cannot reprice capacity from state creating/);
     db.prepare("UPDATE workspace SET state='active' WHERE id=?").run(created.id);
@@ -1102,8 +1101,7 @@ for (const priorIntent of ["source-only", "budgeted"]) test(`${priorIntent} buil
     const oldCapacity = db.prepare("SELECT * FROM workspace_capacity WHERE workspace_id=?").get(created.id);
     const args = ["reprice-capacity", "--id", created.id, "--intent", "budgeted", "--headroom-gib", "1", "--growth-mib", "128", "--json"];
     db.prepare("DELETE FROM workspace_capacity_measurement WHERE workspace_id=?").run(created.id);
-    assert.throws(() => run(args, f.env), /requires a fresh allocated-block sample/);
-    run(["measure-capacity", "--id", created.id, "--json"], f.env);
+
     assert.throws(() => run(args.map(value => value === "128" ? "1000000" : value), f.env), /GiB is required/);
     assert.throws(() => run(args.map(value => value === "1" ? "0.5" : value), f.env), /cannot reduce headroom/);
     assert.deepEqual(db.prepare("SELECT * FROM workspace_capacity WHERE workspace_id=?").get(created.id), oldCapacity);

@@ -2,7 +2,7 @@ import './scratch-env.mjs';
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,rmSync,statSync,statfsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,chmodSync,writeFileSync,rmSync,statSync,statfsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -206,4 +206,30 @@ test('a 512 MiB increase uses exactly CREATE sampled commitments rather than dou
    assert.throws(()=>run(['reprice-capacity','--id',own.row.id,'--intent','budgeted','--growth-mib','1536','--headroom-gib','8','--budget-ms','1000','--json']),e=>e.code==='workspace-capacity-refused');
   }
  }finally{db?.close();if(prior===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=prior;rmSync(root,{recursive:true,force:true});}
+});
+
+test('real stale sample refresh resumes requested price, and failed refresh preserves the plan',()=>{
+ const root=mkdtempSync(path.join(tmpdir(),'reprice-stale-'));let db;
+ const state=path.join(root,'registry.sqlite3'),dir=path.join(root,'source');
+ const git=(...args)=>execFileSync('git',args,{encoding:'utf8',timeout:5000}).trim();
+ const run=args=>{let text='';const prior=process.stdout.write;const exit=process.exitCode;process.stdout.write=v=>{text+=v;return true;};try{main(args,state);}finally{process.stdout.write=prior;process.exitCode=exit;}return JSON.parse(text);};
+ try {
+  mkdirSync(dir);git('init','-b','main',dir);git('-C',dir,'config','user.email','fixture@example.invalid');git('-C',dir,'config','user.name','Fixture');writeFileSync(path.join(dir,'proof'),'source');git('-C',dir,'add','.');git('-C',dir,'commit','-m','source');
+  const head=git('-C',dir,'rev-parse','HEAD'),rec=run(['register','--path',dir,'--root',root,'--owner','owner','--source-commit',head,'--json']);
+  db=new DatabaseSync(state);const stat=statSync(dir),device=String(stat.dev);
+  const plan={intent:'source-only',constructionBytes:1024**2,sourceImportBytes:0,completedAllocationBytes:1024**2,growthBytes:512*M,headroomBytes:8*G,sourceCommit:head};
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity VALUES(?,?,?)').run(rec.id,device,JSON.stringify(plan));
+  const stale={ok:true,bytes:1024,allocatedBytes:1024,device,inode:String(stat.ino),startedAt:Date.now()-1000000,completedAt:Date.now()-1000000};
+  db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(rec.id,JSON.stringify(stale));
+  const args=['reprice-capacity','--id',rec.id,'--intent','budgeted','--headroom-gib','8','--growth-mib','3072','--json'];
+  const priced=run(args).capacity;
+  assert.equal(priced.intent,'budgeted');assert.equal(priced.headroomBytes,8*G);assert.equal(priced.repricing.remainingGrowthBytes,3072*M);
+  assert.ok(priced.repricing.measurementStartedAt>stale.startedAt);
+  db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(rec.id);
+  const before=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json;
+  mkdirSync(path.join(dir,"unreadable"));chmodSync(path.join(dir,"unreadable"),0);
+  assert.throws(()=>run(args),e=>e.code==='reprice-sample-refresh-failed');
+  assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json,before);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM workspace_capacity_repricing WHERE workspace_id=?').get(rec.id).n,1);
+ } finally {if(db)chmodSync(path.join(dir,"unreadable"),0o700);db?.close();rmSync(root,{recursive:true,force:true});}
 });
