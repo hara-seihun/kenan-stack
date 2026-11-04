@@ -5694,10 +5694,10 @@ function measureWorkspaceRow(database, row, paths, deadline, statePath, incremen
       const saved=database.prepare(`SELECT state_json FROM ${walkTable} WHERE workspace_id=?`).get(row.id);
       let prior;try{prior=saved?JSON.parse(saved.state_json):null;}catch{prior=null;}
       if(prior && prior.contentProof!==contentProof)prior=null;
-      // An allocation walk that already exceeds the unchanged freshness window
-      // cannot finish as a fresh physical observation. Restart traversal only;
-      // never erase the last complete sample or publish a partial allocation.
-      if(prior && !contentProof && Date.now()-prior.startedAt>CAPACITY_MEASUREMENT_MAX_AGE_MS)prior=null;
+      // Both walk modes produce allocation samples subject to start-time freshness.
+      // Restart an expired traversal before doing work, including content proofs;
+      // never retimestamp old progress or erase the last complete sample.
+      if(prior && Date.now()-prior.startedAt>CAPACITY_MEASUREMENT_MAX_AGE_MS)prior=null;
       const until=Math.min(deadline,Date.now()+1000);
       const walk=observeContent=>allocationSlice(row.path,row.device_id,prior,{deadline:until,excludedPaths,observeContent});
       const slice=contentProof?withContentObservation(database,{deadline:until},walk):walk(undefined);

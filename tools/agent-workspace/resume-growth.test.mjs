@@ -1,6 +1,7 @@
 import './scratch-env.mjs';
 import{test}from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import os from'node:os';import path from'node:path';import{execFileSync,spawnSync}from'node:child_process';import{DatabaseSync}from'node:sqlite';import{fileURLToPath}from'node:url';import{digest}from'./growth-lifecycle.mjs';
-const moduleFile=process.env.WORKSPACE_RESUME_MODULE||fileURLToPath(new URL('./workspace.mjs',import.meta.url));const{main}=await import(moduleFile);
+const moduleFile=process.env.WORKSPACE_RESUME_MODULE||fileURLToPath(new URL('./workspace.mjs',import.meta.url));const{main,workspaceTesting}=await import(moduleFile);
+import {allocationSlice} from './incremental-allocation.mjs';
 function fixture(action,oldIntent='source-only'){
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'resume-contract-')),source=path.join(root,'source'),state=path.join(root,'registry.sqlite3');fs.mkdirSync(source);let db;const previous=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
  const git=(...a)=>execFileSync('git',['-C',source,...a],{encoding:'utf8',timeout:5000,stdio:['ignore','pipe','pipe']}).trim();
@@ -39,4 +40,32 @@ test('stale actual allocation sample refuses source-only resume without plan or 
 test('installed executable help and typed selector error share the command-specific contract',()=>fixture(f=>{
  const help=spawnSync(process.execPath,[moduleFile,'--help'],{encoding:'utf8',timeout:5000});assert.equal(help.status,0);assert.match(help.stdout,/resume-growth \(--id ID \[--path PATH\]\|--path PATH\).*--intent source-only\|budgeted/);
  const bad=spawnSync(process.execPath,[moduleFile,...f.argv([])],{encoding:'utf8',timeout:5000,env:{...process.env,PI_WORKSPACE_STATE:f.state}});assert.equal(bad.status,2);const body=JSON.parse(bad.stdout);assert.equal(body.error.code,'invalid-workspace-selector');assert.match(body.error.detail,/^resume-growth requires/);assert.equal(body.error.nextAction.command,'resume-growth');
+}));
+
+for (const contentProof of [false,true]) test(`expired paused ${contentProof?'content-proof':'allocation'} walk restarts and its fresh result permits repricing`,()=>fixture(f=>{
+ const table=contentProof?'workspace_capacity_content_walk':'workspace_capacity_walk';
+ f.db.exec(`CREATE TABLE IF NOT EXISTS ${table}(workspace_id TEXT PRIMARY KEY, state_json TEXT NOT NULL)`);
+ // Make a real partial traversal whose root enumeration predates the pause.
+ // A file created after that enumeration must be discovered by a new scan, not
+ // hidden by merely changing the timestamp on the old checkpoint.
+ const now=Date.now;const oldStart=now()-16*60_000;let partial;
+ Date.now=()=>oldStart;
+ try{partial=allocationSlice(f.source,String(fs.statSync(f.source).dev),null,{maxEntries:1,observeContent:contentProof?()=>0:undefined});}
+ finally{Date.now=now;}
+ assert.equal(partial.partial,true);partial.state.contentProof=contentProof;
+ f.db.prepare(`INSERT OR REPLACE INTO ${table} VALUES(?,?)`).run(f.record.id,JSON.stringify(partial.state));
+ const payload=path.join(f.source,'created-after-pause');fs.writeFileSync(payload,Buffer.alloc(1024*1024,97));
+ const before=Date.now();
+ const measured=f.run(['measure-capacity','--id',f.record.id,'--incremental',...(contentProof?['--content-proof']:[]),'--budget-ms','5000','--json']);
+ const sample=JSON.parse(f.snapshot().sample);
+ assert.equal(measured.progress.measured,1);assert.equal(measured.progress.error,0);
+ assert.equal(sample.ok,true);assert.ok(sample.startedAt>=before,'expired traversal must restart before work');
+ assert.equal(sample.writeObservationComplete,contentProof);
+ const exact=workspaceTesting.workspaceAllocationSample(f.source,String(fs.statSync(f.source).dev),{deadline:Date.now()+3000,maxEntries:2_000_000});
+ assert.equal(sample.bytes,exact.bytes,'restart must include files added after the paused root enumeration');
+ assert.equal(sample.allocatedBytes,exact.allocatedBytes);
+ assert.equal(f.db.prepare(`SELECT state_json FROM ${table} WHERE workspace_id=?`).get(f.record.id),undefined);
+ const resumed=f.run(f.argv(['--id',f.record.id]));
+ assert.equal(resumed.capacity.intent,'source-only');assert.ok(resumed.capacity.admission);
+ assert.equal(resumed.capacity.growthLifecycle,undefined);
 }));
