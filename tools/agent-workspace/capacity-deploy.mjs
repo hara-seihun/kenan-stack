@@ -25,8 +25,11 @@ const sourceRepository='/srv/pi/component-source.git';
 // Keep the entire commit closure independently of the disposable writer before selection.
 if(git('rev-parse','--is-shallow-repository')!=='false')throw Error('complete source history required');
 if(!fs.existsSync(sourceRepository))execFileSync('git',['init','--bare',sourceRepository]);
-execFileSync('git',['--git-dir='+sourceRepository,'fetch','--no-tags',repo,`${head}:refs/agent-workspace/deployed/${head}`]);
+execFileSync('git',['--git-dir='+sourceRepository,'fetch','--no-tags','--no-write-fetch-head',repo,`${head}:refs/agent-workspace/deployed/${head}`]);
 execFileSync('git',['--git-dir='+sourceRepository,'rev-list','--objects','--missing=error',head],{stdio:'ignore'});
+// FETCH_HEAD is transport metadata, not a runtime dependency. Its old source
+// pathname must not pin the disposable writer after durable refs own the closure.
+fs.rmSync(path.join(sourceRepository,'FETCH_HEAD'),{force:true});
 const target=path.join(path.dirname(expected),head),stage=target+'.stage';
 if(fs.existsSync(target)||fs.existsSync(stage))throw Error('existing target reconcile first');
 fs.cpSync(expected,stage,{recursive:true,verbatimSymlinks:true});
