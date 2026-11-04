@@ -1296,3 +1296,27 @@ within its original deadline. Only a freshly reobserved, identical root-bound
 running invocation can replace a timed-out store observation during release;
 healthy missing or foreign records, admission receipts, and arbitrary shell
 identities do not gain that fallback. The database index survives runtime restarts.
+
+### Deploying a public fix over retained private source
+
+Component deployment retains its full source ancestry in a local bare repository outside
+admitted workspaces. The installed `.component-release.json` records `sourceRepository`
+and the exact `sourceCommit`. This custody is local: private source is never pushed to
+public main by the deployment helper. `PI_STACK_COMPONENT_SOURCE_REPO` may select an
+absolute local bare repository; by default custody lives next to the release store.
+
+If public main does not contain the selected private source, do not replace the installed
+component with the public tree. In a clean admitted checkout containing the explicit public
+fix commits, run:
+
+```
+node /srv/pi/tools/agent-workspace/source-lineage.mjs integrate "$PWD" /srv/pi/tools FULL_FIX_COMMIT
+```
+
+This verifies installed bytes and modes against retained source, creates a new repair
+branch at that exact source, and cherry-picks only the supplied component-only commits.
+It refuses unrelated changes, merges, dirty checkouts, and mismatched installed bytes.
+Resolve conflicts normally or use `git cherry-pick --abort`; it never resets another writer.
+Run the affected tests, then `bash tools/agent-workspace/deploy`. Deployment still checks
+ancestry and unrelated tool changes and refuses a stale baseline if another writer deployed
+first. Keep the installed source repository intact when retiring source workspaces.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if (( EUID != 0 )) && [[ ${PI_STACK_DEPLOY_NO_SUDO:-0} != 1 ]]; then
-  exec sudo -n --preserve-env=PI_STACK_TOOLS_DEST,PI_STACK_RELEASES_ROOT,PI_STACK_HOST_LOCK_PATH,PI_STACK_DEPLOY_TIMEOUT_SECONDS,PI_STACK_PUBLICATION_REQUEST bash "$(realpath "$0")" "$@"
+  exec sudo -n --preserve-env=PI_STACK_TOOLS_DEST,PI_STACK_RELEASES_ROOT,PI_STACK_HOST_LOCK_PATH,PI_STACK_DEPLOY_TIMEOUT_SECONDS,PI_STACK_PUBLICATION_REQUEST,PI_STACK_COMPONENT_SOURCE_REPO bash "$(realpath "$0")" "$@"
 fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 source "$root/deploy/lib"
@@ -16,7 +16,7 @@ baseline=$(<"$dest/.pi-stack-commit")
 comparison=$baseline
 if git -C "$root" cat-file -e "$baseline^{commit}" 2>/dev/null; then
   git -C "$root" merge-base --is-ancestor "$baseline" "$commit" || {
-    echo "candidate must descend from selected tools source $baseline" >&2; exit 65;
+    echo "candidate must descend from selected tools source $baseline; integrate explicit component fixes with node $dest/agent-workspace/source-lineage.mjs integrate ADMITTED_CHECKOUT $dest FIX_COMMIT" >&2; exit 65;
   }
 elif comparison=$(node "$root/tools/agent-workspace/installed-base.mjs" "$root" "$dest"); then
   # The selected source object is unavailable, but an ancestor's component tree equals the installed bytes.
@@ -28,6 +28,11 @@ fi
 git -C "$root" diff --quiet "$comparison" "$commit" -- tools ':!tools/agent-workspace' ':!tools/host-retention' ':!tools/README.md' config/tools.json || {
   echo 'component deployment refuses changes to other tools or their manifest; use the full release owner' >&2; exit 65;
 }
+# Keep complete ancestry in durable local custody before publishing its identity.
+# The source repository is retained outside disposable admitted workspaces.
+custody=${PI_STACK_COMPONENT_SOURCE_REPO:-$(dirname "$(readlink -f "$dest")")/../../component-source.git}
+custody=$(realpath -m "$custody")
+node "$root/tools/agent-workspace/source-lineage.mjs" retain "$root" "$custody" "$commit" >/dev/null
 stage=$(mktemp -d "${TMPDIR:-/tmp}/pi-workspace-tools.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
 rsync -a "$(readlink -f "$dest")/" "$stage/"
@@ -43,10 +48,10 @@ printf '%s\n' "$commit" > "$stage/.pi-stack-commit"
 observer_node=$(command -v node)
 observer_entry=$dest/agent-workspace/operator-observe.mjs
 observer_gid=$(getent group kenan-operators | cut -d: -f3) || observer_gid=
-node - "$stage/agent-workspace/.component-release.json" "$baseline" "$commit" "$observer_node" "$observer_entry" "$observer_gid" <<'NODE'
+node - "$stage/agent-workspace/.component-release.json" "$baseline" "$commit" "$observer_node" "$observer_entry" "$observer_gid" "$custody" <<'NODE'
 const fs = require('node:fs');
-const [file, baseline, sourceCommit, node, entry, gid] = process.argv.slice(2);
-fs.writeFileSync(file, JSON.stringify({component: 'agent-workspace', baseline, sourceCommit, deployedAt: Date.now(),
+const [file, baseline, sourceCommit, node, entry, gid, sourceRepository] = process.argv.slice(2);
+fs.writeFileSync(file, JSON.stringify({component: 'agent-workspace', baseline, sourceCommit, sourceRepository, deployedAt: Date.now(),
   scope: 'tools-only; other tool bodies and dependency links retained',
   ...(gid === '' ? {} : {operatorObserver: {gid: Number(gid), node, entry}})}, null, 2) + '\n');
 NODE

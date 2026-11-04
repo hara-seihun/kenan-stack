@@ -1,4 +1,5 @@
 import './scratch-env.mjs';
+import './source-lineage.test.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -53,7 +54,9 @@ test('component deployment retains other tools and fences unrelated source and p
     assert.equal(readlinkSync(path.join(destination, 'node_modules')), path.join(temporary, 'dependencies'));
     assert.equal(readFileSync(path.join(destination, 'other/body'), 'utf8'), 'other tool unchanged\n');
     assert.equal(readFileSync(path.join(selected, 'agent-workspace/README.md'), 'utf8'), original);
-    assert.equal(JSON.parse(readFileSync(path.join(destination, 'agent-workspace/.component-release.json'))).baseline, baseline);
+    const receipt = JSON.parse(readFileSync(path.join(destination, 'agent-workspace/.component-release.json')));
+    assert.equal(receipt.baseline, baseline);
+    assert.equal(git(receipt.sourceRepository, 'rev-parse', `refs/agent-workspace/deployed/${commit}`), commit);
     writeFileSync(hostLock + '.publication', JSON.stringify({requestId: 'different-owner', integrationSha: commit}));
     assert.throws(deploy, /publication reserves this host/);
     rmSync(hostLock + '.publication');
