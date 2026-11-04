@@ -73,6 +73,7 @@ test('re-pricing an existing reservation charges only its increment, even on an 
 
 // Repricing retains every unrelated promise without reading or refreshing its cache.
 test('repricing increases read CREATE sampled accounting without refreshing unrelated stale caches and commit consumed growth exactly once',()=>{
+ const priorContinuation=process.env.PI_WORKSPACE_REPRICE_CONTINUATION;
  const root=mkdtempSync(path.join(tmpdir(),'reprice-stale-'));let db;
  const state=path.join(root,'registry.sqlite3'),priorSafety=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
@@ -209,6 +210,7 @@ test('a 512 MiB increase uses exactly CREATE sampled commitments rather than dou
 });
 
 test('real stale sample refresh resumes requested price, and failed refresh preserves the plan',()=>{
+ const priorContinuation=process.env.PI_WORKSPACE_REPRICE_CONTINUATION;
  const root=mkdtempSync(path.join(tmpdir(),'reprice-stale-'));let db;
  const state=path.join(root,'registry.sqlite3'),dir=path.join(root,'source');
  const git=(...args)=>execFileSync('git',args,{encoding:'utf8',timeout:5000}).trim();
@@ -222,7 +224,16 @@ test('real stale sample refresh resumes requested price, and failed refresh pres
   const stale={ok:true,bytes:1024,allocatedBytes:1024,device,inode:String(stat.ino),startedAt:Date.now()-1000000,completedAt:Date.now()-1000000};
   db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(rec.id,JSON.stringify(stale));
   const args=['reprice-capacity','--id',rec.id,'--intent','budgeted','--headroom-gib','8','--growth-mib','3072','--json'];
+  process.env.PI_WORKSPACE_REPRICE_CONTINUATION=JSON.stringify({id:rec.id,owner:rec.owner,path:rec.path,
+    sourceCommit:rec.sourceCommit,durableSourceCommit:rec.durableSourceCommit,device,inode:String(stat.ino),
+    planSha256:createHash('sha256').update(JSON.stringify(plan)).digest('hex'),operationId:'fixture-original-operation'});
   const priced=run(args).capacity;
+  assert.equal(priced.repricing.operationId,'fixture-original-operation');
+  assert.deepEqual(run(args).capacity,priced,'interrupted result commit cannot charge consumed growth twice');
+  db.prepare('UPDATE workspace SET owner=? WHERE id=?').run('another-owner',rec.id);
+  assert.throws(()=>run(args),{code:'reprice-binding-changed'});
+  db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(rec.owner,rec.id);
+  delete process.env.PI_WORKSPACE_REPRICE_CONTINUATION;
   assert.equal(priced.intent,'budgeted');assert.equal(priced.headroomBytes,8*G);assert.equal(priced.repricing.remainingGrowthBytes,3072*M);
   assert.ok(priced.repricing.measurementStartedAt>stale.startedAt);
   db.prepare('DELETE FROM workspace_capacity_measurement WHERE workspace_id=?').run(rec.id);
@@ -231,5 +242,5 @@ test('real stale sample refresh resumes requested price, and failed refresh pres
   assert.throws(()=>run(args),e=>e.code==='reprice-sample-refresh-failed');
   assert.equal(db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(rec.id).plan_json,before);
   assert.equal(db.prepare('SELECT count(*) AS n FROM workspace_capacity_repricing WHERE workspace_id=?').get(rec.id).n,1);
- } finally {if(db)chmodSync(path.join(dir,"unreadable"),0o700);db?.close();rmSync(root,{recursive:true,force:true});}
+ } finally {if(priorContinuation===undefined)delete process.env.PI_WORKSPACE_REPRICE_CONTINUATION;else process.env.PI_WORKSPACE_REPRICE_CONTINUATION=priorContinuation;try{chmodSync(path.join(dir,"unreadable"),0o700);}catch{}db?.close();rmSync(root,{recursive:true,force:true});}
 });

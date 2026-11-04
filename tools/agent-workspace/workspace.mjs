@@ -5149,7 +5149,7 @@ function repriceCapacityCommand(database, args, statePath, resume = false) {
       const job=runSourceJob({directory:path.join(path.dirname(statePath),"source-preparations","jobs"),key:`reprice:${operationId}`,request,
         command:[process.execPath,new URL("reprice-job.mjs",import.meta.url).pathname,statePath,...normalized],
         env:{PI_WORKSPACE_REPRICE_CONTINUATION:JSON.stringify(binding)},waitMs:0,restartInterrupted:true,restartAbnormal:true});
-      print({...job,jobKind:"source",operationKind:"reprice",sampling:observations,nextAction:`Observe agent-workspace job-status --job-id ${job.jobId} --json; the original pricing request is executing automatically.`},bool(args,"json"));
+      print({...job,jobKind:"source",operationKind:"reprice",sampling:observations,nextAction:job.state==="failed" ? "The repricing continuation failed; the original allowance is retained. Inspect the error before retrying." : job.state==="ready" ? "The original pricing request completed." : `Observe agent-workspace job-status --job-id ${job.jobId} --json; the original pricing request is executing automatically.`},bool(args,"json"));
       if(job.state!=="ready")process.exitCode=job.state==="failed"?1:75;
     }});
 }
