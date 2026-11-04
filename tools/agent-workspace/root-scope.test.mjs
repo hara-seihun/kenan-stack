@@ -93,3 +93,19 @@ test('persistent native scope authenticates without a service lifetime binding',
  assert.equal(callerToolCall({pid,scope,parent:()=>9,argv:()=>['node','/srv/kenan/production/dist/server/main.js'],uid:()=>0}),null);
  f.files.set('/sys/fs/cgroup'+group+'/cgroup.procs','321\n');assert.equal(f.observe().kind,'refused');
 });
+
+for (const agentId of ['manager:converge', 'manager:team-west', bgAgent]) {
+ for (const name of ['aw-release-06fbdbe99249dabc8449a1229ba77628', 'job-with-many-hyphens']) {
+  test(`background identity ${agentId} binds the whole hyphenated job name ${name}`, () => {
+   const unit=`kenan-bg-${agentId}-${name}.service`, group=`/user.slice/user-agents.slice/user-agents-kenanbg.slice/${unit}`;
+   const f=fixture({unit,identity:{...bgIdentity,agentId}});
+   const scope=()=>procScope(pid,{read:()=>`0::${group}`,kernel:(p,g,u)=>rootScope(p,g,u,{io:f.io}),query:()=>assert.fail('no weaker fallback')});
+   assert.equal(callerToolCall({pid,scope,uid:()=>1002}).agentId,agentId);
+   const file='/run/systemd/transient/'+unit,original=f.files.get(file);
+   for(const foreign of ['manager:other', `${agentId}-${name}`, 'manager:converge-wrong', `${agentId}.+`]) {
+    f.files.set(file,original.replace(JSON.stringify(agentId),JSON.stringify(foreign)));
+    assert.equal(rootScope(pid,group,unit,{io:f.io}).kind,'refused',foreign);
+   }
+  });
+ }
+}

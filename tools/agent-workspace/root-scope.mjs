@@ -2,6 +2,10 @@ import fs from 'node:fs';
 
 const native=/^agent-tool-[a-z][a-z0-9-]*-[a-f0-9-]{36}\.scope$/;
 const background=/^kenan-bg-([a-f0-9-]{36}|manager:[a-z][a-z0-9-]{0,63})-[-A-Za-z0-9._]{1,60}\.service$/;
+const backgroundAgent=/^(?:[a-f0-9-]{36}|manager:[a-z][a-z0-9-]{0,63})$/;
+// Manager IDs and job names can both contain hyphens. Bind the root-authored
+// identity first, rather than accepting a greedy regex capture as the owner.
+const backgroundMatches=(unit,agentId)=>typeof agentId==='string'&&backgroundAgent.test(agentId)&&unit.startsWith(`kenan-bg-${agentId}-`)&&/^[-A-Za-z0-9._]{1,60}\.service$/.test(unit.slice(`kenan-bg-${agentId}-`.length));
 const same=(a,b)=>a.dev===b.dev&&a.ino===b.ino&&a.size===b.size&&a.mtimeMs===b.mtimeMs&&a.ctimeMs===b.ctimeMs;
 
 // A populated kernel scope and systemd's root-owned transient description are
@@ -45,7 +49,7 @@ export function rootScope(pid,group,unit,{io=fs}={}){
   if(!description?.startsWith('kenan-tool-call:')||sections.get(service?'Service':'Scope')?.get('Slice')!==(service?'user-agents-kenanbg.slice':'user-agents.slice'))throw Error('scope-proof-invalid-description');
   const identity=JSON.parse(description.slice('kenan-tool-call:'.length));
   if(service){
-   if(identity.background!==true||identity.agentId!==service[1]||!Number.isSafeInteger(identity.uid)||identity.uid<=0||sections.get('Service')?.get('User')!==String(identity.uid)||!/^[a-z][a-z0-9-]{0,23}$/.test(identity.channel??''))throw Error('scope-proof-background-mismatch');
+   if(identity.background!==true||!backgroundMatches(unit,identity.agentId)||!Number.isSafeInteger(identity.uid)||identity.uid<=0||sections.get('Service')?.get('User')!==String(identity.uid)||!/^[a-z][a-z0-9-]{0,23}$/.test(identity.channel??''))throw Error('scope-proof-background-mismatch');
   }else if(typeof identity.channel!=='string'||!unit.startsWith(`agent-tool-${identity.channel}-`)||(sections.get('Unit')?.has('BindsTo')&&sections.get('Unit').get('BindsTo')!==`kenan@${identity.channel}.service`))throw Error('scope-proof-channel-mismatch');
   const kernel='/sys/fs/cgroup'+group;
   if(!/^populated 1$/m.test(read(kernel+'/cgroup.events'))||!read(kernel+'/cgroup.procs').split('\n').includes(String(pid)))throw Error('scope-proof-caller-not-populated');
