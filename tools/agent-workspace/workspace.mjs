@@ -37,7 +37,7 @@ const donorViewOperations = {git, command: (repository, args, options) => comman
 import { shareMirrorPacks, configuredLocalSources, removeStaleTemporaryPacks } from "./mirror-pack-sharing.mjs";
 import { checkoutsUnder, classifyMirrors, coldBorrowedObjectDirectories, hostMirrorBorrowers, markMirrorUse, removeMirror, removeParkedMirrors } from "./mirror-retirement.mjs";
 import { observeLockHolders, recordLockHolder } from "./lock-holders.mjs";
-import {awaitSubmittedRelease,RELEASE_AWAIT_MS} from './release-await.mjs';
+import {awaitSubmittedRelease,RELEASE_AWAIT_MS,retainedReleaseReport} from './release-await.mjs';
 import {releaseUnitCessation} from './release-unit.mjs';
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -6094,8 +6094,7 @@ function finishSubmittedRelease(database,record,submitted,{budgetMs=RELEASE_AWAI
   }catch{return {submissionState:'submitted'};}}});
   const settlement=releaseSettlement(database,record.id);
   if(outcome.kind==='completed')return {...submitted,action:'release-completed',completed:true,state:outcome.observed.submissionState,releaseSettlement:settlement};
-  if(outcome.kind==='terminal')return {...submitted,ok:false,action:'release-retained',completed:false,state:'terminal-known',terminal:outcome.observed.terminal,releaseSettlement:settlement,
-    note:`The background release ended without a verified completed removal and settlement. Read releaseSettlement and the unit log ${submitted.launch?.log??''} for the reason.`};
+  if(outcome.kind==='terminal')return retainedReleaseReport(submitted,outcome.observed.terminal,settlement);
   return {...submitted,note:`The release is still running in the background unit (accepted work, not a failure). Its completion raises host event ${submitted.launch?.event??'job:<agent>:'+submitted.unitName}; agent-workspace status --id ${record.id} --json shows the outcome.`};
 }
 

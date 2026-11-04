@@ -20,3 +20,31 @@ test('the cessation wait returns as soon as the unit ceases and otherwise ends a
  assert.equal(awaitUnitCessation({observe:()=>({ceased:++reads===2}),...fake}).ceased,true);assert.equal(reads,2);
  assert.equal(awaitUnitCessation({observe:()=>({ceased:false}),budgetMs:300,...fake}).ceased,false);
 });
+
+
+const {retainedReleaseReport} = await import('./release-await.mjs');
+test('retained continuation reports its current refusal rather than the old dirty-tree settlement', () => {
+ const old = {kind:'completed', result:{physicalDisposition:{kind:'retained',reason:'working tree has changes'}}};
+ const result = {error:{code:'retention-release-protected'},inspection:{classification:'blocked',processes:[{pid:42,matches:['cwd:/workspace']} ]}};
+ const terminal = {exitCode:2,result};
+ const report = retainedReleaseReport({releaseSettlement:old,requestId:'original'},terminal,old);
+ assert.equal(report.result,result);
+ assert.equal(report.releaseSettlement,undefined);
+ assert.equal(report.previousReleaseSettlement,old);
+ assert.match(report.hint,/from outside/);
+ assert.equal(report.completed,false);
+ assert.equal(report.requestId,'original');
+ assert.equal(result.inspection.processes[0].pid,42,'process safety evidence is unchanged');
+});
+test('older terminal receipts keep their log and settlement fallback without inventing a result', () => {
+ const old = {kind:'completed'};
+ const report = retainedReleaseReport({launch:{log:'/original/log'}},{exitCode:2},old);
+ assert.equal(report.releaseSettlement,old);
+ assert.equal(report.result,undefined);
+ assert.equal(report.hint,undefined);
+ assert.match(report.note,/original\/log/);
+});
+test('references without a cwd match never claim that changing directory resolves them', () => {
+ const report = retainedReleaseReport({}, {result:{inspection:{processes:[{matches:['argument']}]}}}, {});
+ assert.equal(report.hint,undefined);
+});

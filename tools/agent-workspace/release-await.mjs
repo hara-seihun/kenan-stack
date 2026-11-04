@@ -37,3 +37,24 @@ export function awaitUnitCessation({observe, budgetMs = RELEASE_CESSATION_AWAIT_
     sleep(Math.min(intervalMs, left));
   }
 }
+
+// A terminal continuation may refuse before creating an ordinary-release settlement.
+// Its own result, not the earlier dirty-tree receipt, is the current diagnosis.
+export function retainedReleaseReport(submitted, terminal, settlement) {
+  const result = terminal?.result;
+  const items = Array.isArray(result) ? result : [result];
+  const cwdReference = items.some(item => item?.inspection?.processes?.some(process =>
+    process.matches?.some(match => match.startsWith('cwd:'))));
+  const report = {...submitted, ok:false, action:'release-retained', completed:false,
+    state:'terminal-known', terminal};
+  if (result) {
+    delete report.releaseSettlement;
+    report.previousReleaseSettlement = settlement;
+    report.result = result;
+  } else report.releaseSettlement = settlement;
+  report.note = result
+    ? 'The background release retained the checkout. Read result for the current refusal; previousReleaseSettlement is historical.'
+    : `The background release ended without a verified removal. Read releaseSettlement and the unit log ${submitted.launch?.log ?? ''} for the reason.`;
+  if (cwdReference) report.hint = 'A process still has its working directory inside the checkout. Run cd /home/kenan, finish any shells or pipelines still using the checkout, then repeat the same release command from outside it. All safety checks will run again.';
+  return report;
+}
