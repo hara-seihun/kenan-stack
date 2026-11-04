@@ -1384,7 +1384,7 @@ function groupInspectionOptions(record, records, options) {
 }
 
 function groupReconciliation(database, records, options) {
-  if (records.some(record => generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database,record.path))) return records.map(retainedCustodyResult);
+  if (records.some(record => generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database,record.path))) return records.map(candidate => retainedCustodyResult(database, candidate));
   const now = Date.now();
   let safety = options.safety;
   const groupId = records[0]?.groupId;
@@ -4222,8 +4222,22 @@ function withGrowthBorrowerLocks(database,record,action,deadline) {
   const next = index => index === borrowers.length ? action() : withWorkspaceLock(database,borrowers[index].path,()=>next(index+1),borrowers[index].groupId,deadline);
   return next(0);
 }
-function retainedCustodyResult(record) {
-  return {record, action:"none", inspection:{classification:"blocked", reason:"explicit retained source/runtime custody; resume-growth admission required before cleanup or writing", processes:[], containers:[], systemdUnits:[]}};
+function retainedCustodyResult(database, record) {
+  const row = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+  // The retirement disposition hashes evidence, not the capacity plan. Return the
+  // actual bound command so a source owner can end retention without a guessing loop.
+  const canEndRetention = row && retainedGrowth(JSON.parse(row.plan_json)) && record.groupId === null &&
+    record.leaseExpiresAt === 0 && !generatedOnlySourceCustody(database, record.id) && !retainedParent(database, record.path);
+  const nextAction = canEndRetention ? {
+    kind:"end-retention", planSha256:digest(row.plan_json),
+    argv:["agent-workspace", "release", "--id", record.id, "--end-retention", "--owner", record.owner,
+      "--expected-plan-sha256", digest(row.plan_json), "--json"],
+    detail:"End retained custody after fresh runtime and source safety checks; this command never resumes writing or stops a consumer."
+  } : {kind:"inspect-retention", argv:["agent-workspace", "growth-status", "--id", record.id, "--path", record.path, "--json"]};
+  return {record, action:"none", inspection:{classification:"blocked",
+    reason:canEndRetention ? "retained source/runtime custody; use nextAction to end retention, or resume-growth before writing" :
+      "explicit retained source/runtime custody; inspect retention before cleanup or resume-growth before writing",
+    processes:[], containers:[], systemdUnits:[]}, nextAction};
 }
 
 // Owners whose custody the current owner holds through recorded ended-owner transfers
@@ -4500,7 +4514,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
     return;
   }
   if (records.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database,candidate.path))) {
-    const results = records.map(retainedCustodyResult);
+    const results = records.map(candidate => retainedCustodyResult(database, candidate));
     print(results.length === 1 ? results[0] : results, bool(args,"json"));
     process.exitCode = BLOCKED_RELEASE_EXIT;
     return;

@@ -104,3 +104,20 @@ test('terminal release retains a checkout referenced by a real thread database',
   assert.equal(release().action,'released');assert.equal(existsSync(source),false);
  }finally{threads.close();if(old===undefined)delete process.env.PI_THREAD_DATABASE;else process.env.PI_THREAD_DATABASE=old;}
 }));
+
+
+test('pushed source-only retired checkout prints the exact executable plan-bound release on the first refusal',()=>fixture(({source,db,run,git,record,plan})=>{
+ const sourcePlan=JSON.stringify({...JSON.parse(plan),intent:'source-only'});
+ db.prepare('UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?').run(sourcePlan,record.id);
+ writeFileSync(path.join(source,'proof'),'pushed source change');
+ git('-C',source,'commit','-am','completed source');git('-C',source,'push','origin','HEAD');
+ const result=run(['release','--id',record.id,'--json']);
+ assert.equal(result.action,'none');assert.equal(existsSync(source),true);
+ assert.equal(result.nextAction.kind,'end-retention');
+ assert.equal(result.nextAction.planSha256,digest(sourcePlan));
+ assert.notEqual(result.nextAction.planSha256,JSON.parse(sourcePlan).growthLifecycle.dispositionSha256);
+ assert.deepEqual(result.nextAction.argv,['agent-workspace','release','--id',record.id,'--end-retention','--owner','fixture','--expected-plan-sha256',digest(sourcePlan),'--json']);
+ const released=run(result.nextAction.argv.slice(1));
+ assert.equal(released.ok,true,JSON.stringify(released));assert.equal(released.action,'released');
+ assert.equal(existsSync(source),false);
+}));
