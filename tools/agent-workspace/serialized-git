@@ -9,6 +9,7 @@ import time
 
 REAL_GIT = '/usr/bin/git'
 WRITERS = {'fetch', 'pull', 'gc', 'repack', 'prune', 'maintenance'}
+INDEX_READERS = {'diff', 'status'}
 
 
 def invocation(args):
@@ -28,6 +29,18 @@ def invocation(args):
 def main():
     args = sys.argv[1:]
     prefix, command = invocation(args)
+    if command in INDEX_READERS:
+        # Read commands may otherwise rewrite cached stat information in the index.
+        # A hard foreground timeout can kill Git while that optional lock is held.
+        # Avoid creating it, rather than guessing whether a leftover lock is stale.
+        # The explicit option also overrides inherited GIT_OPTIONAL_LOCKS=1.
+        # Required locks for writes are unchanged.
+        # diff.autoRefreshIndex predates the optional-lock switch and still
+        # rewrites the index on supported Git versions unless disabled itself.
+        read_options = ['--no-optional-locks']
+        if command == 'diff':
+            read_options += ['-c', 'diff.autoRefreshIndex=false']
+        os.execv(REAL_GIT, [REAL_GIT, *prefix, *read_options, *args[len(prefix):]])
     if command not in WRITERS:
         os.execv(REAL_GIT, [REAL_GIT, *args])
     probe = subprocess.run([REAL_GIT, *prefix, 'rev-parse', '--path-format=absolute', '--git-common-dir'],

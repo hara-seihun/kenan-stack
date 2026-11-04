@@ -1,7 +1,6 @@
 """Regression tests for tools/agent-workspace/serialized-git.
 
-The wrapper must pass nonmutating Git commands straight through to /usr/bin/git and
-hold a kernel flock on <git common dir>/agent-workspace-fetch.lock around fetch,
+The wrapper must preserve read output without optional index refreshes, and hold a kernel flock on <git common dir>/agent-workspace-fetch.lock around fetch,
 pull, gc, repack, prune and maintenance. These tests use real Git, a slow logging
 upload-pack and a test-held flock; nothing is installed globally.
 
@@ -205,6 +204,54 @@ class SerializedGit(unittest.TestCase):
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+    def stale_index(self, repo):
+        path = repo / 'seed'
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+
+    def test_read_commands_never_refresh_index(self):
+        for args in (['status', '--porcelain'], ['diff', '--stat']):
+            with self.subTest(args=args):
+                self.stale_index(self.repo)
+                index = self.common / 'index'
+                before = index.read_bytes()
+                result = self.wrap('-c', 'diff.autoRefreshIndex=true', '-C', str(self.repo), *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(index.read_bytes(), before, 'read must not rewrite index stat cache')
+                self.assertFalse((self.common / 'index.lock').exists())
+                # Negative control: ordinary Git really does refresh this fixture.
+                self.git('-C', str(self.repo), *args)
+                self.assertNotEqual(index.read_bytes(), before, 'fixture must provoke optional refresh')
+
+    def test_required_index_writes_still_work(self):
+        (self.repo / 'seed').write_text('changed')
+        result = self.wrap('-C', str(self.repo), 'add', 'seed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git('-C', str(self.repo), 'show', ':seed'), 'changed')
+
+    def test_terminated_diff_has_no_optional_index_lock(self):
+        # Keep a real diff busy in an external formatter, then emulate hard timeout.
+        marker = self.root / 'diff-started'
+        formatter = self.root / 'formatter'
+        formatter.write_text('#!/bin/sh\necho started > "' + str(marker) + '"\nexec sleep 5\n')
+        formatter.chmod(0o755)
+        (self.repo / 'seed').write_text('changed')
+        env = dict(self.env, GIT_EXTERNAL_DIFF=str(formatter), GIT_OPTIONAL_LOCKS='1')
+        p = subprocess.Popen([sys.executable, str(WRAPPER), '-C', str(self.repo), 'diff'],
+                             env=env, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), 'real Git must reach the formatter')
+            self.assertFalse((self.common / 'index.lock').exists())
+        finally:
+            import signal
+            os.killpg(p.pid, signal.SIGKILL)
+            p.communicate(timeout=3)
+        self.assertFalse((self.common / 'index.lock').exists())
+        self.assertEqual(self.wrap('-C', str(self.repo), 'add', 'seed').returncode, 0)
 
     def test_exit_status_and_output_propagate(self):
         bad = self.wrap('-C', str(self.repo), 'rev-parse', '--verify', '-q', 'refs/heads/does-not-exist')
