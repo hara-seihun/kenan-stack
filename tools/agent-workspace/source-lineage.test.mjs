@@ -57,3 +57,11 @@ test('unrelated public changes are refused before changing the checkout',()=>fix
  assert.throws(()=>integrateInstalled(checkout,dest,[fix]),/only tools\/agent-workspace/);
  assert.equal(git(checkout,'rev-parse','HEAD'),fix);
 }));
+
+test('the installed symlink entry executes its CLI instead of silently doing nothing',()=>fixture(({root,checkout,custody,fix})=>{
+ const alias=path.join(root,'selected-source-lineage.mjs');
+ fs.symlinkSync(new URL('./source-lineage.mjs',import.meta.url),alias);
+ const output=execFileSync(process.execPath,[alias,'retain',checkout,custody,fix],{encoding:'utf8'});
+ assert.equal(output.trim(),custody);
+ assert.equal(git(custody,'rev-parse',`refs/agent-workspace/deployed/${fix}`),fix);
+}));

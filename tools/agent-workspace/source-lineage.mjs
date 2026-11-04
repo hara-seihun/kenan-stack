@@ -8,6 +8,7 @@ import {installedEntries} from './installed-base.mjs';
 
 const git = (repository, ...args) => execFileSync('git', ['-C', repository, ...args],
   {encoding: 'utf8', timeout: 20000, maxBuffer: 64 * 1024 * 1024}).trim();
+const shellQuote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const exactCommit = value => {
   if (!/^[a-f0-9]{40}$/.test(value)) throw new Error('An immutable full commit is required.');
   return value;
@@ -29,7 +30,7 @@ export function integrateInstalled(repository, destination, fixes) {
   const receipt = JSON.parse(fs.readFileSync(path.join(destination, 'agent-workspace/.component-release.json'), 'utf8'));
   if (receipt.sourceCommit !== baseline || !path.isAbsolute(receipt.sourceRepository ?? '')) throw new Error('Installed release has no matching durable source repository.');
   // Fetch exact retained ancestry, never an arbitrary public substitute for the private line.
-  git(repository, 'fetch', '--no-tags', receipt.sourceRepository, `refs/agent-workspace/deployed/${baseline}`);
+  git(repository, 'fetch', '--no-tags', `--upload-pack=git -c ${shellQuote('safe.directory=' + receipt.sourceRepository)} upload-pack`, receipt.sourceRepository, `refs/agent-workspace/deployed/${baseline}`);
   const expected = git(repository, 'ls-tree', '-r', baseline, '--', 'tools/agent-workspace').split('\n').filter(Boolean).map(line => {
     const [meta, name] = line.split('\t');
     const [mode, , object] = meta.split(' ');
@@ -51,7 +52,7 @@ export function integrateInstalled(repository, destination, fixes) {
   return {baseline, branch, sourceCommit: git(repository, 'rev-parse', 'HEAD'), fixes: commits,
     nextAction: 'Run the changed component tests, then bash tools/agent-workspace/deploy in this checkout.'};
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [command, repository, destination, ...args] = process.argv.slice(2);
     if (command === 'retain' && args.length === 1) console.log(retainSource(repository, destination, args[0]));
