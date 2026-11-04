@@ -1,12 +1,15 @@
 // Tools-only immutable selective publication. Executed under host deploy lock and
 // exclusive stable admission lock; no service, product or reservation mutation.
 import fs from 'node:fs';import path from 'node:path';import {execFileSync} from 'node:child_process';import {inventory} from './deploy-custody-gate.mjs';
-const [repo,baseCommit,expected,receipt,rollback,sourceRef]=process.argv.slice(2);
+import {sourceScope} from './install-source-scope.mjs';
+const [repo,baseCommit,expected,receipt,rollback,sourceRefArgument,scopeManifest]=process.argv.slice(2);
+const sourceRef=sourceRefArgument||undefined;
 const git=(...a)=>execFileSync('git',['-C',repo,...a],{encoding:'utf8'}).trim();
 if(!sourceRef&&git('status','--porcelain'))throw Error('unclean source');
 const canonicalBase=git('rev-parse','--verify',baseCommit+'^{commit}');if(canonicalBase!==baseCommit)throw Error('full canonical base SHA required');
 const head=git('rev-parse','--verify',(sourceRef??'HEAD')+'^{commit}');if(sourceRef&&head!==sourceRef)throw Error('full canonical source SHA required');const dest='/srv/pi/tools';
 if(fs.realpathSync(dest)!==expected)throw Error('base CAS mismatch');
+const scope=sourceScope(repo,baseCommit,expected,scopeManifest,sourceRef);
 const before=inventory(expected),toolBefore=inventory(path.join(expected,'agent-workspace'));
 for(const [name,entry]of Object.entries(toolBefore)){
  if(name==='.component-release.json')continue;
@@ -16,7 +19,7 @@ for(const [name,entry]of Object.entries(toolBefore)){
 }
 // Canonical rebases may change unrelated repository trees; this publisher selects only
 // this component, and independently proves every other installed byte unchanged below.
-const leaves=git('diff','--name-only',baseCommit,head,'--','tools/agent-workspace').split('\n').filter(Boolean).filter(p=>!p.endsWith('/deploy'));
+const leaves=[...scope.leaves];
 if(leaves.some(p=>!p.startsWith('tools/agent-workspace/')))throw Error('unrelated source');
 // Recover historical selective installs that lost the executable rollback mode.
 const rollbackLeaf='tools/agent-workspace/rollback-main';
@@ -48,5 +51,5 @@ try{
  execFileSync('/usr/local/bin/node',['--test',path.join(rb,'agent-workspace/capacity-recovery.test.mjs'),path.join(rb,'agent-workspace/capacity-diagnostics.test.mjs')],{timeout:15000});
  execFileSync(path.join(rb,'agent-workspace/main'),['--help'],{timeout:5000});
  fs.renameSync(stage,target);const ptr=dest+'.capacity-next';fs.symlinkSync(target,ptr);fs.renameSync(ptr,dest);
- fs.writeFileSync(receipt,JSON.stringify({source:head,baseCommit,selected:target,previous:expected,rollback:target+'.serial-rollback',otherToolsUnchanged:true,servicesChanged:false,workspaceLedgerChanged:false,leaves},null,2)+'\n');
+ fs.writeFileSync(receipt,JSON.stringify({source:head,baseCommit,selected:target,previous:expected,rollback:target+'.serial-rollback',otherToolsUnchanged:true,servicesChanged:false,workspaceLedgerChanged:false,sourceScope:scope,leaves},null,2)+'\n');
 }finally{if(fs.existsSync(stage))fs.rmSync(stage,{recursive:true,force:true});}

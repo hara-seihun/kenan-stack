@@ -19,3 +19,14 @@ test('the slot supervisor preserves argument boundaries and propagates installer
   assert.equal(result.status,17,String(result.stderr));
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+test('the slot supervisor preserves the optional source scope on installer reentry',()=>{
+ const dir=mkdtempSync(path.join(tmpdir(),'install-scope-slot-'));
+ try{
+  const script=path.join(dir,'fixture.sh');
+  writeFileSync(script,'#!/bin/bash\n[[ $5 == test-slot-held && $6 == "scope file" && $# == 6 ]] || exit 99\nexit 17\n');
+  const env={...process.env,AGENT_WORKSPACE_TEST_SLOT_DIR:dir,AGENT_WORKSPACE_TEST_SLOTS:'1'};delete env.AGENT_WORKSPACE_TEST_SLOT_HELD;
+  const r=spawnSync(process.execPath,[new URL('./install-test-slot.mjs',import.meta.url).pathname,script,'repo','base','selected','receipt','','scope file'],{env,timeout:5000});
+  assert.equal(r.status,17,String(r.stderr));
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

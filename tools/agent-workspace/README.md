@@ -1355,3 +1355,18 @@ stdout/stderr paths. Release may itself return another native durable job, which
 must still be observed. No lease or cleanup success is inferred from submission.
 `admission-status` observes only the retained admission job and its service; it
 does not enter the mutable workspace registry.
+
+Tools-only source scope is checked before any stable launcher replacement and again
+under the publication lock. By default the candidate must be one commit directly
+on the installed component source. For a rebase or a longer source chain, provide
+`install-capacity-host REPO BASE SELECTED RECEIPT test-slot-held SCOPE_JSON`
+through the normal test-slot wrapper (use an empty fifth argument instead of
+`test-slot-held` when invoking directly). The JSON contains full `base` and
+`source` SHAs and an exact `leaves` array of changed `tools/agent-workspace/`
+paths, excluding `deploy`. This is an explicit declaration of every selected
+component change, not a filter that silently ignores upstream changes. If the
+installed component source is not BASE, a deliberate correction additionally
+requires `correction: true` and a nonempty `reason`. The existing byte comparison,
+selection lock, retained source closure and tested serial rollback still apply.
+For a direct `capacity-deploy.mjs` correction, pass the manifest after the existing
+rollback and optional immutable source arguments. The receipt records the scope.
