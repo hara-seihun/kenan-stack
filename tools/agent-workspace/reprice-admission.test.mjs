@@ -77,7 +77,8 @@ test('repricing increases read CREATE sampled accounting without refreshing unre
  const state=path.join(root,'registry.sqlite3'),priorSafety=process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;
  process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY='empty';
  const git=(...a)=>execFileSync('git',a,{encoding:'utf8',timeout:5000}).trim();
- const run=args=>{let text='';const write=process.stdout.write,err=process.stderr.write,exit=process.exitCode;process.stdout.write=v=>{text+=v;return true;};process.stderr.write=()=>true;try{main(args,state);return JSON.parse(text);}finally{process.stdout.write=write;process.stderr.write=err;process.exitCode=exit;}};
+ let warnings='';
+ const run=args=>{let text='';warnings='';const write=process.stdout.write,err=process.stderr.write,exit=process.exitCode;process.stdout.write=v=>{text+=v;return true;};process.stderr.write=v=>{warnings+=v;return true;};try{main(args,state);return JSON.parse(text);}finally{process.stdout.write=write;process.stderr.write=err;process.exitCode=exit;}};
  const source=name=>{const dir=path.join(root,name);mkdirSync(dir);git('init','-q',dir);git('-C',dir,'-c','user.name=F','-c','user.email=f@example.invalid','commit','-q','--allow-empty','-m','source');const head=git('-C',dir,'rev-parse','HEAD');return {dir,head,row:run(['register','--path',dir,'--owner','fixture','--source-commit',head,'--json'])};};
  try{
   const own=source('own'),other=source('other');db=new DatabaseSync(state);const device=String(statSync(root).dev),at=Date.now();
@@ -95,6 +96,9 @@ test('repricing increases read CREATE sampled accounting without refreshing unre
   db.prepare('DELETE FROM workspace_growth_policy WHERE workspace_id=?').run(other.row.id);
   const before=db.prepare('SELECT * FROM workspace WHERE id=?').get(other.row.id),otherPlan=db.prepare('SELECT plan_json FROM workspace_capacity WHERE workspace_id=?').get(other.row.id).plan_json;
   const growthMiB=Math.floor(free*.25/M),result=run(['reprice-capacity','--id',own.row.id,'--intent','budgeted','--headroom-gib','8','--growth-mib',String(growthMiB),'--json']).capacity;
+  assert.match(warnings,/capacity warning \(not an admission refusal\)/);
+  assert.match(warnings,/conservative ledger pricing/);
+  assert.match(warnings,/use the exit status and JSON result/);
   assert.equal(result.growthBytes,growthMiB*M+64*M,'one margin-adjusted consumed growth increment, not two');
   assert.equal(db.prepare('SELECT count(*) n FROM workspace_capacity_repricing WHERE workspace_id=?').get(own.row.id).n,1);
   assert.deepEqual(db.prepare('SELECT * FROM workspace WHERE id=?').get(other.row.id),before);

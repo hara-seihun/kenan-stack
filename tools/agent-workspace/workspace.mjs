@@ -2665,7 +2665,7 @@ function assertCapacity(root, args, database, reservedPath, plan, prior) {
   const device = String(statSync(root).dev);
   const reservations = prior?.reservations ?? capacityReservations(database, device, reservedPath);
   for (const failure of reservations.measurementFailures ?? []) {
-    process.stderr.write(`capacity measurement unavailable at ${failure.path}; original budget ${(failure.reservedBytes / 1024 ** 3).toFixed(2)} GiB (current pricing is in capacity-detail): ${failure.error}\n`);
+    process.stderr.write(`capacity warning (not an admission refusal): measurement unavailable at ${failure.path}; original budget ${(failure.reservedBytes / 1024 ** 3).toFixed(2)} GiB remains subject to conservative ledger pricing: ${failure.error}. Admission is decided separately; use the exit status and JSON result, or capacity-detail on refusal.\n`);
   }
   const stats = statfsSync(root);
   const freeBytes = stats.bavail * stats.bsize;
