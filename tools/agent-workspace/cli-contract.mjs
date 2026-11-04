@@ -12,7 +12,8 @@ export function selectedArguments(command,values) {
  const selected=Object.fromEntries(contract.selector.flags.filter(key=>values[key]!==undefined).map(key=>[key,values[key]]));
  let valid;switch(contract.selector.kind){case 'exactly-one':valid=Object.keys(selected).length===1;break;case 'all':valid=Object.keys(selected).length===contract.selector.flags.length;break;case 'one-or-both':valid=Object.keys(selected).length>=1;break;default:return {ok:false,error:{code:'invalid-selector-contract',detail:command}};}
  const both=contract.selector.kind==='exactly-one'&&Object.keys(selected).length>1;
- if(!valid||Object.values(selected).some(value=>typeof value!=='string'||value.length===0))return {ok:false,error:{code:'invalid-workspace-selector',detail:both?command+' accepts exactly one selector; --id and --path were both supplied; use '+selectorSyntax(command):command+' requires '+selectorSyntax(command),nextAction:{kind:'correct-arguments',command,selector:contract.selector}}};
+ const guidance=command==='reprice-capacity'?' Ordinary repricing uses --id ID or --path PATH, never both. Both selectors are required only for an explicit active reduction with --owner, --reduction and --reduction-sha256.':'';
+ if(!valid||Object.values(selected).some(value=>typeof value!=='string'||value.length===0))return {ok:false,error:{code:'invalid-workspace-selector',detail:(both?command+' accepts exactly one selector; --id and --path were both supplied; use '+selectorSyntax(command):command+' requires '+selectorSyntax(command))+guidance,nextAction:{kind:'correct-arguments',command,selector:contract.selector}}};
  return {ok:true,value:selected};
 }
 export function futureGrowthAction(record) {

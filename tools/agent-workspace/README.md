@@ -41,6 +41,12 @@ Active reduction runs inside one explicit bounded operation: `--budget-ms 25000`
 
 Single-selector command errors name the actual command and distinguish both-supplied mutually exclusive flags from missing/invalid input. Heartbeat and release both reject ID+path; their rejection does not change a lease or release source.
 
+## Capacity repricing selectors
+
+Ordinary `reprice-capacity` requires exactly one selector: `--id ID` or `--path PATH`, never both. For example, use `agent-workspace reprice-capacity --id ID --intent budgeted --headroom-gib 8 --growth-mib 1024 --json` for an expansion.
+
+Only the explicit active-reduction form requires both `--id ID --path PATH`, together with `--owner OWNER --reduction FILE --reduction-sha256 SHA256` and the pricing options. Other commands have their own selector contracts; a bound pair accepted by `growth-status` or `resume-growth` does not imply that ordinary repricing accepts one.
+
 ## Resuming a retired writing budget
 
 `resume-growth (--id ID [--path PATH]|--path PATH)` requires explicit owner, current plan SHA, intent, remaining growth and headroom. If both selectors are supplied they must name the same original workspace. Shared CLI contracts generate its help and selector errors; errors name `resume-growth`.

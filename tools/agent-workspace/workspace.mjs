@@ -6019,7 +6019,10 @@ function help() {
   agent-workspace reap-ended-owners [--root PATH] [--execute] [--bind-budget-ms 15000] [--bind-max-records 128] [--budget-ms 90000] [--max-records 64] [--json]
   agent-workspace measure-capacity [--root PATH | --path PATH | --id ID] [--budget-ms 40000] [--incremental] [--content-proof] [--json]
   agent-workspace reprice-capacity ${selectorSyntax("reprice-capacity")} --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
-  Active reduction additionally requires --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
+  Ordinary reprice-capacity accepts exactly one selector: use --id ID or --path PATH, never both.
+  Only an explicit active reduction uses both selectors:
+  agent-workspace reprice-capacity --id ID --path PATH --owner OWNER --reduction FILE --reduction-sha256 SHA256
+                            --intent source-only|budgeted --headroom-gib N --growth-mib N [--json]
                             [--budget-ms 25000]
   agent-workspace reduce-retained-headroom --id ID --path PATH --owner OWNER --disposition FILE --disposition-sha256 SHA --json
   agent-workspace execution-reserve --root ABS_EMPTY_DIRECTORY --owner OWNER --operation-id UUID --growth-mib N --headroom-gib N --holder-pid PID --json
