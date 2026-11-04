@@ -21,14 +21,21 @@ if(leaves.some(p=>!p.startsWith('tools/agent-workspace/')))throw Error('unrelate
 // Recover historical selective installs that lost the executable rollback mode.
 const rollbackLeaf='tools/agent-workspace/rollback-main';
 if(!(fs.statSync(path.join(expected,'agent-workspace/rollback-main')).mode&0o111)&&!leaves.includes(rollbackLeaf))leaves.push(rollbackLeaf);
+const sourceRepository='/srv/pi/component-source.git';
+// Keep the entire commit closure independently of the disposable writer before selection.
+if(git('rev-parse','--is-shallow-repository')!=='false')throw Error('complete source history required');
+if(!fs.existsSync(sourceRepository))execFileSync('git',['init','--bare',sourceRepository]);
+execFileSync('git',['--git-dir='+sourceRepository,'fetch','--no-tags',repo,`${head}:refs/agent-workspace/deployed/${head}`]);
+execFileSync('git',['--git-dir='+sourceRepository,'rev-list','--objects','--missing=error',head],{stdio:'ignore'});
 const target=path.join(path.dirname(expected),head),stage=target+'.stage';
 if(fs.existsSync(target)||fs.existsSync(stage))throw Error('existing target reconcile first');
 fs.cpSync(expected,stage,{recursive:true,verbatimSymlinks:true});
 try{
  for(const p of leaves){const out=path.join(stage,p.replace(/^tools\//,''));if(git('ls-tree',head,'--',p)===''){fs.unlinkSync(out);continue;}fs.writeFileSync(out,execFileSync('git',['-C',repo,'show',`${head}:${p}`]));fs.chmodSync(out,git('ls-tree',head,'--',p).startsWith('100755 ')?0o755:0o644);}
  fs.writeFileSync(path.join(stage,'.pi-stack-commit'),head+'\n');
+ fs.writeFileSync(path.join(stage,'agent-workspace/.component-release.json'),JSON.stringify({component:'agent-workspace',baseline:baseCommit,sourceCommit:head,sourceRepository,deployedAt:Date.now(),scope:'tools-only; other tool bodies and dependency links retained'},null,2)+'\n');
  fs.writeFileSync(path.join(stage,'.agent-workspace-component.json'),JSON.stringify({source:head,recoveredInstalledBase:baseCommit,originalObjectAvailable:false,rollback,scope:'agent-workspace only',receipt},null,2)+'\n');
- const after=inventory(stage),changed=new Set([...leaves.map(p=>p.replace(/^tools\//,'')),'.pi-stack-commit','.agent-workspace-component.json']);
+ const after=inventory(stage),changed=new Set([...leaves.map(p=>p.replace(/^tools\//,'')),'.pi-stack-commit','.agent-workspace-component.json','agent-workspace/.component-release.json']);
  for(const p of new Set([...Object.keys(before),...Object.keys(after)]))if(!changed.has(p)&&JSON.stringify(before[p])!==JSON.stringify(after[p]))throw Error('unselected change '+p);
  if(fs.realpathSync(dest)!==expected||JSON.stringify(inventory(expected))!==JSON.stringify(before))throw Error('pre-CAS change');
  // Prepare a schema2-aware immutable rollback before selecting the candidate.
