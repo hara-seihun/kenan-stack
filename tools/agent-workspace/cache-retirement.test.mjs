@@ -26,14 +26,20 @@ function fixture(action){
   fs.writeFileSync(path.join(root,'source.ts'),'dirty irreplaceable');fs.mkdirSync(path.join(root,'ignored-evidence'));fs.writeFileSync(path.join(root,'ignored-evidence','receipt'),'private receipt');
   const cache=path.join(root,'node_modules');fs.mkdirSync(cache);fs.writeFileSync(path.join(cache,'dependency'),'rebuildable');
   const binding=workspaceTesting.cacheBinding(db,record.id),r={kind:'retire-workspace-cache',operationId:'fixture-cache-36a4',binding,cachePath:'node_modules',classification:'node-dependencies',ownerEvidence:'original actor ended; no more dependency use'};
-  const c={database:db,stateDirectory:base,deadline:Date.now()+10000,binding:()=>workspaceTesting.cacheBinding(db,record.id),classify:request=>workspaceTesting.classifyWorkspaceCache({...record,leaseExpiresAt:0},request),tracked:()=>false,original:()=>({record:db.prepare('SELECT * FROM workspace WHERE id=?').get(record.id),plan:db.prepare('SELECT * FROM workspace_capacity WHERE workspace_id=?').get(record.id)}),invalidate:()=>{},safety:()=>({errors:[],references:[],retainedBorrowers:[],observedAt:Date.now()})};
+  const c={database:db,stateDirectory:base,binding:()=>workspaceTesting.cacheBinding(db,record.id),classify:request=>workspaceTesting.classifyWorkspaceCache({...record,leaseExpiresAt:0},request),tracked:()=>false,original:()=>({record:db.prepare('SELECT * FROM workspace WHERE id=?').get(record.id),plan:db.prepare('SELECT * FROM workspace_capacity WHERE workspace_id=?').get(record.id)}),invalidate:()=>{},safety:()=>({errors:[],references:[],retainedBorrowers:[],observedAt:Date.now()})};
   action({base,root,cache,db,r,c,run,git,record});
  }finally{db?.close();fs.rmSync(base,{recursive:true,force:true});}
 }
 const preserved=f=>({source:fs.readFileSync(path.join(f.root,'source.ts'),'utf8'),evidence:fs.readFileSync(path.join(f.root,'ignored-evidence','receipt'),'utf8'),head:f.git('rev-parse','HEAD'),row:f.db.prepare('SELECT * FROM workspace WHERE id=?').get(f.record.id),capacity:f.db.prepare('SELECT * FROM workspace_capacity WHERE workspace_id=?').get(f.record.id)});
 
 test('dirty unpublished source, unclassified ignored evidence and exact row/plan survive cache-only retirement and replay',()=>fixture(f=>{
- const before=preserved(f);const result=retireWorkspaceCache(f.c,f.r);assert.equal(result.ok,true,JSON.stringify(result));assert.equal(fs.existsSync(f.cache),false);assert.deepEqual(preserved(f),before);assert.equal(retireWorkspaceCache(f.c,f.r).value.replayed,true);
+ const before=preserved(f);
+ // A bounded native attempt may pause under host load. Exercise its real
+ // journal continuation instead of making machine speed an acceptance guard.
+ f.c.afterEntryRemoval=(_relative,execution)=>{execution.deadline=Date.now()-1;};
+ const paused=retireWorkspaceCache(f.c,f.r);assert.equal(paused.ok,false);assert.equal(paused.error.code,'generated-io-error');assert.match(paused.error.detail,/bounded deletion paused/);
+ delete f.c.afterEntryRemoval;delete f.c.deadline;
+ const result=retireWorkspaceCache(f.c,f.r);assert.equal(result.ok,true,JSON.stringify(result));assert.equal(fs.existsSync(f.cache),false);assert.deepEqual(preserved(f),before);assert.equal(retireWorkspaceCache(f.c,f.r).value.replayed,true);
 }));
 for(const kind of ['queued-tool','native-fd','thread','borrower','unknown-queue','active-lease','stale-head','tracked-cache','unclassified'])test('retirement refuses '+kind,()=>fixture(f=>{
  if(kind==='active-lease')f.db.prepare('UPDATE workspace SET lease_expires_at=? WHERE id=?').run(Date.now()+10000,f.record.id);

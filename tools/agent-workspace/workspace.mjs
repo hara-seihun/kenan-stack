@@ -31,6 +31,7 @@ import {MaintenanceJournal, MaintenanceError, priorDisposition, digest as mainte
 import {boundedCommand} from './bounded-command.mjs';
 import {selectedArguments,selectorSyntax,futureGrowthAction} from './cli-contract.mjs';
 import {cacheStagingRoots} from './cache-retirement.mjs';
+import {hasNodeDependencyMetadata,localTrackedCacheText} from './cache-tree-metadata.mjs';
 import {referenceSummaries} from './generated-retirement.mjs';
 import { recentImportBase } from "./import-ancestors.mjs";
 import { refPinPath, pinnedSourceCommit, clearRefPin } from "./ref-pin.mjs";
@@ -1133,8 +1134,9 @@ const REPOSITORY_CACHE_MANIFEST = ".agent-workspace-caches";
  * cannot launder unique work by dropping an untracked manifest into the checkout; the
  * declaration has to be part of the repository's history. Every caller that creates a workspace
  * for that repository then classifies its output the same way, without repeating `--cache`. */
-function repositoryManifestCachePaths(workspacePath) {
-  const result = command("git", ["-C", workspacePath, "show", `HEAD:${REPOSITORY_CACHE_MANIFEST}`]);
+function repositoryManifestCachePaths(workspacePath, localOnly = false) {
+  const result = localOnly ? {status:0,stdout:localTrackedCacheText(workspacePath,REPOSITORY_CACHE_MANIFEST,command) ?? ""}
+    : command("git", ["-C", workspacePath, "show", `HEAD:${REPOSITORY_CACHE_MANIFEST}`]);
   if (result.status !== 0) return [];
   const declared = result.stdout
     .split("\n")
@@ -5334,20 +5336,14 @@ function classifyWorkspaceCache(record, request) {
   if(tracked.status!==0 || tracked.stdout) throw new CacheRetirementError("cache-source-protected","selected output contains tracked source");
   const ignored=command("git",["-C",record.path,"check-ignore","--quiet","--",relative+"/"]);
   if(ignored.status!==0) throw new CacheRetirementError("unclassified-cache","selected cache must be Git-ignored");
-  const declared=[...record.cachePaths,...repositoryManifestCachePaths(record.path)];
+  const manifestCachePaths=repositoryManifestCachePaths(record.path,true);
+  const declared=[...record.cachePaths,...manifestCachePaths];
   if(!declared.some(d=>d===relative || d.startsWith("**/") && path.basename(relative)===d.slice(3))) throw new CacheRetirementError("unclassified-cache","selected path is not an existing generated declaration");
   if(request.classification==="declared-build-cache") {
-    if(!repositoryManifestCachePaths(record.path).includes(relative)) throw new CacheRetirementError("unclassified-cache","build output requires an exact tracked repository cache declaration");
+    if(!manifestCachePaths.includes(relative)) throw new CacheRetirementError("unclassified-cache","build output requires an exact tracked repository cache declaration");
   } else {
     if(path.basename(relative)!=="node_modules") throw new CacheRetirementError("unclassified-cache","node dependency class requires exact node_modules root");
-    let directory=path.dirname(relative),qualified=false;
-    while(true){
-      const prefix=directory==="."?"":directory+"/";
-      const manifest=command("git",["-C",record.path,"cat-file","-e",`HEAD:${prefix}package.json`]);
-      if(manifest.status===0 && ["package-lock.json","bun.lock","bun.lockb","pnpm-lock.yaml","yarn.lock"].some(lock=>command("git",["-C",record.path,"cat-file","-e",`HEAD:${prefix}${lock}`]).status===0)){qualified=true;break;}
-      if(directory===".") break; directory=path.dirname(directory);
-    }
-    if(!qualified) throw new CacheRetirementError("unclassified-cache","tracked package manifest and lockfile required");
+    if(!hasNodeDependencyMetadata(record.path,relative,command)) throw new CacheRetirementError("unclassified-cache","tracked regular package manifest and lockfile required");
   }
   if(existsSync(target) && (lstatSync(target).isSymbolicLink() || !lstatSync(target).isDirectory())) throw new CacheRetirementError("unclassified-cache","cache root must be a directory, never an alias");
 }
