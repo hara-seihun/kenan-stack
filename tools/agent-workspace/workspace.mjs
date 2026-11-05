@@ -1309,7 +1309,7 @@ function inspectRecord(record, options = {}) {
 }
 
 function reconcileRecord(database, record, options) {
-  if (generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database,record.path)) return retainedCustodyResult(record);
+  if (generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database,record.path)) return retainedCustodyResult(database, record);
   let safety = options.safety;
   let inspection = inspectRecord(record, { ignoreLease: options.ignoreLease, safety, deadline: options.deadline, terminalSourceTransfer: options.terminalSourceTransfer === true, archiveWorkingTree: options.archiveWorkingTree === true });
   if (inspection.classification === "active") return { record, inspection, action: "none" };
