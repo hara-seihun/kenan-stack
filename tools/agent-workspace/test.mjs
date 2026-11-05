@@ -2289,6 +2289,35 @@ test("Docker authority honors explicit context before host and inspects authoriz
   }
 });
 
+test("Docker inspection keeps complete reference coverage in short bounded batches", () => {
+  const ids = Array.from({ length: 33 }, (_, index) => `container-${index}`);
+  const batches = [];
+  const snapshot = workspaceTesting.dockerSnapshot((_executable, args, options) => {
+    if (args[0] === "context") return { status: 0, stdout: JSON.stringify("tcp://docker-host:2375"), stderr: "" };
+    if (args[0] === "ps") return { status: 0, stdout: ids.join("\n"), stderr: "" };
+    assert.equal(args[0], "inspect");
+    assert.equal(options.timeout, 5_000);
+    const batch = args.slice(1);
+    batches.push(batch);
+    return { status: 0, stdout: JSON.stringify(batch.map(Id => ({ Id }))), stderr: "" };
+  }, { env: {} });
+  assert.deepEqual(batches.map(batch => batch.length), [16, 16, 1]);
+  assert.deepEqual(batches.flat(), ids);
+  assert.deepEqual(snapshot, { containers: ids.map(Id => ({ Id })), available: true });
+});
+
+test("a bounded Docker inspection failure never substitutes a partial snapshot", () => {
+  const snapshot = workspaceTesting.dockerSnapshot((_executable, args) => {
+    if (args[0] === "context") return { status: 0, stdout: JSON.stringify("tcp://docker-host:2375"), stderr: "" };
+    if (args[0] === "ps") return { status: 0, stdout: Array.from({ length: 17 }, (_, index) => `container-${index}`).join("\n"), stderr: "" };
+    if (args[1] === "container-0") return { status: 0, stdout: JSON.stringify(args.slice(1).map(Id => ({ Id }))), stderr: "" };
+    return { status: null, stdout: "", stderr: "error: no such object: container-16", error: { code: "ETIMEDOUT" } };
+  }, { env: {} });
+  assert.equal(snapshot.available, true);
+  assert.match(snapshot.error, /no such object: container-16/);
+  assert.deepEqual(snapshot.containers, []);
+});
+
 test("ignores containers removed during the Docker ownership snapshot", () => {
   const snapshot = workspaceTesting.dockerSnapshot((_executable, args) => {
     if (args[0] === "context") return { status: 0, stdout: JSON.stringify("tcp://docker-host:2375"), stderr: "" };

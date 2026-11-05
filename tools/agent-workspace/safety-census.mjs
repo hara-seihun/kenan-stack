@@ -161,7 +161,11 @@ export function dockerEndpointScope(endpoint, {
   return { inspect: true };
 }
 
-const DOCKER_INSPECT_BATCH = 64;
+// The recorded 63-container Docker inspect timed out as one request within the
+// release census. Keep each request short so bounded subsets can complete under
+// ordinary load, or the census can fail closed before its enclosing deadline.
+const DOCKER_INSPECT_BATCH = 16;
+const DOCKER_INSPECT_TIMEOUT_MS = 5_000;
 const VANISHED_CONTAINER = /^(?:Error(?: response from daemon)?: )?No such (?:object|container): \S+$/iu;
 export function dockerSnapshot(execute = run, { env = process.env, endpointScope = dockerEndpointScope } = {}) {
   const context = execute("docker", ["context", "inspect", ...(env.DOCKER_CONTEXT ? [env.DOCKER_CONTEXT] : []),
@@ -185,7 +189,11 @@ export function dockerSnapshot(execute = run, { env = process.env, endpointScope
   const containers = [];
   for (let offset = 0; offset < ids.length; offset += DOCKER_INSPECT_BATCH) {
     const batch = ids.slice(offset, offset + DOCKER_INSPECT_BATCH);
-    const inspected = execute("docker", ["inspect", ...batch], { timeout: 20_000 });
+    const inspected = execute("docker", ["inspect", ...batch], { timeout: DOCKER_INSPECT_TIMEOUT_MS });
+    // A timed-out or signalled process has no complete inspection result, even if
+    // its stderr happens to mention a container that vanished after `ps`.
+    if (inspected.error || inspected.signal)
+      return { containers: [], available: true, error: inspected.stderr || inspected.stdout || "docker inspect failed" };
     if (inspected.status !== 0) {
       // A container removed after `ps` is absent, not unknown; every other diagnostic refuses.
       const diagnostics = (inspected.stderr ?? "").split("\n").map(line => line.trim()).filter(Boolean);
