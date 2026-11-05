@@ -4504,9 +4504,10 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   }
   const previous = releaseSettlement(database, record.id);
   const planRow = database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);
+  if (bool(args,"preserve-runtime") && planRow && retainedGrowth(JSON.parse(planRow.plan_json))) markSourceRetained(database, record.id);
   // An ordinary release may retire growth while a temporary consumer retains the tree.
   // Retrying that same end-writing intent needs terminal safety, not new growth admission.
-  if (records.length === 1 && ["repair-required", "released"].includes(record.state) && record.leaseExpiresAt === 0 &&
+  if (!bool(args,"preserve-runtime") && records.length === 1 && ["repair-required", "released"].includes(record.state) && record.leaseExpiresAt === 0 &&
       previous.kind === "completed" && endedCustodyLineage(database, record).has(previous.owner) &&
       previous.result?.futureGrowthSettlement?.kind === "retired" &&
       previous.result.futureGrowthSettlement.requestId === previous.requestId &&
@@ -4540,7 +4541,7 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
     process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
   }
-  const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth, Infinity, false, records.length === 1);
+  const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth, Infinity, false, records.length === 1, bool(args,"preserve-runtime"));
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
   if (settled.some(item => item.inspection?.classification === "blocked")) process.exitCode = BLOCKED_RELEASE_EXIT;
 }
@@ -4550,8 +4551,12 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
 // settlement (and its owner evidence) differs; every safety observation is identical.
 // archiveWorkingTree: only an explicit release of a single checkout archives its uncommitted files;
 // the ended-owner release and groups keep a dirty checkout as before.
-function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false, archiveWorkingTree = false) {
+function ordinaryRelease(database, records, args, statePath, settle, outerDeadline = Infinity, protectSourceIntent = false, archiveWorkingTree = false, preserveHandoff = false) {
   const requestId = beginOrdinaryRelease(database, records, args);
+  // An explicit runtime handoff retains the physical tree and ignored runtime
+  // dependencies even between consumers. Persist the intent before inspection,
+  // so a later sweep or interrupted capacity settlement cannot delete the handoff.
+  if (preserveHandoff) for (const record of records) markSourceRetained(database, record.id);
   const current = records.map((candidate) => recordBy(database, { id: candidate.id }));
   const deadline=Math.min(inspectionDeadline??Date.now()+35_000, outerDeadline);
   // Snapshot failure is a completed *non-destructive* refusal, not an orphaned
@@ -6112,6 +6117,7 @@ function releaseForegroundAttempt(database,args,statePath,selected,{deadline,rel
         const releaseCallers=captureReleaseCallers(record.path);
         leaveReleaseDirectory();
         return submitRelease({database,record,request,binding:authority.binding,settlement:releaseSettlement(database,record.id),
+          continuationPlanSha256:(()=>{const row=database.prepare("SELECT plan_json FROM workspace_capacity WHERE workspace_id=?").get(record.id);return row?digest(row.plan_json):undefined;})(),
           custodyLineage:[...endedCustodyLineage(database,record)],
           observe:releaseUnitCessation,launch:name=>{
             const argv=['release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];

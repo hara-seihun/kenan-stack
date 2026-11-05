@@ -79,6 +79,7 @@ test('future-growth prerequisite supplies executable bound-selector actions and 
  assert.equal(caught?.code,'future-growth-not-retired');assert.equal(caught.nextAction.kind,'retire-future-growth-required');
  const status=caught.nextAction.steps.find(step=>step.argv?.[1]==='growth-status');assert.deepEqual(status.argv,['agent-workspace','growth-status','--id',record.id,'--path',source,'--json']);
  assert.equal(caught.nextAction.steps.find(step=>step.kind==='prepare-disposition').schema.properties.growthWriters.const,'none');
+ assert.ok(caught.nextAction.steps.find(step=>step.kind==='prepare-disposition').schema.required.includes('observedAt'));
  assert.throws(()=>run(['retire-growth','--id',record.id,'--owner','fixture','--json']),error=>error.code==='invalid-workspace-selector'&&error.nextAction.selector.kind==='all');
  assert.throws(()=>run(['release','--id',record.id,'--path',source,'--end-retention','--owner','fixture','--expected-plan-sha256',digest(priced),'--json']),error=>error.code==='invalid-workspace-selector'&&error.nextAction.selector.kind==='exactly-one');
 }));
@@ -120,4 +121,18 @@ test('pushed source-only retired checkout prints the exact executable plan-bound
  const released=run(result.nextAction.argv.slice(1));
  assert.equal(released.ok,true,JSON.stringify(released));assert.equal(released.action,'released');
  assert.equal(existsSync(source),false);
+}));
+
+test('explicit preserve-runtime keeps a runnable handoff and dependencies between consumers and repeated release',()=>fixture(({source,db,record,run,plan})=>{
+ const priced=JSON.stringify({...JSON.parse(plan),growthLifecycle:undefined});
+ db.prepare('UPDATE workspace_capacity SET plan_json=? WHERE workspace_id=?').run(priced,record.id);
+ mkdirSync(path.join(source,'node_modules'));writeFileSync(path.join(source,'node_modules','receipt'),'runtime dependency');
+ const result=run(['release','--id',record.id,'--preserve-runtime','--json']);
+ assert.equal(result.physicalDisposition.kind,'retained');
+ assert.equal(result.futureGrowthSettlement.kind,'retired',JSON.stringify(result));
+ assert.equal(readFileSync(path.join(source,'node_modules','receipt'),'utf8'),'runtime dependency');
+ assert.equal(readFileSync(path.join(source,'proof'),'utf8'),'durable');
+ assert.ok(db.prepare('SELECT 1 FROM workspace_source_retention WHERE workspace_id=?').get(record.id));
+ run(['release','--id',record.id,'--json']);
+ assert.equal(readFileSync(path.join(source,'node_modules','receipt'),'utf8'),'runtime dependency');
 }));

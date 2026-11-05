@@ -2,12 +2,20 @@ import {createHash,randomUUID} from 'node:crypto';
 import {awaitUnitCessation,RELEASE_CESSATION_AWAIT_MS} from './release-await.mjs';
 // A submission is custody of work, never proof of physical release. Its original
 // authenticated binding is immutable, including across a repeated foreground call.
-export function submitRelease({database,record,request,binding,launch,settlement,observe=()=>({ceased:false}),custodyLineage=[],cessationBudgetMs=RELEASE_CESSATION_AWAIT_MS,now,sleep}) {
+export function submitRelease({database,record,request,binding,launch,settlement,observe=()=>({ceased:false}),custodyLineage=[],cessationBudgetMs=RELEASE_CESSATION_AWAIT_MS,continuationPlanSha256,now,sleep}) {
  database.exec(`CREATE TABLE IF NOT EXISTS workspace_release_submission (
   workspace_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, request_json TEXT NOT NULL,
   binding_json TEXT NOT NULL, unit_name TEXT NOT NULL, state TEXT NOT NULL, launch_json TEXT)`);
  const columns=database.prepare('PRAGMA table_info(workspace_release_submission)').all();
  for(const column of ['terminal_json','continuations_json'])if(!columns.some(c=>c.name===column))database.exec(`ALTER TABLE workspace_release_submission ADD COLUMN ${column} TEXT`);
+ // Continuations must bind the currently observed capacity plan, not an evidence
+ // hash or the plan from an earlier physical transition.
+ const continuationFlags=new Map(request.flags);
+ if(continuationFlags.has('end-retention')) {
+  continuationFlags.set('owner',[record.owner]);
+  if(continuationPlanSha256)continuationFlags.set('expected-plan-sha256',[continuationPlanSha256]);
+ }
+ const continuationArgv=['agent-workspace','release','--id',record.id,...[...continuationFlags].sort(([a],[b])=>a.localeCompare(b)).flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'];
  const requestText=JSON.stringify(request);
  let row=database.prepare('SELECT * FROM workspace_release_submission WHERE workspace_id=?').get(record.id);
  if(row && record.state==='released' && settlement.kind==='completed')return {ok:true,action:'already-released',record,releaseSettlement:settlement};
@@ -41,7 +49,7 @@ export function submitRelease({database,record,request,binding,launch,settlement
   originalCeased());
  if(row && JSON.stringify(originalRequest)!==requestText && !preservingContinuation && !adoptedContinuation)return {ok:false,error:{code:'release-submission-conflict',detail:'Reconcile the original submission before changing its candidate, custodian or release flags.'},requestId:row.request_id,
   nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],
-   settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--','agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
+   settleInAuthenticatedBackground:['env','KENAN_BG_IDENTITY=1','kenan-bg','workspace-release-continuation','--',...continuationArgv],
    continuation:'After reconciling the original terminal effect, the authenticated current custodian may settle retained disposal in this background route. Normal custody and physical safety checks still apply; this does not replace the original submission or settlement.'}};
 
  // A successful retry must return its new settled result, not replay a launch or
@@ -89,6 +97,6 @@ export function submitRelease({database,record,request,binding,launch,settlement
  }
  return {ok:true,action:'release-submitted',completed:false,state:row.state,requestId:row.request_id,
   workspaceId:record.id,unitName:row.unit_name,originalBinding:JSON.parse(row.binding_json),launch:JSON.parse(row.launch_json??'null'),
-  ...(launchedNow?{previousReleaseSettlement:settlement}:{releaseSettlement:settlement}),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],settleInAuthenticatedBackground:['agent-workspace','release','--id',record.id,...request.flags.flatMap(([key,values])=>values.map(value=>`--${key}=${value}`)),'--json'],
+  ...(launchedNow?{previousReleaseSettlement:settlement}:{releaseSettlement:settlement}),nextAction:{observe:['agent-workspace','status','--id',record.id,'--json'],settleInAuthenticatedBackground:[...continuationArgv],
    continuation:'If the recorded unit ended without a completed settlement, reconcile its log and original journal, then use that journal\'s exact settlement command in an authenticated background call.'}};
 }

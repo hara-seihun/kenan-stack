@@ -121,3 +121,13 @@ test('a still-submitted unit is observed once and never awaited by the submissio
  submitRelease({...base,sleep:()=>assert.fail('no wait for a running unit'),observe:()=>{observations++;return {ceased:false};}});
  assert.equal(observations,1);assert.equal(count(),1);
 }));
+
+test('end-retention conflict guidance binds the current owner and capacity plan without rewriting custody',()=>fixture((base,count)=>{
+ submitRelease(base);const before=base.database.prepare('SELECT * FROM workspace_release_submission').get();
+ const plan='a'.repeat(64);
+ const result=submitRelease({...base,continuationPlanSha256:plan,request:{...base.request,flags:[['end-retention',['true']],['owner',['owner']]]}});
+ const argv=result.nextAction.settleInAuthenticatedBackground;
+ assert.equal(result.error.code,'release-submission-conflict');
+ assert.ok(argv.includes('--expected-plan-sha256='+plan));assert.ok(argv.includes('--owner=owner'));
+ assert.equal(count(),1);assert.deepEqual(base.database.prepare('SELECT * FROM workspace_release_submission').get(),before);
+}));

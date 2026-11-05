@@ -1384,3 +1384,9 @@ A released checkout can be safely removed because its commits are published remo
 When that closure is absent, use the documented unestimated remote create route with the exact commit, `--min-free-gib 30`, and without `--intent`, `--headroom-gib` or `--growth-mib`. After its actual import and admission, reprice through the ordinary command. The priced route continues to refuse missing or dependent mirrors without reservation or transport.
 
 Local partial clones can resolve a commit without holding its selected blobs. Once source preparation has established the exact selection in an independent durable mirror, pricing reads that mirror while retaining the original checkout configuration checks. It never enables lazy fetching to discover sizes or treats missing blobs as zero bytes. An incomplete mirror still refuses pricing.
+
+### Preserve a runnable handoff
+
+An explicit `release --preserve-runtime` retains the physical source tree and its ignored runtime dependencies, including dependency symlinks, even between runtime consumers. It records durable source retention before inspection. Growth retirement still requires the normal fresh writer and runtime observations; a handoff is not evidence that a running writer has ceased. Ordinary repeated release and reconciliation cannot delete this handoff. When its use is complete, use the current plan-bound `release --end-retention` command from `growth-status` or the retained result. The owner-liveness sweep still uses its independent native liveness and consumer checks; it does not invent an explicit runtime handoff for every ended worker.
+
+End-retention conflict continuations include the current capacity plan SHA-256 and owner. The future-growth disposition schema includes the required current `observedAt` timestamp in Unix milliseconds. These commands retain original submission identities and never replay the command surrounding a release.
