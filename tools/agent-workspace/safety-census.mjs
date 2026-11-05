@@ -527,14 +527,7 @@ export function ownerThreadDatabases() {
   return [...databases];
 }
 
-const THREAD_REFERENCE_QUERY = `SELECT t.id, t.cwd FROM thread t WHERE t.id IN (
-        SELECT id FROM thread WHERE state='running'
-          OR json_extract(metadata,'$.agentWait') IS NOT NULL
-          OR json_extract(metadata,'$.cancellationRequest') IS NOT NULL
-        UNION SELECT thread_id FROM thread_work WHERE status!='done'
-        UNION SELECT thread_id FROM thread_execution WHERE ended_at IS NULL
-      )`;
-const THREAD_CACHE_VERSION = 1;
+const THREAD_CACHE_VERSION = 3;
 
 // Every committed SQLite change reaches the database, its WAL or its rollback
 // journal through write(2), so identical stats of all three (outside the racy
@@ -568,34 +561,80 @@ function writeJsonCache(cacheFile, version, entries) {
   renameSync(temporary, cacheFile);
 }
 
-export function threadSnapshot(paths = ownerThreadDatabases(), { cacheFile, racyWindowNs = RACY_WINDOW_NS } = {}) {
+// Cursor checkpoints are bound to the complete SQLite file/WAL/journal identity.
+// A paused census never returns a verdict. Completed databases and partial table
+// scans survive deadlines, while a changed database invalidates all its progress.
+export function threadSnapshot(paths = ownerThreadDatabases(), { cacheFile, racyWindowNs = RACY_WINDOW_NS, batchSize = 256, onCheckpoint } = {}) {
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 4096) throw new CensusFailure("invalid thread census batch size");
   const references = [];
-  const previous = readJsonCache(cacheFile, THREAD_CACHE_VERSION);
-  const next = new Map();
+  const entries = readJsonCache(cacheFile, THREAD_CACHE_VERSION);
   for (const databasePath of paths) {
     assertSafetyBudget("thread references");
-    if (!optionalOwnerPath(databasePath)) continue;
-    const before = sqliteFileIdentity(databasePath);
-    const known = previous.get(databasePath);
-    let rows;
-    if (known !== undefined && known[0] === before.key) {
-      rows = known[1];
-      next.set(databasePath, known);
-    } else {
-      const reusableBefore = BigInt(Date.now()) * 1_000_000n - racyWindowNs;
+    if (!optionalOwnerPath(databasePath)) { entries.delete(databasePath); continue; }
+    let before = sqliteFileIdentity(databasePath);
+    const reusableBefore = BigInt(Date.now()) * 1_000_000n - racyWindowNs;
+    let reusable = before.newestChange !== null && before.newestChange < reusableBefore;
+    let progress = entries.get(databasePath);
+    if (!reusable || progress?.key !== before.key) progress = {key: before.key, phase: 0, cursor: 0, ids: [], rows: []};
+    const checkpoint = () => {
+      if (sqliteFileIdentity(databasePath).key !== before.key) {
+        entries.delete(databasePath);
+        if (cacheFile !== undefined) writeJsonCache(cacheFile, THREAD_CACHE_VERSION, entries);
+        throw new CensusFailure("thread database changed during observation; no safety verdict established");
+      }
+      if (reusable && cacheFile !== undefined) {
+        entries.set(databasePath, progress);
+        writeJsonCache(cacheFile, THREAD_CACHE_VERSION, entries);
+      }
+      onCheckpoint?.({databasePath, phase: progress.phase, cursor: progress.cursor});
+      assertSafetyBudget("thread references");
+    };
+    if (progress.phase !== 4) {
       const database = new DatabaseSync(databasePath, { readOnly: true, timeout: busyBudgetMs() });
       try {
-        rows = database.prepare(THREAD_REFERENCE_QUERY).all().map((row) => [row.id, row.cwd]);
-      } finally {
-        database.close();
-      }
-      const after = sqliteFileIdentity(databasePath);
-      if (after.key === before.key && before.newestChange !== null && before.newestChange < reusableBefore)
-        next.set(databasePath, [before.key, rows]);
+        // Pin a consistent read snapshot before recording the baseline. SQLite
+        // may recover/create an empty WAL when the first reader opens it.
+        database.exec("BEGIN");
+        database.prepare("SELECT rootpage FROM sqlite_master LIMIT 1").get();
+        const opened = sqliteFileIdentity(databasePath);
+        if (opened.key !== before.key) {
+          before = opened;
+          reusable = before.newestChange !== null && before.newestChange < reusableBefore;
+          progress = {key: before.key, phase: 0, cursor: 0, ids: [], rows: []};
+        }
+        const ids = new Set(progress.ids);
+        const queries = [
+          "SELECT rowid AS cursor, CASE WHEN state='running' OR json_extract(metadata,'$.agentWait') IS NOT NULL OR json_extract(metadata,'$.cancellationRequest') IS NOT NULL THEN id END AS id FROM thread WHERE rowid>? ORDER BY rowid LIMIT ?",
+          "SELECT DISTINCT thread_id AS cursor, thread_id AS id FROM thread_work WHERE status!='done' AND thread_id>? ORDER BY thread_id LIMIT ?",
+          "SELECT DISTINCT thread_id AS cursor, thread_id AS id FROM thread_execution WHERE ended_at IS NULL AND thread_id>? ORDER BY thread_id LIMIT ?",
+        ];
+        while (progress.phase < 3) {
+          assertSafetyBudget("thread references");
+          const batch = database.prepare(queries[progress.phase]).all(progress.cursor, batchSize);
+          for (const row of batch) if (row.id !== null) ids.add(row.id);
+          progress.ids = [...ids];
+          if (batch.length) progress.cursor = batch.at(-1).cursor;
+          else { progress.phase++; progress.cursor = progress.phase < 3 ? "" : 0; }
+          checkpoint();
+        }
+        const lookup = database.prepare("SELECT id,cwd FROM thread WHERE id=?");
+        while (progress.cursor < progress.ids.length) {
+          assertSafetyBudget("thread references");
+          const end = Math.min(progress.cursor + batchSize, progress.ids.length);
+          while (progress.cursor < end) {
+            const row = lookup.get(progress.ids[progress.cursor++]);
+            if (row) progress.rows.push([row.id, row.cwd]);
+          }
+          checkpoint();
+        }
+        progress.phase = 4;
+        progress.ids = [];
+        checkpoint();
+      } finally { database.close(); }
     }
-    for (const [id, cwd] of rows) references.push({ id, cwd, database: databasePath });
+    for (const [id, cwd] of progress.rows) references.push({id, cwd, database: databasePath});
   }
-  if (cacheFile !== undefined) writeJsonCache(cacheFile, THREAD_CACHE_VERSION, next);
+  if (cacheFile !== undefined) writeJsonCache(cacheFile, THREAD_CACHE_VERSION, entries);
   return references;
 }
 
