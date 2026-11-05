@@ -2,8 +2,11 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {existsSync} from 'node:fs';
 
-const modules = ['qualification-references', 'operator-observe', 'source-lineage', 'workspace'];
+// Tools-only integration preserves private source lineages that predate the
+// optional operator-observe feature; do not import that feature just for a fix.
+const modules = ['qualification-references', ...(existsSync(new URL('./operator-observe.mjs',import.meta.url)) ? ['operator-observe'] : []), 'source-lineage', 'workspace'];
 const run = (args, input) => spawnSync(process.execPath, args, {
   input, encoding: 'utf8', timeout: 10000,
 });
