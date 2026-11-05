@@ -39,7 +39,7 @@ function fixture(action){
     const record=run(['register','--path',source,'--root',root,'--owner','awareness-list-1bab','--source-commit',git('-C',source,'rev-parse','HEAD'),'--json'],{caller:()=>({ok:true,kind:'operator'})}).result;
     db=workspaceTesting.openRegistry(state);
     bindNativeOwner(db,record.id,{agentId:CREATOR,channel:'beta',callId:'call-creator'},'caller-scope',{command:'create'});
-    const agents=list=>fs.writeFileSync(liveness,JSON.stringify({errors:[],agents:list,wakes:[],observations:[],observedAt:Date.now()}));
+    const agents=(list,wakes=[])=>fs.writeFileSync(liveness,JSON.stringify({errors:[],agents:list,wakes,observations:[],observedAt:Date.now()}));
     const manager={id:MANAGER,channel:'beta',role:'manager',state:'running',archived:false};
     action({source,record,db,run,agents,manager});
   }finally{db?.close();['PI_WORKSPACE_TEST_EXTERNAL_SAFETY','PI_WORKSPACE_TEST_OWNER_LIVENESS'].forEach((key,i)=>{if(previous[i]===undefined)delete process.env[key];else process.env[key]=previous[i];});fs.rmSync(root,{recursive:true,force:true});}
@@ -203,3 +203,12 @@ test('the foreground submitter vacates its checkout before launching physical re
     assert.equal(workspaceTesting.processReferences(root,[{...record,executable:root+'/node'}]).length,1,'an executable in the checkout remains protected');
   } finally {process.chdir(before);fs.rmSync(root,{recursive:true,force:true});}
 });
+
+for(const named of [false,true])test(`parent custody adoption ${named?'protects a path-naming':'accepts a goal-only'} held trigger`,()=>fixture(f=>{
+ f.agents([{id:CREATOR,parentAgentId:MANAGER,channel:'beta',role:'worker',state:'idle',archived:true,goalId:'goal-1'},f.manager],
+  [{id:'trigger',agentId:MANAGER,channel:'beta',held:true,goalId:'goal-1',text:named?`continue in ${f.source}`:'continue independent ranking'}]);
+ const result=f.run(['release','--id',f.record.id,'--preserve-runtime','--json'],native(MANAGER));
+ assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,named?'awareness-list-1bab':MANAGER,JSON.stringify(result.result));
+ assert.equal(fs.existsSync(f.source),true,'Custody adoption and explicit handoff must not delete source');
+ if(named)assert.equal(result.result.custodyAdoption.code,'pending-wake-reference');
+}));

@@ -4720,7 +4720,7 @@ function endedReleaseOwner(database, record) {
 function endedOwnerSummary(record) {
   return { id: record.id, path: record.path, owner: record.owner, state: record.state, groupId: record.groupId };
 }
-function endedOwnerRefusal(database, group, verdicts, observation, deadline, requester) {
+function endedOwnerRefusal(database, group, verdicts, observation, deadline, requester, transferOnly=false) {
   if (group.some(record => !ENDED_OWNER_STATES.includes(record.state))) return { code: "state-not-eligible" };
   if (observation.errors.length) return { code: "owner-unknown" };
   const unended = verdicts.find((verdict, index) => verdict.kind !== "ended" && (existsSync(group[index].path) || verdict.kind === "live"));
@@ -4731,7 +4731,7 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline, req
   // authenticated live requester taking custody is such a successor, and a transfer deletes
   // nothing, so only a trigger that names this checkout (path or basename) still refuses it.
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]))
-    .filter(wake => !(requester && wake.match === "owner-goal-held-trigger"));
+    .filter(wake => !((requester || (transferOnly && group.every(record => parentCustody(endedReleaseOwner(database,record),observation).kind === "transfer"))) && wake.match === "owner-goal-held-trigger"));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
   if (group.some(candidate => existsSync(candidate.path) && (generatedOnlySourceCustody(database, candidate.id) || retainedParent(database, candidate.path))))
     return { code: "retained-custody" };
@@ -4751,13 +4751,13 @@ function lockedEndedOwnerVerdicts(database, group, deadline, requester) {
 }
 function releaseEndedOwnerGroup(database, group, observation, options) {
   const verdicts = group.map(record => classifyOwner(endedReleaseOwner(database, record), observation));
-  const refusal = endedOwnerRefusal(database, group, verdicts, observation, options.deadline, options.requester);
+  const refusal = endedOwnerRefusal(database, group, verdicts, observation, options.deadline, options.requester, options.transferOnly);
   if (refusal) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", ...refusal }));
   if (!options.execute) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "would-release-ended-owner" }));
   if (options.deadline - Date.now() < 10_000) return group.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: verdicts[index], action: "none", code: "deferred" }));
   const released = withWorkspaceLock(database, group[0].path, () => {
     const locked = lockedEndedOwnerVerdicts(database, group, options.deadline, options.requester);
-    const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline, options.requester);
+    const freshRefusal = locked.changed ? { code: "owner-liveness-changed" } : endedOwnerRefusal(database, locked.current, locked.verdicts, locked.fresh, options.deadline, options.requester, options.transferOnly);
     if (freshRefusal) return { refused: locked.current.map((record, index) => ({ record: endedOwnerSummary(record), ownerLiveness: locked.verdicts[index], action: "none", ...freshRefusal })) };
     const byId = new Map(locked.current.map((record, index) => [record.id, locked.verdicts[index]]));
     const requester = options.requester;
