@@ -4544,7 +4544,8 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
     if (!result.ok) process.exitCode = BLOCKED_RELEASE_EXIT;
     return;
   }
-  if (records.some(candidate => generatedOnlySourceCustody(database, candidate.id) || recordRetainsCustody(database, candidate.id) || retainedParent(database,candidate.path))) {
+  if (records.some(candidate => generatedOnlySourceCustody(database, candidate.id) || retainedParent(database,candidate.path) ||
+      (recordRetainsCustody(database, candidate.id) && !bool(args,"preserve-runtime")))) {
     const results = records.map(candidate => retainedCustodyResult(database, candidate));
     print(results.length === 1 ? results[0] : results, bool(args,"json"));
     process.exitCode = BLOCKED_RELEASE_EXIT;
@@ -4553,6 +4554,29 @@ function ownedReleaseCommand(database, args, statePath, authorityDependencies) {
   const settled = ordinaryRelease(database, records, args, statePath, settleReleasedFutureGrowth, Infinity, false, records.length === 1, bool(args,"preserve-runtime"));
   print(settled.length === 1 ? settled[0] : settled, bool(args, "json"));
   if (settled.some(item => item.inspection?.classification === "blocked")) process.exitCode = BLOCKED_RELEASE_EXIT;
+}
+
+// Explicit handoff is an intended terminal custody state, not a cleanup failure.
+// Unestimated imports have no priced future-growth contract to retire. Keep their
+// conservative capacity plan unchanged, but require the same fresh cessation proof.
+function settleRuntimeHandoff(database,item,deadline) {
+  if (item.physicalDisposition?.kind !== "retained") return item;
+  const record=recordBy(database,{id:item.record.id}), plan=recordedCapacity(database,record.id);
+  const retired=item.futureGrowthSettlement?.kind === "retired" || (plan && retainedGrowth(plan));
+  const unestimated=plan?.intent === "unestimated";
+  if (!retired && !unestimated) return item;
+  let safety;
+  try { safety=terminalSafety(database,record,deadline,true); }
+  catch(error) { return {...item,runtimeHandoff:{kind:"retained-unsettled",code:error.code??"runtime-handoff-unknown",detail:error.message}}; }
+  if (safety.errors.length || safety.references.length) return {...item,
+    runtimeHandoff:{kind:"retained-unsettled",safety}};
+  const changed=database.prepare("UPDATE workspace SET state='referenced',detail='Explicit frozen runtime handoff; writing ended; source and runtime retained',updated_at=? WHERE id=? AND owner=? AND updated_at=? AND lease_expires_at=0")
+    .run(Date.now(),record.id,record.owner,record.updatedAt).changes;
+  if (changed !== 1) growthError("stale-runtime-handoff","Workspace changed during runtime handoff settlement");
+  return {...item,record:creationRecord(database,record.id),action:"runtime-preserved",
+    inspection:{...item.inspection,classification:"retained",reason:"Explicit frozen runtime handoff settled after fresh cessation checks"},
+    runtimeHandoff:{kind:"settled",newWritesAuthorized:false,sourceDeleted:false,safety,
+      capacityDisposition:unestimated?"Unestimated reservation remains unchanged; no priced growth retirement is claimed":"Future growth retired; original plan and headroom retained"}};
 }
 
 // The ordinary release transition shared by an owner's explicit release and by the
@@ -4587,8 +4611,7 @@ function ordinaryRelease(database, records, args, statePath, settle, outerDeadli
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
   }
   result = result.map(item => settle(database, item, requestId, statePath));
-  if (preserveHandoff) result=result.map(item=>item.physicalDisposition?.kind==='retained' && item.futureGrowthSettlement?.kind==='retired'
-    ? {...item,action:'runtime-preserved',inspection:{...item.inspection,classification:'retained',reason:'Explicit runtime handoff preserved; future growth retired after fresh safety checks'}} : item);
+  if (preserveHandoff) result=result.map(item=>settleRuntimeHandoff(database,item,deadline));
   return finishOrdinaryRelease(database, requestId, result);
 }
 

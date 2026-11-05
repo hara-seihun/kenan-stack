@@ -1,3 +1,7 @@
+## Settled frozen runtime handoffs
+
+An explicit `release --preserve-runtime` keeps the checkout and generated dependencies even between consumers. After fresh cessation checks it reports `runtime-preserved`, state `referenced`, and `runtimeHandoff.kind: settled`. This is intentional retained custody, not `repair-required`. Repeating the same command repairs older unsettled handoffs without removing bytes or granting a writing lease. Priced plans retain the existing growth-retirement checks. Unestimated plans remain conservatively reserved, unchanged; settlement does not fabricate priced growth retirement or capacity credit. Live or unknown consumers still prevent settlement. Writing again requires normal growth admission.
+
 # Agent workspace manager
 
 `agent-workspace` owns temporary Git clones and worktrees used by agents. It gives every checkout a lease, records its owner and durable source commit, blocks new allocation when disk or inode reserves are low, and removes a checkout only after proving that it has no unique local work. Processes, active systemd units, Docker containers, and durable work in this Unix person's thread databases count as live owners.
