@@ -52,7 +52,8 @@ export function integrateInstalled(repository, destination, fixes) {
   return {baseline, branch, sourceCommit: git(repository, 'rev-parse', 'HEAD'), fixes: commits,
     nextAction: 'Run the changed component tests, then bash tools/agent-workspace/deploy in this checkout.'};
 }
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node uses "-" for stdin and omits argv[1] for eval; neither is a CLI file.
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const [command, repository, destination, ...args] = process.argv.slice(2);
     if (command === 'retain' && args.length === 1) console.log(retainSource(repository, destination, args[0]));

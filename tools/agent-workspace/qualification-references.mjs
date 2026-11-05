@@ -312,7 +312,8 @@ export function operatorCensus(roots, options = {}) {
   return {...census, released: census.released.filter(concerned)};
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
+// Node uses "-" for stdin and omits argv[1] for eval; neither is a CLI file.
+if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   if (process.argv[2] !== "--census" || process.argv.length !== 4) {
     process.stderr.write("usage: qualification-references.mjs --census ROOTS_JSON\n");
     process.exit(64);

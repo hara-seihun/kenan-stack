@@ -74,7 +74,8 @@ export function authorize(argv, uid, options = {}) {
   return [module, observation, ...args];
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
+// Node uses "-" for stdin and omits argv[1] for eval; neither is a CLI file.
+if (process.argv[1] && fs.existsSync(process.argv[1]) && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   try {
     if (process.getuid() !== 0) throw new Refusal('the operator observer runs as root through sudo');
     const [module, ...args] = authorize(process.argv.slice(2), callerUid());
