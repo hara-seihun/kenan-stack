@@ -195,3 +195,23 @@ test('cache stripping never detaches a committed Terraform lock even when ignore
  const removed=workspaceTesting.stripCaches({...f.record,cachePaths:[]},f.state,()=>{},()=>({errors:[],references:[]}));
  assert.equal(removed.includes('.terraform.lock.hcl'),false);assert.equal(fs.readFileSync(lock,'utf8'),'committed lock');
 }));
+
+// A managed alternate preserves borrowed objects, not commits written in the clone.
+// Remote publication permits release, but cannot fund a priced offline admission.
+for (const mirrored of [false, true]) test('release reports exact HEAD mirror closure separately from alternate custody: '+mirrored,()=>fixture(f=>{
+ const mirror=path.join(f.root,'mirrors',process.getBuiltinModule('node:crypto').createHash('sha256').update(f.remote).digest('hex').slice(0,24)+'.git');
+ f.git('clone','--bare',f.remote,mirror);
+ fs.writeFileSync(path.join(f.source,'.git/objects/info/alternates'),path.join(mirror,'objects')+'\n');
+ const head=f.commit();f.git('-C',f.source,'push','origin','HEAD:main');
+ if(mirrored)f.git('--git-dir',mirror,'fetch','--no-tags',f.source,head+':refs/heads/preserved');
+ const result=f.release();
+ assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));
+ assert.ok(result.gitMaintenance === 'removed' || ['independent-alternate-stores','independent-alternate-stores-borrowing-origin'].includes(result.gitMaintenance.objectCustody), JSON.stringify(result.gitMaintenance));
+ const evidence=result.headMirrorCustody;
+ assert.equal(evidence.commit,head);assert.equal(evidence.mirror,mirror);
+ assert.equal(evidence.kind,mirrored?'complete':'absent-or-incomplete');
+ assert.equal(evidence.sourcePricing,mirrored?'eligible':'unestimated');
+ const price=()=>workspaceTesting.sourceCapacityPlan('https://example.invalid/source.git',head,{intent:'source-only',headroomBytes:1024,growthBytes:0},4096,mirror);
+ if(mirrored)assert.equal(price().sourceCommit,head);
+ else assert.throws(price,/closure is absent/);
+}));

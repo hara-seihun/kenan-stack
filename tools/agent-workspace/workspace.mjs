@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {observeHeadMirrorCustody} from './head-mirror-custody.mjs';
 import {captureReleaseCallers} from './release-caller.mjs';
 import {fileURLToPath} from 'node:url';
 import {unlinkDeclaredCacheSymlink, cacheAliasInstalledReferences} from './cache-symlink.mjs';
@@ -1490,6 +1491,16 @@ function blockedReconciliation(database, records, error, execute) {
   });
 }
 
+function releaseHeadMirrorCustody(record, statePath) {
+  try {
+    return observeHeadMirrorCustody({workspace:record.path,
+      mirror:mirrorFor(statePath, repositoryRemotes(record.path).fetch), command});
+  } catch {
+    return {kind:'unknown', commit:null, mirror:null, sourcePricing:'unknown',
+      detail:'The canonical mirror binding could not be observed. No custody or pricing eligibility is claimed.'};
+  }
+}
+
 function reconcileRecords(database, selected, options) {
   const results = [];
   const visited = new Set();
@@ -1532,13 +1543,14 @@ function reconcileRecords(database, selected, options) {
         const current = recordsInGroup(database, recordBy(database, { id: selectedRecord.id }));
         const queuedProtection=stackQueueInspection(stackQueueSafety(current.map(record=>record.path),options.safety,options.terminalSourceTransfer===true?"physical-checkout":"source",options.deadline));
         if(queuedProtection!==null) return current.map(record=>({record,inspection:queuedProtection,action:"none"}));
+        const headCustody = new Map(current.map(record => [record.id, releaseHeadMirrorCustody(record, options.statePath)]));
         const retainsCustody = (record) => generatedOnlySourceCustody(database, record.id) || recordRetainsCustody(database, record.id) || retainedParent(database, record.path);
         const maintain = (records) => duringInspection(options.deadline, () => new Map(records.map((record) => [record.id, retainsCustody(record) ? "retained-custody" : maintainReferenceClone(record.path, options.execute, options.statePath)])));
         const reconcile = () => current.length > 1 ? groupReconciliation(database, current, options)
           : current.length === 1 ? [reconcileRecord(database, current[0], options)] : [];
         if (!options.execute) {
           const maintenance = maintain(current);
-          return reconcile().map((result) => ({ ...result, gitMaintenance: maintenance.get(result.record.id) }));
+          return reconcile().map((result) => ({ ...result, headMirrorCustody: headCustody.get(result.record.id), gitMaintenance: maintenance.get(result.record.id) }));
         }
         // Object custody (importing borrowed objects into an independent mirror) only matters
         // for a checkout that stays. Removing a checkout whose work is published loses nothing,
@@ -1558,11 +1570,12 @@ function reconcileRecords(database, selected, options) {
           const keptForOwnReason = new Set(reconciled.filter((result) => result.inspection?.classification !== "reclaimable").map((result) => result.record.id));
           const blocked = new Map(blockedReconciliation(database, kept.filter((record) => !keptForOwnReason.has(record.id)), error, true).map((result) => [result.record.id, result]));
           const skipped = { kind: "skipped", reason: String(error.message).slice(0, 500) };
-          return reconciled.map((result) => blocked.get(result.record.id) ?? { ...result, record: recordBy(database, { id: result.record.id }), gitMaintenance: removed.has(result.record.id) ? "removed" : skipped });
+          return reconciled.map((result) => blocked.get(result.record.id) ?? { ...result, record: recordBy(database, { id: result.record.id }), headMirrorCustody: headCustody.get(result.record.id), gitMaintenance: removed.has(result.record.id) ? "removed" : skipped });
         }
         return reconciled.map((result) => ({
           ...result,
           record: recordBy(database, { id: result.record.id }),
+          headMirrorCustody: headCustody.get(result.record.id),
           gitMaintenance: removed.has(result.record.id) ? "removed" : maintenance.get(result.record.id) ?? null,
         }));
       }, selectedRecord.groupId, options.deadline));
@@ -2022,7 +2035,7 @@ function sourceCapacityPlan(repository, sourceCommit, intent, blockSize, mirror,
     }
     const resolved = command("git", ["--git-dir", mirror, "rev-parse", "--verify", `${sourceCommit}^{commit}`]);
     if (resolved.status !== 0 || resolved.stdout !== sourceCommit || !hasObjectClosure(mirror, sourceCommit, sparsePatterns)) {
-      fail("source capacity estimate unknown: remote commit closure is absent from durable mirror custody; remote import remains unestimated (refetch through that route)");
+      fail("source capacity estimate unknown: remote commit closure is absent from durable mirror custody; remote import remains unestimated (a published remote or independent alternate store does not prove this exact closure; use create without --intent, --headroom-gib or --growth-mib and with --min-free-gib 30)");
     }
     repository = mirror;
   }
@@ -2895,10 +2908,10 @@ function stabilizeObjectCustody(workspace, alternates, execute, statePath, { bor
     && path.dirname(path.dirname(store)) === mirrorRoot
     && !existsSync(path.join(store, "info", "alternates"));
   if (stores.some(durableMirror) && stores.every(store => durableMirror(store) || store === origin)) {
-    if (origin === null || stores.includes(origin)) return "durable-mirror";
+    if (origin === null || stores.includes(origin)) return "independent-alternate-stores";
     if (!execute) return "would-borrow-origin";
     renameAlternate(alternates, [...stores, origin].join("\n"));
-    return "durable-mirror-borrowing-origin";
+    return "independent-alternate-stores-borrowing-origin";
   }
   if (!execute) return "would-import-durable-mirror";
   const upstream = repositoryRemotes(workspace);
