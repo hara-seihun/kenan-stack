@@ -2039,7 +2039,13 @@ function sourceCapacityPlan(repository, sourceCommit, intent, blockSize, mirror,
     }
     repository = mirror;
   }
-  const plan = sourceCheckoutCapacity(repository, sourceCommit, intent, blockSize, sparsePatterns);
+  // A local partial clone can resolve the commit while lacking its blobs. Source
+  // preparation already imported the exact selection into independent custody;
+  // price those bytes, not the incomplete original store. Still inspect the
+  // caller's checkout configuration so mirror selection cannot hide a filter.
+  const custodied = mirror && existsSync(mirror) && hasObjectClosure(mirror, sourceCommit, sparsePatterns);
+  if (custodied && repository !== mirror) assertSourceCheckoutFilters(repository);
+  const plan = sourceCheckoutCapacity(custodied ? mirror : repository, sourceCommit, intent, blockSize, sparsePatterns);
   const imported = sourceImportCapacity(repository, sourceCommit, mirror, sparsePatterns);
   const sourceImportBytes = imported.bytes;
   const constructionBytes = plan.constructionBytes + sourceImportBytes;
