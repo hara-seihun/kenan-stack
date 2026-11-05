@@ -8,7 +8,8 @@ function fixture(action){
  try{
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');fs.writeFileSync(path.join(source,'.gitignore'),'node_modules/\nprivate-evidence/\n');fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');const initial=git('-C',source,'rev-parse','HEAD');
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',initial,'--json']);fs.mkdirSync(path.join(source,'node_modules'));fs.writeFileSync(path.join(source,'node_modules','receipt'),'generated cache');db=workspaceTesting.openRegistry(state);
-  const commit=()=>{fs.writeFileSync(path.join(source,'proof'),'new unique work');git('-C',source,'commit','-am','unique');return git('-C',source,'rev-parse','HEAD');};const release=()=>run(['release','--id',record.id,'--preserve-runtime','--json']);
+  const commit=()=>{fs.writeFileSync(path.join(source,'proof'),'new unique work');git('-C',source,'commit','-am','unique');return git('-C',source,'rev-parse','HEAD');};// Disposal coverage uses plain release. Explicit preserve-runtime is a handoff, not disposal.
+  const release=()=>run(['release','--id',record.id,'--json']);
   action({root,source,remote,state,record,db,git,run,commit,release});
  }finally{db?.close();if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;fs.rmSync(root,{recursive:true,force:true});}
 }

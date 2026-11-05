@@ -4578,6 +4578,8 @@ function ordinaryRelease(database, records, args, statePath, settle, outerDeadli
     result = blockedReconciliation(database, current, error, true).map(leaseReleaseDisposition);
   }
   result = result.map(item => settle(database, item, requestId, statePath));
+  if (preserveHandoff) result=result.map(item=>item.physicalDisposition?.kind==='retained' && item.futureGrowthSettlement?.kind==='retired'
+    ? {...item,action:'runtime-preserved',inspection:{...item.inspection,classification:'retained',reason:'Explicit runtime handoff preserved; future growth retired after fresh safety checks'}} : item);
   return finishOrdinaryRelease(database, requestId, result);
 }
 

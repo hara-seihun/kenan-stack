@@ -130,6 +130,7 @@ test('explicit preserve-runtime keeps a runnable handoff and dependencies betwee
  const result=run(['release','--id',record.id,'--preserve-runtime','--json']);
  assert.equal(result.physicalDisposition.kind,'retained');
  assert.equal(result.futureGrowthSettlement.kind,'retired',JSON.stringify(result));
+ assert.equal(result.action,'runtime-preserved');
  assert.equal(readFileSync(path.join(source,'node_modules','receipt'),'utf8'),'runtime dependency');
  assert.equal(readFileSync(path.join(source,'proof'),'utf8'),'durable');
  assert.ok(db.prepare('SELECT 1 FROM workspace_source_retention WHERE workspace_id=?').get(record.id));
