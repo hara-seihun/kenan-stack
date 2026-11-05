@@ -744,8 +744,8 @@ function threadSnapshot(paths, options) { return censusBound(() => census.thread
 // statement is drained before any observation so no read transaction outlives it.
 function workspaceTopology(database) {
   const rows = [];
-  for (const row of database.prepare("SELECT id,path,checkout_type AS checkoutType FROM workspace ORDER BY path,id").iterate())
-    rows.push({ id: row.id, path: row.path, checkoutType: row.checkoutType });
+  for (const row of database.prepare("SELECT id,path,root,checkout_type AS checkoutType FROM workspace ORDER BY path,id").iterate())
+    rows.push({ id: row.id, path: row.path, root: row.root, checkoutType: row.checkoutType });
   return rows;
 }
 function gitDependencySnapshot(database) {
@@ -764,8 +764,10 @@ function safetySnapshot(database) {
   const isolated = process.env.NODE_TEST_CONTEXT !== undefined &&
     process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
   const threadsObserved = !isolated || Boolean(process.env.PI_THREAD_DATABASE);
+  const topology = workspaceTopology(database);
   const tasks = {
-    gitDependencies: { rows: workspaceTopology(database), cacheFile: observationCache(database, "cold-git-dependencies.v1.json") },
+    gitDependencies: { rows: topology, cacheFile: observationCache(database, "cold-git-dependencies.v1.json") },
+    dependencyLinks: { rows: topology },
     ...(threadsObserved ? { threads: { paths: census.ownerThreadDatabases(), cacheFile: observationCache(database, "thread-references.v1.json") } } : {}),
     ...(isolated ? {} : {
       process: {}, docker: {}, systemdUser: {}, systemdSystem: {},
@@ -780,6 +782,7 @@ function safetySnapshot(database) {
     threads: threadsObserved ? observed.threads : [],
     gitAlternates: observed.gitDependencies.alternates,
     linkedWorktrees: observed.gitDependencies.linkedWorktrees,
+    dependencyLinks: observed.dependencyLinks,
     installed: isolated ? [] : observed.installed,
     // One transition owns this snapshot. Immutable advertised commit identities
     // can be reused while local HEAD, branches and source bytes are rechecked.
@@ -1265,6 +1268,12 @@ function inspectRecord(record, options = {}) {
     const files = [...new Set(installed.map((reference) => reference.file))];
     return { classification: "referenced", reason: `${files.length} installed file(s) under /opt, /srv or /etc/systemd name this checkout: ${files.slice(0, 4).join(", ")}`,
       installed, processes: [], containers: [], systemdUnits: [] };
+  }
+  // Structural dependency custody: another checkout's symlink resolves into this one.
+  const dependencyLinks = census.dependencyLinkReferences([record.path], options.safety?.dependencyLinks ?? []);
+  if (dependencyLinks.length > 0) {
+    return { classification: "referenced", reason: `${dependencyLinks.length} dependency symlink(s) in other checkouts resolve into this checkout: ${dependencyLinks.slice(0, 4).map(link => `${link.path} -> ${link.target}`).join(", ")}; the borrower keeps these bytes until its link is removed`,
+      dependencyLinks, processes: [], containers: [], systemdUnits: [] };
   }
   const processes = processReferences(record.path, options.safety?.processes);
   const docker = dockerReferences(record.path, options.safety?.docker);
@@ -5224,7 +5233,7 @@ function growthProcessReferences(paths) {
   const snapshot = processSnapshot(true,paths);
   return paths.flatMap(root => processReferences(root,snapshot).map(reference => ({...reference,root})));
 }
-function growthSafety(database, record, {preservationOnly=false,snapshot}={}) {
+function growthSafety(database, record, {preservationOnly=false,snapshot,observeProcesses}={}) {
   const isolated = process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty";
   const dependencies = snapshot === undefined ? gitDependencySnapshot(database) :
     {alternates:snapshot.gitAlternates,linkedWorktrees:snapshot.linkedWorktrees};
@@ -5244,7 +5253,8 @@ function growthSafety(database, record, {preservationOnly=false,snapshot}={}) {
   const paths = [record.path,...borrowers.keys()];
   let processes = [];
   if (!isolated) {
-    if (process.getuid?.() === 0) processes = growthProcessReferences(paths);
+    if (observeProcesses !== undefined) processes = observeProcesses(paths);
+    else if (process.getuid?.() === 0) processes = growthProcessReferences(paths);
     else {
       let observed;
       try { observed = command("sudo", privilegedCommand(import.meta.url, ["growth-process-snapshot", ...paths.flatMap(value => ["--path",value])]), {timeout:10_000}); }
@@ -5290,14 +5300,15 @@ function materializationProcessReferences(roots) {
   const snapshot = processSnapshot(true, roots, "all");
   return roots.flatMap(root => processReferences(root, snapshot).map(reference => ({...reference, root})));
 }
-function materializationSafety(database, parent, roots, resourceKind, cacheRoots) {
+function materializationSafety(database, parent, roots, resourceKind, cacheRoots, shared = {}) {
   if(!["source","generated-cache"].includes(resourceKind)) throw new MaterializationError("materialization-safety-unknown","explicit resource kind required");
   if (!Array.isArray(roots) || (resourceKind==="source"?roots.length!==2:roots.length<1||roots.length>65) || roots.some(root => typeof root !== "string" || !path.isAbsolute(root)))
     throw new MaterializationError("materialization-safety-unknown", "exact original and staging roots required");
   if (process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY !== undefined || process.env.NODE_TEST_CONTEXT !== undefined)
     throw new MaterializationError("materialization-safety-unknown", "native materialization safety has no test override");
-  let processes;
-  if (process.getuid?.() === 0) processes = materializationProcessReferences(roots);
+  let processes = shared.processes;
+  if (processes !== undefined) {}
+  else if (process.getuid?.() === 0) processes = materializationProcessReferences(roots);
   else {
     let observed;
     try { observed = command("sudo", privilegedCommand(import.meta.url, ["materialization-process-snapshot", ...roots.flatMap(root => ["--path", root])]), {timeout: 10000}); }
@@ -5307,22 +5318,30 @@ function materializationSafety(database, parent, roots, resourceKind, cacheRoots
     if (!Array.isArray(processes) || processes.some(row => !row || !Number.isSafeInteger(row.pid) || !Array.isArray(row.matches)))
       throw new MaterializationError("materialization-safety-unknown", "invalid process observations");
   }
-  const docker = dockerSnapshot(), systemd = systemdSnapshot(), threads = threadSnapshot();
-  const dependencies = gitDependencySnapshot(database);
+  const host = shared.snapshot;
+  const docker = host?.docker ?? dockerSnapshot(), systemd = host?.systemd ?? systemdSnapshot(), threads = host?.threads ?? threadSnapshot();
+  const dependencies = host === undefined ? gitDependencySnapshot(database) : {alternates:host.gitAlternates, linkedWorktrees:host.linkedWorktrees};
   const retainedBorrowers = [...dependencies.alternates, ...dependencies.linkedWorktrees].filter(value =>
     value.recordId !== parent.id && roots.some(root =>
       typeof value.objectDirectory === "string" && within(root, value.objectDirectory) ||
       typeof value.commonDirectory === "string" && within(root, value.commonDirectory)));
   const queued=currentStackQueueReferences(roots,{resourceKind,cacheRoots,deadline:inspectionDeadline});
+  // Bytes about to move: the generated caches (or both source roots). A symlink from any
+  // other checkout into them is structural custody, observed whether or not it dangles.
+  const links = host?.dependencyLinks ?? censusBound(() => census.dependencyLinkCensus(workspaceTopology(database)));
+  const linked = census.dependencyLinkReferences(shared.dependencyRoots ?? (resourceKind === "generated-cache" ? cacheRoots : roots), links);
   return {errors: [docker.error, systemd.error,...queued.errors].filter(value => value !== undefined),
-    references: [...processes,...queued.references, ...roots.flatMap(root => [...dockerReferences(root, docker).references, ...systemdReferences(root, systemd).references]),
+    references: [...processes,...queued.references,...linked, ...roots.flatMap(root => [...dockerReferences(root, docker).references, ...systemdReferences(root, systemd).references]),
       ...threads.filter(thread => typeof thread.cwd !== "string" || roots.some(root => within(root, thread.cwd)))],
     retainedBorrowers, observedAt: Date.now()};
 }
 function cacheSymlinkSafety(database, record, roots) {
   if (process.env.NODE_TEST_CONTEXT !== undefined && process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY === "empty")
     return {errors:[], references:[], retainedBorrowers:[], observedAt:Date.now()};
-  const safety = materializationSafety(database, record, roots, "generated-cache", roots);
+  // Unlinking a declared cache alias removes only the link, never its target's bytes:
+  // other checkouts that borrow the same target keep it. A chain through the alias
+  // itself (another checkout linking to this link) is still custody.
+  const safety = materializationSafety(database, record, roots, "generated-cache", roots, {dependencyRoots:[roots[0]]});
   const installed = installedReferenceSnapshot(census.INSTALL_ROOTS);
   const qualifications = stackQualificationReferences(roots);
   return {...safety, errors:[...safety.errors, ...qualifications.errors],
@@ -5354,9 +5373,59 @@ function classifyWorkspaceCache(record, request) {
   }
   if(existsSync(target) && (lstatSync(target).isSymbolicLink() || !lstatSync(target).isDirectory())) throw new CacheRetirementError("unclassified-cache","cache root must be a directory, never an alias");
 }
+// A cache retirement needs the growth-writer check and the native materialization check
+// at one instant. Each used to repeat the whole host observation serially: two privileged
+// /proc scans, two Docker and systemd reads and two thread and Git-dependency censuses. On
+// November 5 (load average near 40) the second pass routinely exhausted the 35-second
+// budget, so disk-census retirements ended without a verdict at whichever step was then
+// running (Docker inspect, growth-process-snapshot, thread references). Both checks now
+// share one parallel host census and one privileged /proc pass; every check is unchanged.
+function cacheHostSnapshot(database) {
+  const topology = workspaceTopology(database);
+  const observed = censusBound(() => census.runCensuses({
+    gitDependencies: { rows: topology, cacheFile: observationCache(database, "cold-git-dependencies.v1.json") },
+    dependencyLinks: { rows: topology },
+    threads: { paths: census.ownerThreadDatabases(), cacheFile: observationCache(database, "thread-references.v1.json") },
+    docker: {}, systemdUser: {}, systemdSystem: {},
+  }, inspectionDeadline));
+  return {docker: observed.docker, systemd: census.unionSystemd(observed.systemdUser, observed.systemdSystem), threads: observed.threads,
+    gitAlternates: observed.gitDependencies.alternates, linkedWorktrees: observed.gitDependencies.linkedWorktrees,
+    dependencyLinks: observed.dependencyLinks};
+}
+// One /proc pass: growth reads writable descriptors under the workspace and its Git
+// borrowers; materialization reads every descriptor under the workspace and staging roots.
+function cacheProcessReferences(growthPaths, roots, snapshot = processSnapshot(true, [...new Set([...growthPaths, ...roots])], "both")) {
+  if (snapshot.some(record => !Array.isArray(record.openFiles)))
+    throw new MaterializationError("materialization-safety-unknown", "all-descriptor observation missing from the shared process snapshot");
+  const everyDescriptor = snapshot.map(record => ({...record, writableFiles: record.openFiles}));
+  return {
+    growth: growthPaths.flatMap(root => processReferences(root, snapshot).map(reference => ({...reference, root}))),
+    materialization: roots.flatMap(root => processReferences(root, everyDescriptor).map(reference => ({...reference, root}))),
+  };
+}
+function privilegedCacheProcesses(growthPaths, roots) {
+  if (process.getuid?.() === 0) return cacheProcessReferences(growthPaths, roots);
+  const observed = command("sudo", ["-n", process.execPath, new URL(import.meta.url).pathname, "cache-process-snapshot",
+    ...growthPaths.flatMap(value => ["--growth-path", value]), ...roots.flatMap(root => ["--path", root])], {timeout: 10_000});
+  if (observed.status !== 0) throw new MaterializationError("materialization-safety-unknown", `privileged all-FD observer failed: ${observed.stderr}`);
+  let value;
+  try { value = JSON.parse(observed.stdout); } catch { throw new MaterializationError("materialization-safety-unknown", "invalid process observation JSON"); }
+  const valid = rows => Array.isArray(rows) && rows.every(row => row && Number.isSafeInteger(row.pid) && Array.isArray(row.matches));
+  if (!value || !valid(value.growth) || !valid(value.materialization)) throw new MaterializationError("materialization-safety-unknown", "invalid process observations");
+  return value;
+}
 function workspaceCacheSafety(database,selected,stages,cacheRoots) {
-  const growth=growthSafety(database,recordBy(database,{id:selected.id}));
-  const native=materializationSafety(database,selected,[selected.path,...stages],"generated-cache",cacheRoots);
+  const roots=[selected.path,...stages];
+  if (process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY !== undefined || process.env.NODE_TEST_CONTEXT !== undefined)
+    throw new MaterializationError("materialization-safety-unknown", "native materialization safety has no test override");
+  const snapshot=cacheHostSnapshot(database);
+  let materializationProcesses;
+  const growth=growthSafety(database,recordBy(database,{id:selected.id}),{snapshot,observeProcesses:paths=>{
+    const observed=privilegedCacheProcesses(paths,roots);
+    materializationProcesses=observed.materialization;
+    return observed.growth;
+  }});
+  const native=materializationSafety(database,selected,roots,"generated-cache",cacheRoots,{snapshot,processes:materializationProcesses});
   return {errors:[...growth.errors,...native.errors],references:[...growth.references,...native.references],retainedBorrowers:growth.retainedBorrowers,observedAt:Date.now()};
 }
 function cacheSafetyCommand(database,args,statePath) {
@@ -6082,7 +6151,7 @@ Records outlive the directory, so status explains what became of a checkout that
 `);
 }
 
-export const workspaceTesting = { leaveReleaseDirectory, processReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
+export const workspaceTesting = { leaveReleaseDirectory, processReferences, cacheProcessReferences, finishSubmittedRelease, adoptCustodyForRelease, growthSafety, inheritShallowBoundary, completeCreation, assertRepriceSnapshot, repriceReservations, openRegistry, releaseCommand, reassignWorkspace, bindNativeOwnersCommand,releaseEndedOwnersCommand,endedCustodyLineage,reapEndedOwnersCommand, withCapacityAdmission, pruneReleased, ensureSourceCustody, fetchSource, resolveSource, sourceRefFor, prepareCreationSource, revalidatePreparedSource, repositoryRemotes, configurePushUrl, duringInspection, safetySnapshot, assertSafetyBudget, importBaseCommits, ownReleaseUnit, installedReferenceSnapshot, leaseReleaseDisposition, reconcileRecord, stackQueueInspection, classifyWorkspaceCache, cacheBinding, inspectRecord, capacityRefusalDetails, checkoutConstructionCapacity, ledgerLiability, assertCapacity, allocatedWorkspaceBytes, workspaceAllocationSample, cachedWorkspaceAllocation, remainingCapacityBytes, capacityRequirement, capacityReservations, gitDependencySnapshot, sourceCapacityPlan, cacheTargets, stripCaches, dockerEndpointScope: census.dockerEndpointScope, dockerSnapshot, groupReconciliation, maintainReferenceClone, parseSystemdUnits: census.parseSystemdUnits, pruneReleased, systemdManagerSnapshot, releaseInspectionContext, systemdReferences, ownerThreadDatabases: census.ownerThreadDatabases, threadSnapshot };
 
 // A detached physical release must not be pinned by its submitter's inherited cwd.
 // Resolve the selector and flags first, then move only this administrative process;
@@ -6220,6 +6289,14 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     const roots = many(args, "path");
     if (roots.length < 1 || roots.length > 65 || roots.some(root => !path.isAbsolute(root))) throw new MaterializationError("materialization-invalid-request", "exact original/stage paths required");
     print(materializationProcessReferences(roots), true); return;
+  }
+  if (argv[0] === "cache-process-snapshot") {
+    if (process.getuid?.() !== 0) throw new MaterializationError("materialization-safety-unknown", "all-FD observation requires root");
+    const args = parseArgs(argv.slice(1)); assertOnly(args, ["growth-path", "path"]);
+    const growthPaths = many(args, "growth-path"), roots = many(args, "path");
+    if (growthPaths.length < 1 || roots.length < 1 || roots.length > 65 || [...growthPaths, ...roots].some(root => !path.isAbsolute(root)))
+      throw new MaterializationError("materialization-invalid-request", "exact growth and original/stage paths required");
+    print(cacheProcessReferences(growthPaths, roots), true); return;
   }
   if (argv[0] === "growth-process-snapshot") {
     if (process.getuid?.() !== 0) growthError("growth-writer-unknown", "privileged process observation requires root");
@@ -6386,7 +6463,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
   }
   const database = openRegistry(statePath,releaseEntryDeadline);
   try {
-    if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "dependency-links", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -6409,6 +6486,15 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     else if (commandName === "register") registerCommand(database, args);
     else if (commandName === "end-writing") endWritingCommand(database,args);
     else if (commandName === "terminal-safety") { assertOnly(args,["id","path","owner","json"]);const r=growthSelected(database,args,"terminal-safety"),deadline=Date.now()+25000;if(r.owner!==required(args,"owner"))growthError("stale-growth-disposition","owner changed");duringInspection(deadline,()=>withWorkspaceLock(database,r.path,()=>withGrowthBorrowerLocks(database,r,()=>print({ok:true,effect:"none",safety:terminalSafety(database,r,deadline)},true),deadline),r.groupId,deadline)); }
+    else if (commandName === "dependency-links") {
+      // Read-only: the structural dependency census release and cache retirement use,
+      // with the symlinks from other checkouts that keep PATH's bytes.
+      assertOnly(args,["path","json"]);
+      const target=path.resolve(required(args,"path")),deadline=Date.now()+30_000,started=Date.now();
+      const links=duringInspection(deadline,()=>censusBound(()=>census.dependencyLinkCensus(workspaceTopology(database))));
+      print({ok:true,effect:"none",path:target,observedLinks:links.length,elapsedMs:Date.now()-started,
+        references:census.dependencyLinkReferences([target],links)},true);
+    }
     else if (commandName === "custody-status") {
       assertOnly(args,["id","path","json"]);
       const r=growthSelected(database,args),deadline=Date.now()+1000;
@@ -6523,7 +6609,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code === "workspace-owner-mismatch" || error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code === "workspace-owner-mismatch" || error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "cache-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),

@@ -47,7 +47,6 @@ function remoteFixture(change=()=>{}) {
   if(args[2]==='ls-remote')return {status:0,stdout:tips.map((sha,i)=>`${sha}\trefs/heads/branch-${i}`).join('\n')};
   assert.equal(args[2],'cat-file');
   const batch=options.input.trim().split('\n');calls.push(batch);
-  // Reproduce the original quantum failure without a wall-clock-dependent sleep.
   if(batch.length>REMOTE_OBJECT_BATCH_SIZE)return {status:1,error:{code:'ETIMEDOUT'},stdout:''};
   assert.equal(options.env.GIT_NO_LAZY_FETCH,'1');assert.equal(options.env.GIT_NO_REPLACE_OBJECTS,'1');
   const result={status:0,stdout:batch.map((sha,i)=>`${sha} ${Number.parseInt(sha,16)%3===0?'missing':'commit'}`).join('\n')};
@@ -55,9 +54,11 @@ function remoteFixture(change=()=>{}) {
  };
  return {tips,calls,command};
 }
-test('large advertised remote inventory is checked in bounded quanta without skipping heads',()=>{
+// November 5: 256-object batches spawned 53 git processes (each opening every mirror pack
+// index) for one Converge checkout and exhausted the release inspection deadline.
+test('large advertised remote inventory is checked by one git process without skipping heads',()=>{
  const f=remoteFixture(),result=observedRemoteHeads(f.command,'/source');
- assert.equal(result.ok,true);assert.equal(f.calls.length,Math.ceil(f.tips.length/REMOTE_OBJECT_BATCH_SIZE));
+ assert.equal(result.ok,true);assert.equal(f.calls.length,1);
  assert.deepEqual(f.calls.flat(),f.tips);
  assert.deepEqual(result.durable,f.tips.filter(sha=>Number.parseInt(sha,16)%3!==0));
  assert.equal(result.observations[0].heads,f.tips.length);
@@ -69,5 +70,5 @@ for(const failure of ['timeout','incomplete','wrong-id','wrong-type'])test('a la
   if(failure==='wrong-id')result.stdout=result.stdout.replace(batch[0],'f'.repeat(40));
   if(failure==='wrong-type')result.stdout=result.stdout.replace(/ (commit|missing)/,' blob');
  });
- const result=observedRemoteHeads(f.command,'/source');assert.equal(result.ok,false);assert.equal(result.code,'remote-custody-unknown');assert.equal(result.durable,undefined);assert.equal(f.calls.length,3);
+ const result=observedRemoteHeads(f.command,'/source',{batchSize:256});assert.equal(result.ok,false);assert.equal(result.code,'remote-custody-unknown');assert.equal(result.durable,undefined);assert.equal(f.calls.length,3);
 });

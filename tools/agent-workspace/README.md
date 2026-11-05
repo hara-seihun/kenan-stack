@@ -1333,9 +1333,42 @@ Run the affected tests, then `bash tools/agent-workspace/deploy`. Deployment sti
 ancestry and unrelated tool changes and refuses a stale baseline if another writer deployed
 first. Keep the installed source repository intact when retiring source workspaces.
 
+### Dependency symlinks from other checkouts
+
+A symlink from another checkout is custody even when nothing is running. On November 5,
+derek-build-progress/node_modules was a manual symlink to gabriel-retest-ui-c3b2/node_modules.
+The donor's ordinary release saw no process, container, unit or thread, retired node_modules
+and removed the checkout, and the borrower's frozen screenshot run failed. Every safety
+snapshot now includes a structural dependency-link census (`dependencyLinkCensus` in
+`safety-census.mjs`). It covers every top-level symlink of every registered workspace and of
+every other member of a registered root (shared scratch roots such as /var/tmp contribute
+only their registered members), plus the `node_modules` symlinks of package directories
+declared by `package.json` "workspaces" or `pnpm-workspace.yaml` (wildcards at most two
+levels deep). Each chain is followed hop by hop, including dangling and indirect chains and
+symlinked parent directories. An unreadable member this account owns, or a looping chain,
+fails the census, and no verdict is given. Release classifies a checkout that such a link
+reaches as `referenced` and keeps it, while still ending its writing lease. Cache retirement
+and source materialization refuse to move linked bytes. Unlinking a checkout's own cache
+alias stays allowed unless another checkout chains through that alias. Read-only
+observation: `agent-workspace dependency-links --path PATH --json`. Regression:
+`node --test tools/agent-workspace/dependency-link-custody.test.mjs`.
+
+### One host observation per cache retirement
+
+Cache retirement and `cache-safety` share one parallel host census (Git dependencies,
+dependency links, threads, Docker, systemd) and one privileged `/proc` pass
+(`cache-process-snapshot`) between the growth-writer check (writable descriptors under the
+checkout and its Git borrowers) and the native materialization check (every descriptor under
+the checkout and staging roots). Before November 5 they repeated the whole observation in
+series, and under a load average near 40 the second pass exhausted the 35-second budget.
+Release remote custody reads all advertised heads of a remote with one `git cat-file`
+process: 256-object batches had spawned 53 processes, each opening every pack index of a
+340-pack mirror, for one Converge checkout. Regressions: `cache-safety-observation.test.mjs`
+and `release-reachability.test.mjs`.
+
 ### Releasing from a shell inside the checkout
 
-The ordinary release command can run while its parent shell has the checkout as its current directory. After authenticating the release, the submission captures those ancestor processes with their UID and kernel start time in the durable worker command. If only those processes retain the checkout by their current directory, the worker rechecks the complete release for up to two minutes, allowing the submitting command and shell to exit. It never ignores a reference or deletes under a live shell. Other processes, writable files, executables, containers, services, dirty source and unpublished commits retain their existing protections. A shell that stays inside the checkout past that bound leaves an honest retained result; leave the directory and repeat the same release request. In shell batches, prefer `checkout=$PWD; cd /home/kenan; agent-workspace release --path "$checkout" --json` so the caller does not retain its own checkout.
+The ordinary release command can run while its parent shell has the checkout as its current directory. After authenticating the release, the submission captures those ancestor processes with their UID and kernel start time in the durable worker command. Members of the caller shell's pipeline in the same process group (for example `| tee FILE`) are captured the same way. If only those processes retain the checkout by their current directory, the worker rechecks the complete release for up to two minutes, allowing the submitting command and shell to exit. It never ignores a reference or deletes under a live shell. Other processes, writable files, executables, containers, services, dirty source and unpublished commits retain their existing protections. A shell that stays inside the checkout past that bound leaves an honest retained result; leave the directory and repeat the same release request. In shell batches, prefer `checkout=$PWD; cd /home/kenan; agent-workspace release --path "$checkout" --json` so the caller does not retain its own checkout.
 
 
 ### Custody commands during tool publication

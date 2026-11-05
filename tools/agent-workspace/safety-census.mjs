@@ -4,7 +4,7 @@
 import { spawnSync } from "node:child_process";
 import {
   accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync,
-  readlinkSync, renameSync, statSync, writeFileSync,
+  readlinkSync, renameSync, statSync, writeFileSync, realpathSync as realpathSyncNative, lstatSync as lstatSyncNative,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import path from "node:path";
@@ -88,8 +88,11 @@ export function within(root, candidate) {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+// fdAccess "write" records writable descriptors under the roots in writableFiles, "all"
+// records every descriptor there, and "both" records writable ones in writableFiles and
+// every one in openFiles, so one /proc pass serves the growth-writer and all-FD checks.
 export function processSnapshot(strict = false, workspacePath = null, fdAccess = "write") {
-  if (!["write", "all"].includes(fdAccess)) growthError("growth-writer-unknown", "unknown FD observation mode");
+  if (!["write", "all", "both"].includes(fdAccess)) growthError("growth-writer-unknown", "unknown FD observation mode");
   if (!existsSync("/proc")) { if (strict) growthError("growth-writer-unknown", "/proc unavailable"); return []; }
   const ignored = processAncestry();
   const uid = process.getuid?.();
@@ -110,7 +113,7 @@ export function processSnapshot(strict = false, workspacePath = null, fdAccess =
       if (owner !== uid && !strict) continue;
       const commandLine = readFileSync(`${root}/cmdline`, "utf8").split("\0").filter(Boolean);
       if (strict && readLink(`${root}/cwd`) === null && commandLine.length > 0) growthError("growth-writer-unknown", `unknown cwd for process ${pid}`);
-      const writableFiles = [];
+      const writableFiles = [], openFiles = [];
       const cwd = readLink(`${root}/cwd`), executable = readLink(`${root}/exe`);
       if (strict && commandLine.length > 0) {
         for (const fd of readdirSync(`${root}/fd`)) {
@@ -120,11 +123,13 @@ export function processSnapshot(strict = false, workspacePath = null, fdAccess =
           if (workspacePath && path.isAbsolute(target) && (Array.isArray(workspacePath) ? workspacePath : [workspacePath]).some(root => within(root, target))) {
             const flags = readFileSync(`${root}/fdinfo/${fd}`, "utf8").match(/^flags:\s+([0-7]+)$/mu)?.[1];
             if (flags === undefined) growthError("growth-writer-unknown", `unknown fd flags ${pid}/${fd}`);
-            if (fdAccess === "all" || (parseInt(flags,8) & 3) !== 0) writableFiles.push(target);
+            const writable = (parseInt(flags,8) & 3) !== 0;
+            if (fdAccess === "all" || writable) writableFiles.push(target);
+            if (fdAccess === "both") openFiles.push(target);
           }
         }
       }
-      processes.push({ writableFiles, pid, ppid: Number(status.match(/^PPid:\s+(\d+)/mu)?.[1] ?? 0), command: commandLine[0] ?? "unknown", commandLine, cwd, executable });
+      processes.push({ writableFiles, ...(fdAccess === "both" ? { openFiles } : {}), pid, ppid: Number(status.match(/^PPid:\s+(\d+)/mu)?.[1] ?? 0), command: commandLine[0] ?? "unknown", commandLine, cwd, executable });
     } catch (error) {
       if (strict && (!["ENOENT", "ESRCH"].includes(error.code) || existsSync(root))) growthError("growth-writer-unknown", `cannot inspect process ${pid}: ${error.message}`);
       continue;
@@ -449,6 +454,137 @@ function linkedCommonDirectory(workspacePath) {
   return { kind: "resolved", directory: path.resolve(adminDirectory, common) };
 }
 
+// Structural dependency custody (November 5, converge-kenan): an agent wired
+// derek-build-progress/node_modules as a symlink to the dependencies of another
+// workspace, gabriel-retest-ui-c3b2. That owner's ordinary release found no process,
+// container, unit or thread in its checkout, retired its node_modules and removed it,
+// and the consumer's frozen screenshot run failed at once. A symlink is custody before
+// any process starts. This census lists every dependency symlink that another checkout
+// can hold: each top-level symlink of every registered workspace and of every other
+// member of a registered root (any name), and the node_modules symlinks of the package
+// directories its package.json "workspaces" or pnpm-workspace.yaml declare. Each chain
+// is followed hop by hop, including dangling and indirect ones, and through symlinked
+// parent directories. An unreadable member or an unbounded chain fails the census.
+const LINK_HOPS = 40;
+function resolvedPrefix(candidate) {
+  // Resolve the longest existing prefix so a dangling target under a symlinked
+  // parent directory is attributed to the directory it really names.
+  let existing = candidate, rest = [];
+  for (;;) {
+    try { return path.join(realpathSyncNative(existing), ...rest); }
+    catch (error) {
+      if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw new CensusFailure(`cannot resolve ${candidate}: ${error.code}`);
+      const parent = path.dirname(existing);
+      if (parent === existing) return candidate;
+      rest.unshift(path.basename(existing)); existing = parent;
+    }
+  }
+}
+export function dependencyLinkChain(link) {
+  const hops = [];
+  let current = link;
+  for (let index = 0; index < LINK_HOPS; index++) {
+    let target;
+    try { target = readlinkSync(current); }
+    catch (error) {
+      if (error.code === "EINVAL" || error.code === "ENOENT" || error.code === "ENOTDIR") break; // not a link, or dangling end
+      throw new CensusFailure(`cannot read dependency link ${current}: ${error.code}`);
+    }
+    current = path.resolve(path.dirname(current), target);
+    hops.push(current, resolvedPrefix(current));
+    if (index === LINK_HOPS - 1) throw new CensusFailure(`dependency link chain exceeds ${LINK_HOPS} hops: ${link}`);
+  }
+  return [...new Set(hops)];
+}
+function packageDirectories(member) {
+  const patterns = [];
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(member, "package.json"), "utf8"));
+    const declared = Array.isArray(manifest?.workspaces) ? manifest.workspaces : manifest?.workspaces?.packages;
+    if (Array.isArray(declared)) patterns.push(...declared.filter(value => typeof value === "string"));
+  } catch (error) { if (!["ENOENT", "ENOTDIR"].includes(error.code) && !(error instanceof SyntaxError)) throw error; }
+  try {
+    const yaml = readFileSync(path.join(member, "pnpm-workspace.yaml"), "utf8");
+    let inPackages = false;
+    for (const line of yaml.split("\n")) {
+      if (/^packages:\s*$/u.test(line)) { inPackages = true; continue; }
+      if (inPackages && /^\S/u.test(line)) inPackages = false;
+      const entry = inPackages && line.match(/^\s*-\s*['"]?([^'"#]+?)['"]?\s*(?:#.*)?$/u);
+      if (entry && !entry[1].startsWith("!")) patterns.push(entry[1]);
+    }
+  } catch (error) { if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw error; }
+  const directories = new Set();
+  const children = directory => {
+    try { return readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== "node_modules" && !entry.name.startsWith(".")).map(entry => path.join(directory, entry.name)); }
+    catch (error) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return []; throw new CensusFailure(`cannot read package directory ${directory}: ${error.code}`); }
+  };
+  for (const pattern of patterns) {
+    const normalized = path.posix.normalize(pattern).replace(/\/+$/u, "");
+    if (normalized.startsWith("..") || path.isAbsolute(normalized)) continue;
+    const segments = normalized.split("/");
+    const literal = [];
+    while (segments.length && !/[*?[{]/u.test(segments[0])) literal.push(segments.shift());
+    const base = path.join(member, ...literal);
+    if (!within(member, base)) continue;
+    if (!segments.length) { directories.add(base); continue; }
+    // A wildcard segment: package directories at most two levels below its literal prefix.
+    // Deeper globs would walk whole source trees (link-ui declares src/** yet has one root
+    // package.json), costing seconds per checkout under load for no package directory.
+    let level = [base];
+    for (let depth = 0; depth < Math.min(2, segments[0] === "**" ? 2 : segments.length); depth++) {
+      level = level.flatMap(children);
+      for (const directory of level) directories.add(directory);
+    }
+  }
+  directories.delete(member);
+  return [...directories];
+}
+// Shared system scratch directories hold thousands of unrelated entries (6,822 under
+// /var/tmp on November 5); their registered members are still observed one by one.
+const SHARED_SCRATCH_ROOTS = new Set(["/", "/tmp", "/var/tmp", "/dev/shm", homedir()]);
+export function dependencyLinkCensus(rows) {
+  const members = new Set(rows.map(row => row.path));
+  for (const root of new Set(rows.map(row => row.root).filter(value => typeof value === "string" && !SHARED_SCRATCH_ROOTS.has(path.resolve(value))))) {
+    assertSafetyBudget("dependency links");
+    try { for (const entry of readdirSync(root)) members.add(path.join(root, entry)); }
+    catch (error) { if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw new CensusFailure(`cannot list workspace root ${root}: ${error.code}`); }
+  }
+  const links = [];
+  const record = (member, link) => links.push({ workspacePath: member, path: link, hops: dependencyLinkChain(link) });
+  for (const member of members) {
+    assertSafetyBudget("dependency links");
+    let entries;
+    try { entries = readdirSync(member, { withFileTypes: true }); }
+    catch (error) {
+      if (["ENOENT", "ENOTDIR"].includes(error.code)) continue;
+      // Another account's private directory beside a root (systemd PrivateTmp under
+      // /var/tmp, for example) is no member of this account's workspaces. An
+      // unreadable directory this account owns is an incomplete observation.
+      if (["EACCES", "EPERM"].includes(error.code)) {
+        let owner;
+        try { owner = lstatSyncNative(member).uid; } catch { owner = undefined; }
+        if (owner !== undefined && owner !== process.getuid?.()) continue;
+      }
+      throw new CensusFailure(`cannot list workspace member ${member}: ${error.code}`);
+    }
+    for (const entry of entries) if (entry.isSymbolicLink()) record(member, path.join(member, entry.name));
+    if (!entries.some(entry => entry.isFile() && (entry.name === "package.json" || entry.name === "pnpm-workspace.yaml"))) continue;
+    for (const directory of packageDirectories(member)) {
+      const link = path.join(directory, "node_modules");
+      try { if (lstatSyncNative(link).isSymbolicLink()) record(member, link); }
+      catch (error) { if (!["ENOENT", "ENOTDIR"].includes(error.code)) throw new CensusFailure(`cannot inspect ${link}: ${error.code}`); }
+    }
+  }
+  return links;
+}
+// References to the roots about to lose bytes: a link outside every root whose chain
+// passes through one of them. Links inside a root disappear with it.
+export function dependencyLinkReferences(roots, links) {
+  return links.filter(link => !roots.some(root => within(root, link.path)) &&
+    link.hops.some(hop => roots.some(root => within(root, hop))))
+    .map(link => ({ kind: "dependency-link", path: link.path, workspacePath: link.workspacePath, target: link.hops.at(-1), hops: link.hops }));
+}
+
 // A checkout moved to the Storage Box can't change, so its dependencies are read through the
 // SMB mount once and reused while its symlink stays the same (cacheFile beside the registry).
 export function gitDependencyCensus(rows, execute = run, { cacheFile } = {}) {
@@ -653,6 +789,7 @@ const CENSUSES = {
   systemdSystem: () => systemdManagerSnapshot("system"),
   threads: ({ paths, cacheFile }) => threadSnapshot(paths, { cacheFile }),
   gitDependencies: ({ rows, cacheFile }) => gitDependencyCensus(rows, run, { cacheFile }),
+  dependencyLinks: ({ rows }) => dependencyLinkCensus(rows),
   installed: ({ roots, cacheFile }) => installedReferenceSnapshot(roots, { cacheFile }),
 };
 

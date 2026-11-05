@@ -20,10 +20,16 @@ export function hasUncoveredCommits(git, candidates, exclusions) {
 // and is left out; local object existence alone is never counted as durable.
 // `command(file, args, options)` returns {status, stdout, error}.
 export const MAX_RELEASE_REMOTES = 16;
-// Each read shares the existing inspection deadline and two-second journal quantum.
-// A large remote must not turn one object lookup into an unbounded unit of work.
-export const REMOTE_OBJECT_BATCH_SIZE = 256;
-export function observedRemoteHeads(command, repository, {timeout = 4000} = {}) {
+// One object lookup per remote. Each git process opens every pack index of the borrowed
+// mirror before its first lookup (340 packs on converge-kenan), so per-process startup,
+// not per-object work, dominates: on November 5 the former 256-object batches spawned 53
+// processes for 13,000+ Converge heads and consumed about 7.3 of a release inspection's
+// seconds, and the release lost its safety verdict to the deadline. The same 14,884
+// lookups take about half a second in one process. GIT_NO_LAZY_FETCH keeps a missing tip
+// local (the earlier unbounded single read could fetch it). Every read still shares the
+// inspection deadline and fails closed on timeout; the cap only bounds the input size.
+export const REMOTE_OBJECT_BATCH_SIZE = 32768;
+export function observedRemoteHeads(command, repository, {timeout = 4000, batchSize = REMOTE_OBJECT_BATCH_SIZE} = {}) {
   const listed = command('git', ['-C', repository, 'remote'], {timeout});
   if (listed.status !== 0 || listed.error) return {ok: false, code: 'remote-custody-unknown', detail: 'remote inventory failed'};
   const remotes = listed.stdout.split('\n').map(line => line.trim()).filter(Boolean);
@@ -40,8 +46,8 @@ export function observedRemoteHeads(command, repository, {timeout = 4000} = {}) 
       tips.push(sha);
     }
     const unique = [...new Set(tips)];
-    for (let start = 0; start < unique.length; start += REMOTE_OBJECT_BATCH_SIZE) {
-      const batch = unique.slice(start, start + REMOTE_OBJECT_BATCH_SIZE);
+    for (let start = 0; start < unique.length; start += batchSize) {
+      const batch = unique.slice(start, start + batchSize);
       const checked = command('git', ['-C', repository, 'cat-file', '--batch-check=%(objectname) %(objecttype)'], {input: batch.join('\n') + '\n', timeout, env: {GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1'}});
       if (checked.status !== 0 || checked.error) return {ok: false, code: 'remote-custody-unknown', detail: 'remote object inventory failed'};
       const rows = checked.stdout.split('\n').filter(Boolean);

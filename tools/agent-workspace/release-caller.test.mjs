@@ -41,3 +41,26 @@ test('a caller that stays alive remains protected after bounded observation; PID
  const done=await runReleaseWorker(()=>{calls++;return result(receipt);},{releaseCallers:[caller],now:()=>clock,sleep:async ms=>{clock+=ms;},budgetMs:5000});
  assert.equal(calls,3);assert.equal(done.exitCode,2);assert.deepEqual(done.receipt,receipt);
 });
+// November 5 (disk-census-b511): `agent-workspace release --path CHECKOUT | tee FILE` from a
+// shell inside the checkout retained it for the tee, a pipeline sibling, not an ancestor.
+test('a pipeline sibling of the release in the caller shell is captured; unrelated same-user processes are not',async()=>{
+ const root=mkdtempSync(path.join(tmpdir(),'release-caller-pipe-'));
+ const module=new URL('./release-caller.mjs',import.meta.url).href;
+ const code=`import {captureReleaseCallers} from ${JSON.stringify(module)};import {readFileSync} from 'node:fs';
+  const callers=captureReleaseCallers(process.cwd());
+  const comm=pid=>{try{return readFileSync('/proc/'+pid+'/comm','utf8').trim();}catch{return null;}};
+  console.log(JSON.stringify({callers,commands:callers.map(c=>comm(c.pid)),shell:process.ppid}));`;
+ const unrelated=spawn('/bin/sleep',['30'],{cwd:root,stdio:'ignore'});
+ const shell=spawn('/bin/bash',['-c','"$1" --input-type=module -e "$2" | tee /dev/null; read -r line','caller',process.execPath,code],{cwd:root,stdio:['pipe','pipe','pipe']});
+ try {
+  let text='';for await(const chunk of shell.stdout){text+=chunk;if(text.includes('\n'))break;}
+  const observed=JSON.parse(text);
+  assert.ok(observed.callers.some(c=>c.pid===shell.pid),text);
+  assert.ok(observed.commands.includes('tee'),text);
+  assert.ok(!observed.callers.some(c=>c.pid===unrelated.pid),'a same-user process outside the caller pipeline is never a caller');
+  // The sibling is only a bounded wait hint: while it lives the retained receipt stays retained after the budget.
+  const tee=observed.callers[observed.commands.indexOf('tee')];
+  assert.equal(transientReleaseCaller(retained(tee.pid),observed.callers),true);
+  assert.equal(transientReleaseCaller({...retained(tee.pid),inspection:{...retained(tee.pid).inspection,processes:[{pid:tee.pid,matches:['write-fd:/x']}]}},observed.callers),false);
+ }finally{shell.stdin.end('exit\n');shell.kill();unrelated.kill();rmSync(root,{recursive:true,force:true});}
+});

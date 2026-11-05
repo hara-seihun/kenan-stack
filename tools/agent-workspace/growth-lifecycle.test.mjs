@@ -140,11 +140,12 @@ for (const lease of ['valid','expired']) test(`retained growth CLI ${lease} leas
 
 test('dependency topology streams identities without reading unrelated registry payloads',()=>{
  const db=new DatabaseSync(':memory:');
- db.exec('CREATE TABLE workspace(id TEXT,path TEXT,checkout_type TEXT,cache_paths TEXT,creation_request TEXT)');
- db.prepare('INSERT INTO workspace VALUES(?,?,?,?,?)').run('missing','/nonexistent-topology-test-record','clone','malformed cache JSON','malformed request JSON');
+ db.exec('CREATE TABLE workspace(id TEXT,path TEXT,root TEXT,checkout_type TEXT,cache_paths TEXT,creation_request TEXT)');
+ db.prepare('INSERT INTO workspace VALUES(?,?,?,?,?,?)').run('missing','/nonexistent-topology-test-record','/nonexistent-topology-root','clone','malformed cache JSON','malformed request JSON');
  let iterated=false;
  const bounded={prepare(sql){
-   assert.match(sql,/^SELECT id,path,checkout_type AS checkoutType FROM workspace /);
+   // The root column lets the dependency-link census observe unregistered root members.
+   assert.match(sql,/^SELECT id,path,root,checkout_type AS checkoutType FROM workspace /);
    assert.doesNotMatch(sql,/cache_paths|creation_request|SELECT \*/);
    const statement=db.prepare(sql);
    return {iterate(){iterated=true;return statement.iterate();},all(){assert.fail('topology must stream rows');}};

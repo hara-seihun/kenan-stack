@@ -1,21 +1,43 @@
-import {readFileSync,readlinkSync} from 'node:fs';
+import {readFileSync,readlinkSync,readdirSync} from 'node:fs';
 import {processAncestry,within} from './safety-census.mjs';
 
+function statFields(pid) {
+ const stat=readFileSync(`/proc/${pid}/stat`,'utf8');
+ return stat.slice(stat.lastIndexOf(')')+2).split(' ');
+}
 function identity(pid) {
  const status=readFileSync(`/proc/${pid}/status`,'utf8');
- const stat=readFileSync(`/proc/${pid}/stat`,'utf8');
- return {pid,uid:Number(status.match(/^Uid:\s+(\d+)/m)[1]),start:stat.slice(stat.lastIndexOf(')')+2).split(' ')[19]};
+ return {pid,uid:Number(status.match(/^Uid:\s+(\d+)/m)[1]),start:statFields(pid)[19]};
 }
 // Captured only after normal native release authorization. This is a wait hint,
 // not authority or an exemption from any physical safety observation.
+// The caller's shell is an ancestor; the other members of its pipeline are not. In
+// `cd CHECKOUT; agent-workspace release --path CHECKOUT | tee FILE` the tee is the shell's
+// child in this process's own process group, and on November 5 it alone retained a
+// released checkout (disk-census-b511) because it was still exiting with the shell. Such
+// siblings get the same identity-bound bounded recheck: the worker still re-inspects
+// everything and keeps the checkout while any of them is alive.
 export function captureReleaseCallers(target) {
- const callers=[];
- for(const pid of processAncestry()) {
-  if(pid===process.pid)continue;
+ const callers=[],ancestors=new Set(processAncestry());
+ const capture=pid=>{
   try {
    const entry=identity(pid);
    if(entry.uid===process.getuid()&&within(target,readlinkSync(`/proc/${pid}/cwd`)))callers.push(entry);
   }catch{} // Missing custody never permits the special retry.
+ };
+ for(const pid of ancestors) if(pid!==process.pid) capture(pid);
+ let group;
+ try {group=statFields(process.pid)[2];} catch {return callers;}
+ const shells=new Set(callers.map(caller=>String(caller.pid)));
+ let entries=[];
+ try {entries=readdirSync('/proc').filter(entry=>/^\d+$/u.test(entry));} catch {}
+ for(const entry of entries) {
+  const pid=Number(entry);
+  if(ancestors.has(pid)||pid===process.pid)continue;
+  try {
+   const fields=statFields(pid);
+   if(shells.has(fields[1])&&fields[2]===group)capture(pid);
+  }catch{}
  }
  return callers;
 }
