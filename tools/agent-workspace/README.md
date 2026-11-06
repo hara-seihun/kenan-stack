@@ -1427,3 +1427,17 @@ Local partial clones can resolve a commit without holding its selected blobs. On
 An explicit `release --preserve-runtime` retains the physical source tree and its ignored runtime dependencies, including dependency symlinks, even between runtime consumers. It records durable source retention before inspection. Growth retirement still requires the normal fresh writer and runtime observations; a handoff is not evidence that a running writer has ceased. Ordinary repeated release and reconciliation cannot delete this handoff. When its use is complete, use the current plan-bound `release --end-retention` command from `growth-status` or the retained result. The owner-liveness sweep still uses its independent native liveness and consumer checks; it does not invent an explicit runtime handoff for every ended worker.
 
 End-retention conflict continuations include the current capacity plan SHA-256 and owner. The future-growth disposition schema includes the required current `observedAt` timestamp in Unix milliseconds. These commands retain original submission identities and never replay the command surrounding a release.
+
+## Retaining force-pushed review commits in a bundle
+
+A pull-request ref fetched for review may disappear when its author force-pushes. Its historical existence alone does not prove that its old objects remain recoverable. Preserve the reviewed tip in an external Git bundle, then register that archive before releasing the checkout:
+
+```sh
+git bundle create /independent/review.bundle HEAD ^DURABLE_BASE
+agent-workspace retain-bundle --id ID --path CHECKOUT --owner OWNER --bundle /independent/review.bundle --json
+agent-workspace release --path CHECKOUT
+```
+
+The owner-bound command validates the pack and records its hash and tips under the common Git directory. Incremental bundles are accepted only when every prerequisite is independently reachable from durable source ancestry or remote heads. Archives larger than 64 MiB are refused. Release rereads the external archive, verifies its exact hash and prerequisites, and covers only its actual tips and ancestors. Missing or changed archives, unpublished prerequisites, later commits and unrelated private branches remain protected. The archive stays outside the removed checkout. A bundle is retained source, not evidence of publication or customer delivery.
+
+The regression checks are in `release-custody.test.mjs`.

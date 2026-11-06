@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {recordBundleRetention,retainedBundleTips} from './bundle-retention.mjs';
 import {observeHeadMirrorCustody} from './head-mirror-custody.mjs';
 import {captureReleaseCallers} from './release-caller.mjs';
 import {fileURLToPath} from 'node:url';
@@ -1001,6 +1002,15 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody, archiveCha
   const durable = inventory.filter(([ref]) => ref.startsWith("refs/remotes/")).map(([,sha]) => sha);
   if (record.durableSourceCommit !== null) durable.push(record.durableSourceCommit);
   const uncovered = () => hasUncoveredCommits((args, options) => git(record.path, args, options), candidates, durable);
+  const commonDir = path.resolve(record.path, git(record.path, ['rev-parse', '--git-common-dir']));
+  const addBundleTips = () => {
+    const directory = path.join(commonDir, 'agent-workspace-bundle-retention');
+    const receipts = existsSync(directory) ? readdirSync(directory).filter(name => name.endsWith('.json')).flatMap(name => {
+      try { return [JSON.parse(readFileSync(path.join(directory, name), 'utf8'))]; } catch { return []; }
+    }) : [];
+    durable.push(...retainedBundleTips({git:(a,o)=>git(record.path,a,o), workspace:record.path, commonDir, durable, receipts}));
+  };
+  addBundleTips();
   const initiallyUncovered = uncovered();
   // Recorded disposal of candidate-local merges: never covers ordinary commits, edits or
   // conflict resolutions; re-verified against current durable remote tips on every call.
@@ -1015,6 +1025,7 @@ function gitDisposition(record, nestedWorkspaces = [], remoteCustody, archiveCha
     if (observed.ok) remoteCustody?.set(record.path, observed);
     if (!observed.ok && observed.code !== "remote-custody-absent") return {safe:false, sourceRetention:true, reason:`remote custody observation unavailable: ${observed.detail}; checkout and generated caches retained`, head};
     if (observed.ok) durable.push(...observed.durable);
+    addBundleTips();
     const publishedTrees = () => {
       try { return publishedTreesCover((args, options) => git(record.path, args, options), candidates, durable); }
       catch { return false; }
@@ -5550,6 +5561,24 @@ function retireSourceMaterializationCommand(database, args, statePath) {
 // Explicit, owner-bound, recorded disposal of candidate-local merge commits whose
 // parents are durable on remotes. Verification refuses unique source; see
 // local-merge-disposal.mjs. Records a receipt only; nothing is deleted here.
+function retainBundleCommand(database, args) {
+  assertOnly(args, ['id','path','owner','bundle','json']);
+  const selected = growthSelected(database,args,'retain-bundle');
+  withWorkspaceLock(database,selected.path,()=>{
+    const record=recordBy(database,{id:selected.id});
+    if(record.owner!==required(args,'owner')) growthError('bundle-retention-owner','current owning identity required');
+    const gitRun=(a,o)=>git(record.path,a,o);
+    const inventory=gitRun(['for-each-ref','--format=%(objectname)','refs/remotes']).split('\n').filter(Boolean);
+    if(record.durableSourceCommit!==null)inventory.push(record.durableSourceCommit);
+    const observed=observedRemoteHeads(command,record.path);
+    if(observed.ok)inventory.push(...observed.durable);
+    const result=recordBundleRetention({git:gitRun,run:(a,o)=>run('git',a,o),workspace:record.path,
+      commonDir:path.resolve(record.path,gitRun(['rev-parse','--git-common-dir'])),owner:record.owner,workspaceId:record.id,
+      bundle:required(args,'bundle'),durable:inventory});
+    print({ok:true,...result},bool(args,'json'));
+  },selected.groupId);
+}
+
 function disposeLocalMergesCommand(database, args) {
   assertOnly(args, ["id", "path", "owner", "json"]);
   const selected = growthSelected(database, args, "dispose-local-merges");
@@ -6123,6 +6152,7 @@ function help() {
   agent-workspace finalize-creation (--id ID|--path PATH)
   agent-workspace heartbeat ${selectorSyntax("heartbeat")} [--lease-seconds N]
   agent-workspace release ${selectorSyntax("release")} [--reap-expired] [--preserve-runtime]
+  agent-workspace retain-bundle --id ID --path PATH --owner OWNER --bundle EXTERNAL_FILE [--json]
   agent-workspace dispose-local-merges ${selectorSyntax("dispose-local-merges")} --owner OWNER [--json]
   agent-workspace release ${selectorSyntax("release")} --end-retention --owner OWNER --expected-plan-sha256 SHA [--json]
   agent-workspace reconcile [--root PATH] [--execute] [--reap-expired] [--preserve-runtime]
@@ -6486,7 +6516,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
   }
   const database = openRegistry(statePath,releaseEntryDeadline);
   try {
-    if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "dependency-links", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "resume-growth"].includes(commandName)
+    if (!["heartbeat", "retire-idle-growth", "capacity-status", "source-handoff", "thaw-source", "freeze-source", "writer-run", "execution-reserve", "execution-release", "execution-status", "register", "terminal-safety", "custody-status", "dependency-links", "end-writing", "status", "list", "maintain", "cancel-creation", "finalize-creation", "reassign", "adopt-ended-actions", "release", "retire-source-materialization", "cache-plan", "retire-cache", "retire-cache-status", "cache-safety", "growth-status", "retire-growth", "dispose-local-merges", "retain-bundle", "reduce-retained-headroom", "resume-growth"].includes(commandName)
       && (commandName !== "reconcile" || bool(args, "execute"))) {
       const scopedRoot = commandName === "reconcile" ? one(args, "root") : undefined;
       const scopedIds = scopedRoot === undefined ? undefined
@@ -6597,6 +6627,7 @@ export function main(argv = process.argv.slice(2), statePath = DEFAULT_STATE, {r
     else if (commandName === "retire-cache-status") { assertOnly(args,["id","stage","json"]); const result=cacheRetirementStatus(database,{workspaceId:one(args,"id"),stage:one(args,"stage")}); print(result,true); if(!result.ok) process.exitCode=2; }
     else if (commandName === "retire-source-materialization") retireSourceMaterializationCommand(database, args, statePath);
     else if (commandName === "retire-growth") retireGrowthCommand(database, args, statePath);
+    else if (commandName === "retain-bundle") retainBundleCommand(database, args);
     else if (commandName === "dispose-local-merges") disposeLocalMergesCommand(database, args);
     else if (commandName === "reduce-retained-headroom") reduceRetainedHeadroomCommand(database,args,statePath);
     else if (commandName === "resume-growth") repriceCapacityCommand(database, args, statePath, true);
@@ -6632,7 +6663,7 @@ if (process.argv[1] !== undefined && existsSync(process.argv[1])
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code, field: error.field, requested: error.requested, recorded: error.recorded,
         } })}\n`);
-      } else if (error.code === "workspace-owner-mismatch" || error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "cache-process-snapshot", "retire-growth", "dispose-local-merges", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
+      } else if (error.code === "workspace-owner-mismatch" || error.code === "inspection-timeout" || error.code?.startsWith("FROZEN_CUSTODY") || ["terminal-safety", "measure-capacity", "source-handoff", "writer-run", "freeze-source", "thaw-source", "execution-reserve", "execution-release", "execution-status", "reassign", "cache-safety", "retire-source-materialization", "materialization-process-snapshot", "cache-process-snapshot", "retire-growth", "dispose-local-merges", "retain-bundle", "reduce-retained-headroom", "growth-status", "resume-growth", "reprice-capacity", "heartbeat"].includes(process.argv[2]) || error instanceof GrowthLifecycleError || error instanceof MaterializationError || error instanceof CacheRetirementError) {
         process.stdout.write(`${JSON.stringify({ ok: false, error: {
           code: error.code ?? (error instanceof ResourceBusyError ? "resource-busy" : error instanceof CliError ? "invalid-request" : "lifecycle-failed"),
           detail: error instanceof Error ? error.message : String(error),

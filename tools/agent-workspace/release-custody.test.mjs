@@ -216,3 +216,51 @@ for (const mirrored of [false, true]) test('release reports exact HEAD mirror cl
  if(mirrored)assert.equal(price().sourceCommit,head);
  else assert.throws(price,/closure is absent/);
 }));
+
+function retainedReview(f) {
+ const base=f.git('-C',f.source,'rev-parse','HEAD'),head=f.commit();
+ f.git('-C',f.source,'push',f.remote,'HEAD:refs/pull/42/head');
+ f.git('-C',f.source,'update-ref','-d','refs/remotes/origin/main');
+ // Force-pushed review tip vanishes from remote; only its external incremental archive remains.
+ f.git('--git-dir',f.remote,'update-ref','refs/pull/42/head',base);
+ const bundle=path.join(f.root,'review.bundle');
+ f.git('-C',f.source,'bundle','create',bundle,'HEAD','^'+base);
+ const register=()=>f.run(['retain-bundle','--id',f.record.id,'--path',f.source,'--owner','fixture','--bundle',bundle,'--json']);
+ return {base,head,bundle,register};
+}
+test('a vanished force-pushed review tip can release through a verified incremental bundle',()=>fixture(f=>{
+ const a=retainedReview(f);assert.equal(f.release().physicalDisposition.kind,'retained');
+ assert.equal(a.register().ok,true);
+ const result=f.release();assert.equal(result.physicalDisposition.kind,'removed',JSON.stringify(result));
+ assert.ok(fs.existsSync(a.bundle));
+}));
+for(const failure of ['changed','missing','later-commit','private-branch'])test('bundle retention protects '+failure,()=>fixture(f=>{
+ const a=retainedReview(f);assert.equal(a.register().ok,true);
+ if(failure==='changed')fs.appendFileSync(a.bundle,'corruption');
+ if(failure==='missing')fs.unlinkSync(a.bundle);
+ if(failure==='later-commit'||failure==='private-branch'){
+  fs.writeFileSync(path.join(f.source,'another'),'not archived');f.git('-C',f.source,'add','another');f.git('-C',f.source,'commit','-m','not archived');
+  if(failure==='private-branch'){f.git('-C',f.source,'branch','private-work');f.git('-C',f.source,'reset','--hard',a.head);}
+ }
+ assert.equal(f.release().physicalDisposition.kind,'retained');
+}));
+test('corrupt bundles and non-durable prerequisites are refused',()=>fixture(f=>{
+ const a=retainedReview(f);const original=fs.readFileSync(a.bundle);original[original.length-25]^=1;fs.writeFileSync(a.bundle,original);
+ assert.throws(()=>a.register(),/index-pack|bundle|pack|inflate/);
+}));
+test('a bundle inside its checkout cannot establish independent retention',()=>fixture(f=>{
+ const a=retainedReview(f),inside=path.join(f.source,'private-evidence','review.bundle');fs.mkdirSync(path.dirname(inside),{recursive:true});fs.copyFileSync(a.bundle,inside);
+ assert.throws(()=>f.run(['retain-bundle','--id',f.record.id,'--path',f.source,'--owner','fixture','--bundle',inside,'--json']),/outside/);
+}));
+test('incremental archives with an unpublished prerequisite cover nothing',()=>fixture(f=>{
+ f.commit();const base=f.git('-C',f.source,'rev-parse','HEAD');fs.writeFileSync(path.join(f.source,'proof'),'next');f.git('-C',f.source,'commit','-am','next');
+ const bundle=path.join(f.root,'unsafe.bundle');f.git('-C',f.source,'bundle','create',bundle,'HEAD','^'+base);
+ assert.throws(()=>f.run(['retain-bundle','--id',f.record.id,'--path',f.source,'--owner','fixture','--bundle',bundle,'--json']),/prerequisites/);
+}));
+test('a forged bundle header cannot claim a local tip absent from its pack',()=>fixture(f=>{
+ const a=retainedReview(f);fs.writeFileSync(path.join(f.source,'other'),'not in bundle');f.git('-C',f.source,'add','other');f.git('-C',f.source,'commit','-m','not bundled');
+ const other=f.git('-C',f.source,'rev-parse','HEAD');const bytes=fs.readFileSync(a.bundle);
+ const header=bytes.indexOf('\n\n');const text=bytes.subarray(0,header).toString().replace(a.head+' HEAD',other+' HEAD');
+ fs.writeFileSync(a.bundle,Buffer.concat([Buffer.from(text),bytes.subarray(header)]));
+ assert.throws(()=>a.register(),/omits objects/);
+}));
