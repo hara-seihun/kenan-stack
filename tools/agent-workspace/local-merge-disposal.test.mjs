@@ -27,7 +27,8 @@ function fixture(action){
   const record=run(['register','--path',source,'--root',root,'--owner','fixture','--source-commit',initial,'--json']);db=new DatabaseSync(state);
   const mergeLeaves=()=>{inSource('merge','--no-ff','-m','merge a','pr-a');inSource('merge','--no-ff','-m','merge b','pr-b');return inSource('rev-parse','HEAD');};
   const dispose=(expectFail)=>run(['dispose-local-merges','--id',record.id,'--path',source,'--owner','fixture','--json'],expectFail);
-  const release=()=>run(['release','--id',record.id,'--preserve-runtime','--json']);
+  // This fixture tests physical source release, not an explicit retained runtime handoff.
+  const release=()=>run(['release','--id',record.id,'--json']);
   action({root,source,remote,record,git,inSource,run,mergeLeaves,dispose,release,initial});
  }finally{db?.close();if(previous===undefined)delete process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY;else process.env.PI_WORKSPACE_TEST_EXTERNAL_SAFETY=previous;fs.rmSync(root,{recursive:true,force:true});}
 }
