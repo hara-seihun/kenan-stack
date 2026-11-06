@@ -26,8 +26,10 @@ function fixture(action,{wakes=[]}={}){
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');
   fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');
   const initial=git('-C',source,'rev-parse','HEAD');
-  const record=run(['register','--path',source,'--root',root,'--owner',CHILD,'--source-commit',initial,'--json']);
+  const record=run(['register','--path',source,'--root',root,'--owner','adopter-release-fixture','--source-commit',initial,'--json']);
   db=workspaceTesting.openRegistry(state);
+  // Install the synthetic owner only after ordinary label admission has succeeded.
+  db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(CHILD,record.id);record.owner=CHILD;
   const st=fs.statSync(source),now=Date.now();
   db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify({intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096}));
   db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));
@@ -37,7 +39,7 @@ function fixture(action,{wakes=[]}={}){
   const args=(entries=[])=>({positional:[],named:new Map(entries.map(([k,v])=>[k,[String(v)]]))});
   // The child commits unique work and releases while it is unpublished: growth retires, the tree is retained.
   fs.writeFileSync(path.join(source,'proof'),'unique work');git('-C',source,'commit','-am','unique');
-  const first=run(['release','--id',record.id,'--preserve-runtime','--json']);
+  const first=run(['release','--id',record.id,'--json']);
   assert.equal(first.futureGrowthSettlement?.kind,'retired',JSON.stringify(first));assert.equal(fs.existsSync(source),true);
   git('-C',source,'push','origin','HEAD:refs/heads/agent/fixture');
   // The child ends; the live parent takes custody, then a live repair worker adopts it.

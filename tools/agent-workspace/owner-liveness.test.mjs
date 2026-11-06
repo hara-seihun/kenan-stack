@@ -92,8 +92,11 @@ function fixture(owner,action){
   git('init','--bare',remote);git('clone',remote,source);git('-C',source,'checkout','-b','main');git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.invalid');
   fs.writeFileSync(path.join(source,'.gitignore'),'node_modules/\n');fs.writeFileSync(path.join(source,'proof'),'initial');git('-C',source,'add','.');git('-C',source,'commit','-m','initial');git('-C',source,'push','origin','main');
   const initial=git('-C',source,'rev-parse','HEAD');
-  let out='';const write=process.stdout.write;process.stdout.write=x=>{out+=x;return true;};try{main(['register','--path',source,'--root',root,'--owner',owner,'--source-commit',initial,'--lease-seconds','86400','--json'],state);}finally{process.stdout.write=write;}
-  const record=JSON.parse(out);db=workspaceTesting.openRegistry(state);unbindNativeOwner(db,record.id);
+  let out='';const write=process.stdout.write;process.stdout.write=x=>{out+=x;return true;};try{main(['register','--path',source,'--root',root,'--owner','owner-liveness-fixture','--source-commit',initial,'--lease-seconds','86400','--json'],state);}finally{process.stdout.write=write;}
+  const record=JSON.parse(out);db=workspaceTesting.openRegistry(state);
+  // Admission uses a label; synthetic native identity belongs only to this fixture.
+  db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(owner,record.id);record.owner=owner;
+  unbindNativeOwner(db,record.id);
   const priced=()=>{const st=fs.statSync(source),now=Date.now(),plan={intent:'budgeted',estimate:'whole-tree-upper-bound',constructionBytes:4096,growthBytes:4*1024**3,headroomBytes:8*1024**3,completedAllocationBytes:4096};
    db.prepare('INSERT OR REPLACE INTO workspace_capacity(workspace_id,device_id,plan_json) VALUES(?,?,?)').run(record.id,String(st.dev),JSON.stringify(plan));
    db.prepare('INSERT OR REPLACE INTO workspace_capacity_measurement VALUES(?,?)').run(record.id,JSON.stringify({ok:true,bytes:4096,allocatedBytes:4096,device:String(st.dev),inode:String(st.ino),startedAt:now,completedAt:now}));return plan;};
@@ -197,7 +200,9 @@ test('a measurement that cannot complete keeps the full future-growth allowance'
 
 test('an explicit --after walk visits every candidate once and ends',()=>fixture(STOPPED,f=>{
  const second=path.join(f.root,'second-ws');f.git('clone','--branch','main',path.join(f.root,'remote.git'),second);
- f.run(['register','--path',second,'--root',f.root,'--owner',STOPPED,'--source-commit',f.git('-C',second,'rev-parse','HEAD'),'--json']);
+ const secondRecord=f.run(['register','--path',second,'--root',f.root,'--owner','second-owner-fixture','--source-commit',f.git('-C',second,'rev-parse','HEAD'),'--json']);
+ f.db.prepare('UPDATE workspace SET owner=? WHERE id=?').run(STOPPED,secondRecord.id);
+ unbindNativeOwner(f.db,secondRecord.id);
  f.observe({agents:[{id:STOPPED,channel:'beta',state:'running',archived:false}],wakes:[]});
  const seen=[];let after='start';
  for(let i=0;i<5;i++){const r=f.run(['release-ended-owners','--root',f.root,'--max-records','1','--after',after,'--json']);seen.push(...r.results.map(x=>x.record.id));if(!r.nextAfter)break;after=r.nextAfter;}

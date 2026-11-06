@@ -4738,11 +4738,12 @@ function endedOwnerRefusal(database, group, verdicts, observation, deadline, req
   if (unended) return { code: unended.kind === "live" ? "owner-live" : "owner-unknown" };
   const directWake = observation.wakes.some(wake => wake.held !== true && group.some(record => wake.agentId === endedReleaseOwner(database, record) || wake.heldFor === endedReleaseOwner(database, record)));
   if (directWake) return { code: "pending-owner-wake" };
-  // A held trigger for the ended owner's goal keeps its checkouts for a successor. An
-  // authenticated live requester taking custody is such a successor, and a transfer deletes
-  // nothing, so only a trigger that names this checkout (path or basename) still refuses it.
+  // A held trigger is future work for a successor, not a live writer. Explicit release
+  // first adopts custody without deleting source; historical path mentions in a handoff
+  // must not prevent that transfer. Automatic disposal still honors every path reference.
+  const adopting = transferOnly && (requester || group.every(record => parentCustody(endedReleaseOwner(database,record),observation).kind === "transfer"));
   const wakes = group.flatMap((record, index) => pendingWakeReferences(record.path, observation, verdicts[index]))
-    .filter(wake => !((requester || (transferOnly && group.every(record => parentCustody(endedReleaseOwner(database,record),observation).kind === "transfer"))) && wake.match === "owner-goal-held-trigger"));
+    .filter(wake => !((adopting && wake.held) || (requester && wake.match === "owner-goal-held-trigger")));
   if (wakes.length) return { code: "pending-wake-reference", pendingWakeReferences: wakes };
   if (group.some(candidate => existsSync(candidate.path) && (generatedOnlySourceCustody(database, candidate.id) || retainedParent(database, candidate.path))))
     return { code: "retained-custody" };

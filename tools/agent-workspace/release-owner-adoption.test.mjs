@@ -204,11 +204,22 @@ test('the foreground submitter vacates its checkout before launching physical re
   } finally {process.chdir(before);fs.rmSync(root,{recursive:true,force:true});}
 });
 
-for(const named of [false,true])test(`parent custody adoption ${named?'protects a path-naming':'accepts a goal-only'} held trigger`,()=>fixture(f=>{
+for(const named of [false,true])test(`parent custody adoption accepts a ${named?'path-naming':'goal-only'} held trigger without deleting source`,()=>fixture(f=>{
  f.agents([{id:CREATOR,parentAgentId:MANAGER,channel:'beta',role:'worker',state:'idle',archived:true,goalId:'goal-1'},f.manager],
   [{id:'trigger',agentId:MANAGER,channel:'beta',held:true,goalId:'goal-1',text:named?`continue in ${f.source}`:'continue independent ranking'}]);
  const result=f.run(['release','--id',f.record.id,'--preserve-runtime','--json'],native(MANAGER));
- assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,named?'awareness-list-1bab':MANAGER,JSON.stringify(result.result));
+ assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,MANAGER,JSON.stringify(result.result));
  assert.equal(fs.existsSync(f.source),true,'Custody adoption and explicit handoff must not delete source');
- if(named)assert.equal(result.result.custodyAdoption.code,'pending-wake-reference');
+ assert.equal(result.result.runtimeHandoff.kind,'settled');
+}));
+
+
+test('an explicit successor release is not blocked by a historical path mention in a handed-off trigger',()=>fixture(f=>{
+ f.agents([{id:CREATOR,parentAgentId:MANAGER,channel:'beta',role:'worker',state:'idle',archived:true,goalId:'goal-1'},f.manager,
+  {id:SUCCESSOR,parentAgentId:MANAGER,channel:'beta',role:'worker',state:'running',archived:false}],
+  [{id:'new-held-trigger',agentId:MANAGER,channel:'beta',held:true,goalId:'goal-1',text:`Release of workspace ${path.basename(f.source)} went to the repair worker; the router has nothing to do there.`}]);
+ const result=release(f,SUCCESSOR);
+ assert.equal(f.db.prepare('SELECT owner FROM workspace WHERE id=?').get(f.record.id).owner,SUCCESSOR,JSON.stringify(result.result));
+ assert.equal(result.result.action,'released',JSON.stringify(result.result));
+ assert.equal(fs.existsSync(f.source),false);
 }));
