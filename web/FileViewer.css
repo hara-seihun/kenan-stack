@@ -1,0 +1,22 @@
+html.artifact-docked #root{position:fixed;top:0;bottom:0;left:0;right:var(--artifact-width);contain:layout}
+.artifact{position:fixed;top:0;right:0;bottom:0;z-index:19;display:flex;flex-direction:column;background:#111}
+.artifact.docked{width:var(--artifact-width);border-left:1px solid #2c2c2c}
+.artifact.full,.artifact.sheet{left:0;z-index:25}
+.artifact header{display:flex;align-items:center;gap:6px;padding:max(6px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) 6px 14px;border-bottom:1px solid #282828}
+.artifact header strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.artifact header a,.artifact header button{display:grid;place-items:center;width:40px;height:40px;min-height:40px;padding:0;border:0;border-radius:9px;background:transparent;color:#cfcfcf}
+.artifact header a:hover,.artifact header button:hover{background:#222;color:#fff}
+.artifact iframe{flex:1;width:100%;border:0;background:#fff}
+.artifact-divider{left:-6px}
+.artifact.sheet header button[aria-label=Close]{width:44px;height:44px;background:#222;border-radius:50%}
+.doc-scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+.doc{max-width:760px;margin:0 auto;padding:20px max(18px,env(safe-area-inset-right)) max(40px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left));line-height:1.65;font-size:16px;overflow-wrap:anywhere}
+.doc h1{font-size:26px;line-height:1.25;margin:28px 0 14px}.doc h2{font-size:21px;line-height:1.3;margin:26px 0 12px}.doc h3{font-size:17px;margin:22px 0 10px}.doc h4,.doc h5,.doc h6{font-size:15px;margin:18px 0 8px}
+.doc h1:first-child,.doc h2:first-child,.doc h3:first-child{margin-top:4px}
+.doc h1,.doc h2{padding-bottom:6px;border-bottom:1px solid #2a2a2a}
+.doc li{margin:3px 0}.doc hr{border:0;border-top:1px solid #333;margin:24px 0}
+.doc-text{margin:0;padding:16px max(14px,env(safe-area-inset-right)) max(40px,env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left));font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#e6e6e6;tab-size:4}
+.doc-note{padding:24px 18px;color:#a1a1a1}
+.pdf-scroll{background:#2a2a2a;touch-action:pan-x pan-y}
+.pdf-pages{margin:8px auto;padding-bottom:max(32px,env(safe-area-inset-bottom))}
+.pdf-pages img{display:block;width:100%;height:auto;margin:0 0 8px;background:#fff;box-shadow:0 1px 6px #0008}

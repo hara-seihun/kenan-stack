@@ -1,0 +1,10 @@
+[Unit]
+Description=kenan-bg authenticated launch server
+Requires=kenan-bg-launch.socket
+After=kenan-bg-launch.socket
+
+[Service]
+ExecStart=/usr/local/bin/node @NATIVE_SERVER@
+Restart=on-failure
+CPUWeight=500
+TimeoutStopSec=30

@@ -1,0 +1,20 @@
+/* 🛒 To buy (web/organized/ToBuy.tsx): one rounded card per section in its own colour (--buy), as in design/shopping/shop-S.png. */
+.buy{padding:4px 16px 24px}
+.buy-section{margin:14px 0 4px;padding:8px 12px 4px 14px;border-radius:16px;border:1px solid}
+.buy-h{display:flex;align-items:center;justify-content:space-between;margin:0;font-size:13px;letter-spacing:.1em;font-weight:800;text-transform:uppercase;color:var(--buy)}
+.buy-rows{list-style:none;margin:0;padding:0}
+.buy-row{display:flex;align-items:center;gap:6px;min-height:44px}
+.buy-check{flex:none;width:44px;height:44px;display:grid;place-items:center;background:transparent;border:0;padding:0;margin-left:-8px}
+.buy-check span{width:22px;height:22px;border-radius:50%;border:2px solid var(--buy);box-sizing:border-box}
+.buy-text{flex:1;min-width:0;text-align:left;background:transparent;border:0;color:var(--text);font-size:17px;padding:10px 4px;overflow-wrap:anywhere}
+.buy-row.bought{opacity:.45;transition:opacity 1.2s}
+.buy-row.bought .buy-check span{background:var(--buy)}
+.buy-row.bought .buy-text{text-decoration:line-through;color:var(--text)}
+.buy-edit{flex:1;display:flex;align-items:center;min-width:0}
+.buy-edit input{flex:1;min-width:0;background:transparent;border:0;border-bottom:1px solid var(--buy);border-radius:0;color:var(--text);font-size:17px;padding:9px 4px}
+.buy-edit input:focus-visible{outline:0}
+.buy-check:hover,.buy-text:hover,.buy-check:disabled,.buy-text:disabled{background:transparent;opacity:1}
+.buy-row.draggable{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.buy-row.lifted{position:relative;z-index:3;pointer-events:none;margin:0 -12px 0 -14px;padding:0 12px 0 14px;border-radius:12px;background:linear-gradient(color-mix(in srgb,var(--buy) 22%,transparent),color-mix(in srgb,var(--buy) 22%,transparent)),#151715;box-shadow:0 10px 24px #000d,0 0 0 1px #b9dd6a66;scale:1.02;transition:scale .12s,box-shadow .12s}
+.buy-section.org-drop-target>.buy-h span{color:#b9dd6a}
+@media(prefers-reduced-motion:reduce){.buy-row.lifted{scale:none}}

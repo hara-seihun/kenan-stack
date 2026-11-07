@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep enabled Kenan runtimes recoverable after self-interruption
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,273 @@
+#!/opt/kenan-image/venv/bin/python
+"""kenan-image: cartoon/sketch images on the CPU, one job at a time at idle priority. Guide: /usr/local/share/kenan/skills/image/SKILL.md."""
+import argparse, fcntl, json, os, subprocess, sys, time
+from pathlib import Path
+
+MODEL = Path(os.environ.get("KENAN_IMAGE_MODEL", "/var/lib/kenan/models/image/sd-turbo"))
+LOCK = Path(os.environ.get("KENAN_IMAGE_LOCK", "/var/lib/kenan/image-gen/lock"))
+CPUS, MEMORY, NICE = 2, "4G", 19
+LOCK_WAIT_S = 240
+MAX_N = 4
+STYLE = "flat vector illustration, clean bold outlines, simple flat colours, plain white background"
+
+
+class Fail(Exception):
+    def __init__(self, code, detail):
+        super().__init__(f"{code}: {detail}")
+        self.code, self.detail = code, detail
+
+
+def fail(code, detail):
+    raise Fail(code, detail)
+
+
+def size_arg(text):
+    parts = text.lower().split("x")
+    if len(parts) not in (1, 2) or not all(p.isdigit() for p in parts):
+        raise argparse.ArgumentTypeError("SIZE or WIDTHxHEIGHT, e.g. 512 or 448x704")
+    w, h = int(parts[0]), int(parts[-1])
+    for v in (w, h):
+        if v % 64 or not 256 <= v <= 768:
+            raise argparse.ArgumentTypeError("each side must be a multiple of 64 between 256 and 768")
+    return [w, h]
+
+
+def strength_arg(text):
+    v = float(text)
+    if not 0.1 <= v <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0.1 and 1.0")
+    return v
+
+
+def n_arg(text):
+    v = int(text)
+    if not 1 <= v <= MAX_N:
+        raise argparse.ArgumentTypeError(f"must be 1..{MAX_N}")
+    return v
+
+
+# ---------- light commands (no model) ----------
+
+def to_rgba_transparent(img, tolerance):
+    """Background = everything connected to the border within TOLERANCE of the border colour (handles paper texture)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    rgb = img.convert("RGB").filter(ImageFilter.MedianFilter(3))
+    w, h = rgb.size
+    marker = (255, 0, 254)
+    seeds = [(x, y) for x in range(0, w, 8) for y in (0, h - 1)] + [(x, y) for y in range(0, h, 8) for x in (0, w - 1)]
+    for xy in seeds:
+        if rgb.getpixel(xy) != marker:
+            ImageDraw.floodfill(rgb, xy, marker, thresh=tolerance)
+    import numpy as np
+    mask = Image.fromarray(np.where((np.asarray(rgb) == marker).all(-1), 0, 255).astype("uint8"))
+    mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    out = img.convert("RGBA")
+    out.putalpha(mask)
+    return out
+
+
+def trace(png: Path, svg: Path, transparent: bool, colors: int, tolerance: int, png_out=None):
+    import vtracer
+    from PIL import Image
+    img = Image.open(png)
+    if transparent:
+        img = to_rgba_transparent(img, tolerance)
+        if png_out:
+            img.save(png_out)
+    tmp = svg.with_suffix(".prep.png")
+    img.save(tmp)
+    try:
+        vtracer.convert_image_to_svg_py(str(tmp), str(svg), colormode="color", hierarchical="stacked",
+                                        mode="spline", filter_speckle=6, color_precision=max(1, min(8, colors)),
+                                        layer_difference=24, corner_threshold=60, length_threshold=4.0,
+                                        splice_threshold=45, path_precision=2)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return svg
+
+
+def cmd_trace(a):
+    png = Path(a.image)
+    if not png.is_file():
+        fail("image_missing", str(png))
+    out = Path(a.out) if a.out else png.with_suffix(".svg")
+    trace(png, out, a.transparent, a.colors, a.tolerance, a.png_out)
+    return {"svg": str(out), **({"png": a.png_out} if a.png_out else {})}
+
+
+def cmd_layer(a):
+    from PIL import Image, ImageChops, ImageFilter
+    dressed = Image.open(a.image).convert("RGB")
+    base = Image.open(a.base).convert("RGB")
+    if base.size != dressed.size:
+        fail("size_mismatch", f"{a.base} is {base.size}, {a.image} is {dressed.size}")
+    diff = ImageChops.difference(dressed, base).convert("L")
+    mask = diff.point(lambda v: 255 if v > a.threshold else 0).filter(ImageFilter.MedianFilter(5))
+    mask = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    if a.hue:
+        lo, hi = (int(x) for x in a.hue.split("-"))
+        hsv = dressed.convert("HSV")
+        h, s, v = hsv.split()
+        hue_ok = h.point(lambda x: 255 if lo <= x * 360 // 255 <= hi else 0)
+        sat_ok = s.point(lambda x: 255 if x > 40 else 0)
+        mask = ImageChops.multiply(mask, ImageChops.multiply(hue_ok, sat_ok)) if a.hue_and_diff else \
+            ImageChops.multiply(hue_ok, sat_ok).filter(ImageFilter.MedianFilter(5))
+    layer = dressed.convert("RGBA")
+    layer.putalpha(mask)
+    out = Path(a.out)
+    layer.save(out)
+    res = {"png": str(out), "coverage": round(sum(mask.histogram()[255:]) / (mask.size[0] * mask.size[1]), 3)}
+    if a.trace:
+        res["svg"] = str(trace(out, out.with_suffix(".svg"), False, a.colors, 0))
+    return res
+
+
+def cmd_stack(a):
+    import re
+    groups, view = [], None
+    for item in a.layers:
+        name, _, path = item.rpartition("=") if "=" in item else (Path(item).stem, "", item)
+        text = Path(path).read_text()
+        m = re.search(r"<svg\b([^>]*)>(.*)</svg>", text, re.S)
+        if not m:
+            fail("not_svg", path)
+        attrs, body = m.groups()
+        if view is None:
+            w = re.search(r'width="([\d.]+)', attrs)
+            h = re.search(r'height="([\d.]+)', attrs)
+            if not (w and h):
+                fail("svg_without_size", path)
+            view = (w.group(1), h.group(1))
+        groups.append(f'<g id="{name}" inkscape:groupmode="layer" inkscape:label="{name}">{body}</g>')
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+           f'width="{view[0]}" height="{view[1]}" viewBox="0 0 {view[0]} {view[1]}">\n' + "\n".join(groups) + "\n</svg>\n")
+    Path(a.out).write_text(svg)
+    return {"svg": a.out, "layers": [g.split('"')[1] for g in groups]}
+
+
+# ---------- gen: outer (lock + cpu-slot) and inner (model) ----------
+
+def cmd_gen(a):
+    if not MODEL.is_dir():
+        fail("model_missing", f"{MODEL} is not installed")
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    if a.init and not Path(a.init).is_file():
+        fail("image_missing", a.init)
+    spec = {"prompt": a.prompt if a.raw else f"{a.prompt}, {STYLE}", "negative": a.negative, "out": str(out),
+            "n": a.n, "seed": a.seed, "size": a.size, "init": str(Path(a.init).resolve()) if a.init else None,
+            "strength": a.strength, "name": a.name}
+    try:
+        lock = open(LOCK, "r")
+    except OSError as e:
+        fail("lock_unavailable", f"{LOCK}: {e.strerror}")
+    with lock:
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    fail("busy", f"another image job held the lock for over {LOCK_WAIT_S}s; try again later")
+                time.sleep(2)
+        seconds = 60 + 25 * a.n
+        cmd = ["chrt", "--idle", "0", "nice", "-n", str(NICE), sys.executable, os.path.abspath(__file__), "_worker", json.dumps(spec)]
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", "ROCR_VISIBLE_DEVICES": "",
+               "OMP_NUM_THREADS": str(CPUS), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    last = [l for l in r.stdout.splitlines() if l.startswith("{")]
+    if r.returncode != 0 or not last:
+        fail("generation_failed", f"exit {r.returncode}: {(r.stderr or r.stdout)[-800:]}")
+    res = json.loads(last[-1])
+    if a.trace:
+        res["svgs"] = [str(trace(Path(p), Path(p).with_suffix(".svg"), a.transparent, a.colors, a.tolerance)) for p in res["pngs"]]
+    return res
+
+
+def worker(spec_json):
+    spec = json.loads(spec_json)
+    import torch
+    torch.set_num_threads(CPUS)
+    t0 = time.time()
+    if spec["init"]:
+        from diffusers import AutoPipelineForImage2Image as P
+    else:
+        from diffusers import AutoPipelineForText2Image as P
+    pipe = P.from_pretrained(str(MODEL), variant="fp16", torch_dtype=torch.bfloat16, safety_checker=None).to("cpu")
+    pipe.set_progress_bar_config(disable=True)
+    load = time.time() - t0
+    seed = spec["seed"] if spec["seed"] is not None else int.from_bytes(os.urandom(3), "big")
+    init = None
+    if spec["init"]:
+        from PIL import Image
+        init = Image.open(spec["init"]).convert("RGB").resize(tuple(spec["size"]))
+    pngs, times = [], []
+    for i in range(spec["n"]):
+        t = time.time()
+        g = torch.Generator().manual_seed(seed + i)
+        kw = dict(prompt=spec["prompt"], guidance_scale=0.0, generator=g)
+        if spec["negative"]:
+            kw.update(negative_prompt=spec["negative"], guidance_scale=1.5)
+        if init is not None:
+            steps = max(2, round(1 / spec["strength"]) + 1)
+            img = pipe(image=init, strength=spec["strength"], num_inference_steps=steps, **kw).images[0]
+        else:
+            img = pipe(num_inference_steps=1, width=spec["size"][0], height=spec["size"][1], **kw).images[0]
+        p = Path(spec["out"]) / f"{spec['name']}-{seed + i}.png"
+        img.save(p)
+        pngs.append(str(p))
+        times.append(round(time.time() - t, 1))
+    print(json.dumps({"pngs": pngs, "seed": seed, "load_s": round(load, 1), "image_s": times}))
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "_worker":
+        return worker(sys.argv[2])
+    ap = argparse.ArgumentParser(prog="kenan-image", description="Cartoon/sketch images on the CPU (SD-Turbo), traced to SVG.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gen", help="text (or image+text) to PNG, optionally traced to SVG")
+    g.add_argument("prompt")
+    g.add_argument("--out", required=True)
+    g.add_argument("--name", default="img")
+    g.add_argument("--n", type=n_arg, default=1)
+    g.add_argument("--seed", type=int)
+    g.add_argument("--size", type=size_arg, default=[512, 512], help="512 or WIDTHxHEIGHT (448x704 for a standing figure)")
+    g.add_argument("--init", help="start from this image (keeps its layout); use --strength")
+    g.add_argument("--strength", type=strength_arg, default=0.5, help="with --init: 0.3 small change .. 0.8 big change")
+    g.add_argument("--negative", help="what to avoid (slightly slower)")
+    g.add_argument("--raw", action="store_true", help="don't append the flat-illustration style words")
+    g.add_argument("--trace", action="store_true")
+    g.add_argument("--transparent", action="store_true", help="with --trace: drop the white background")
+    g.add_argument("--colors", type=int, default=6)
+    g.add_argument("--tolerance", type=int, default=40, help="with --transparent: how different from the border colour still counts as background")
+    t = sub.add_parser("trace", help="PNG to SVG")
+    t.add_argument("image")
+    t.add_argument("--out")
+    t.add_argument("--transparent", action="store_true")
+    t.add_argument("--colors", type=int, default=6)
+    t.add_argument("--png-out", help="with --transparent: also save the cut-out PNG here")
+    t.add_argument("--tolerance", type=int, default=40)
+    l = sub.add_parser("layer", help="cut what changed between BASE and IMAGE into a transparent layer")
+    l.add_argument("image")
+    l.add_argument("--base", required=True)
+    l.add_argument("--out", required=True)
+    l.add_argument("--threshold", type=int, default=40)
+    l.add_argument("--hue", help="keep only this hue range in degrees, e.g. 100-180 for greens")
+    l.add_argument("--hue-and-diff", action="store_true", help="with --hue: require both changed and in hue")
+    l.add_argument("--trace", action="store_true")
+    l.add_argument("--colors", type=int, default=6)
+    s = sub.add_parser("stack", help="combine SVGs into one layered SVG (bottom first), NAME=FILE or FILE")
+    s.add_argument("layers", nargs="+")
+    s.add_argument("--out", required=True)
+    a = ap.parse_args()
+    try:
+        res = {"gen": cmd_gen, "trace": cmd_trace, "layer": cmd_layer, "stack": cmd_stack}[a.cmd](a)
+    except Fail as e:
+        print(json.dumps({"error": e.code, "detail": e.detail}))
+        sys.exit(2)
+    print(json.dumps(res))
+
+
+if __name__ == "__main__":
+    main()

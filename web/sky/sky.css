@@ -1,0 +1,24 @@
+/* The art layer under everything (web/sky/sky.ts): fixed, never hit-tested, on the layout's own page colour. A
+   layout that paints that colour on its screens lets the sky show through while one is on, and the layer carries the colour.
+   Sidebars and slide-in menus are a faint white tint over the sky instead of an opaque panel (Dave 2026-10-22). A
+   slide-in menu covers the chat, so while one is open what lies under it is hidden: the sky, not the chat, is what the
+   menu's tint lies on, and the scrim dims the rest of it. The layer itself never rises: in the iOS home-screen app the
+   shell is position:fixed (web/viewport.ts), a stacking context of its own, so a raised layer covered the whole shell,
+   menu included (Dave 2026-10-27: the menu showed only the sky). */
+.sky{position:fixed;inset:0;z-index:-1;pointer-events:none;background:#000}
+.sky-probe{position:fixed;inset:0;visibility:hidden;pointer-events:none}
+.sky canvas{display:block;width:100%;height:100%;opacity:.675}
+html.sky-on:has(.todo-page) .sky{background:#0e0f0e}
+.sky-on .sidebar{background:#ffffff08}
+.sky-on .main{will-change:opacity}
+html.sky-on .sidebar.open~.main{opacity:0}
+.sky-forest canvas{opacity:.72}
+/* The background on its own (web/SkyOnly.tsx): the app is hidden, the art is at full strength over the whole page,
+   and one invisible button covering it takes her back; its hint fades after a few seconds. */
+html.sky-only body>:not(.sky):not(.sky-only-exit){visibility:hidden}
+html.sky-only .sky{z-index:2147483600}
+html.sky-only .sky canvas{opacity:1}
+.sky-only-exit{position:fixed;inset:0;z-index:2147483601;background:transparent;border:0;border-radius:0;padding:0 0 max(28px,env(safe-area-inset-bottom));display:flex;align-items:flex-end;justify-content:center;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.sky-only-exit:hover,.sky-only-exit:focus,.sky-only-exit:active{background:transparent}
+.sky-only-exit span{font-size:14px;color:#ffffffb0;background:#00000066;padding:8px 14px;border-radius:999px;animation:sky-only-hint 4s ease-in forwards}
+@keyframes sky-only-hint{0%,60%{opacity:1}100%{opacity:0}}

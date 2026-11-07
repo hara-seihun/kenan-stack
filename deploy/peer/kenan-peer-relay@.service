@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenan peer relay %i (messages between two Kenaznias on different hosts)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/peer-relay/peer-relay.mjs %h/.config/kenan-peer-relay/%i.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

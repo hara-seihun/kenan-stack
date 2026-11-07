@@ -1,0 +1,18 @@
+[Unit]
+Description=Spend a banked Codex reset on a Acme pool account that is about to run dry
+After=network-online.target pi-stack-next-employee-models.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi2-acme
+Group=pi2-acme
+StateDirectory=kenan-codex-reset
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/node /opt/kenan-acme/deploy/acme-codex-reset.mjs redeem
+TimeoutStartSec=10min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077

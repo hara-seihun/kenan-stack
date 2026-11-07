@@ -1,0 +1,368 @@
+import type { OAuthCredential } from "@earendil-works/pi-ai";
+import type { SharedOAuthAuth } from "./auth/shared-oauth.js";
+import { meterCredential, meterRequestSignal } from "./auth/meter-credential.js";
+import type { Store } from "./store.js";
+
+/**
+ * Anthropic meter sampling.
+ *
+ * Anthropic does publish rate-limit headers, which is why this provider had
+ * no poller for so long — the usage-logger extension records them for free
+ * from every response. Two structural blind spots make that source
+ * incomplete, and both of them silently *overstate* headroom, which is the
+ * dangerous direction:
+ *
+ * - **The scoped weekly header is model-conditional.** A response carries
+ *   `anthropic-ratelimit-unified-7d_oi-*` only when the request was scoped
+ *   to that model (Fable). An account running Opus emits the 5h and 7d
+ *   headers and nothing else, so its Fable meter simply does not exist in
+ *   the ledger — and a consumer that averages the accounts that *do* have
+ *   one reports the healthy accounts as if they were the fleet.
+ * - **Headers only see this machine.** An account shared with an off-machine
+ *   client (Claude Code on the work laptop) drains meters no local response
+ *   ever reports. A locally idle account looks unchanged rather than drained.
+ *
+ * The account usage endpoint has neither problem: `GET /api/oauth/usage`
+ * returns every bucket of the plan, on every call, whatever the account has
+ * been running and wherever it ran. This sampler polls it beside the Codex
+ * sampler, writing the same ordinary meter readings the header path writes,
+ * so calibration, broker admission, and Pi Remote's plan cards read one
+ * complete set of facts.
+ *
+ * Credentials resolve through SharedOAuthAuth, using the same lock and
+ * atomic write as interactive and fleet sessions. Idle accounts can refresh
+ * without racing another consumer's single-use refresh token.
+ */
+
+export const ANTHROPIC_PROVIDER = "anthropic";
+const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+const USER_AGENT = "pi-orchestrator";
+
+/**
+ * Ledger meter id for each bucket the usage endpoint reports.
+ *
+ * These are the ids the usage-logger extension derives from the header
+ * window names (`anthropic-${window}`), and they must stay identical: one
+ * meter is one fact, whether a response header or this poller observed it.
+ */
+export const ANTHROPIC_METER_IDS = {
+  session: "anthropic-5h",
+  weekly_all: "anthropic-7d",
+  weekly_scoped: "anthropic-7d_oi",
+} as const;
+
+/**
+ * The model the `7d_oi` meter is scoped to. Verified against production
+ * traffic: readings on that meter begin exactly when an account starts
+ * running Fable, and never appear for Opus-only accounts, while the usage
+ * endpoint labels the same bucket `weekly_scoped` on model "Fable". Opus has
+ * no weekly bucket of its own — it drains the session and all-models meters.
+ */
+const SCOPED_MODEL = "fable";
+
+type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+/** One plan bucket, already mapped to the ledger meter that records it. */
+export interface AnthropicBucketUsage {
+  readonly meterId: string;
+  readonly usedPercent: number;
+  readonly resetAt: number | undefined;
+}
+
+export interface AnthropicUsageReading {
+  readonly buckets: AnthropicBucketUsage[];
+  /** Scoped weekly buckets no meter is declared for, by model display name. */
+  readonly unmappedScopes: string[];
+}
+
+export type AnthropicSampleOutcome =
+  | "recorded"
+  | "cancelled"
+  | "not-due"
+  | "no-credential"
+  | "credential-failed"
+  | "request-failed"
+  | "unreadable-response"
+  | "unmapped-scope"
+  | "stale-reading";
+
+export interface AnthropicSampleReport {
+  readonly accountId: string;
+  readonly meterId?: string;
+  readonly outcome: AnthropicSampleOutcome;
+  readonly usedPercent?: number;
+  readonly detail?: string;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function scopedModelName(limit: Record<string, unknown>): string | undefined {
+  const model = record(record(limit.scope)?.model);
+  const name = model?.display_name;
+  return typeof name === "string" && name.length > 0 ? name : undefined;
+}
+
+function bucket(limit: Record<string, unknown>, meterId: string): AnthropicBucketUsage | undefined {
+  const raw = limit.percent ?? limit.utilization;
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined;
+  const resetsAt = typeof limit.resets_at === "string" ? Date.parse(limit.resets_at) : Number.NaN;
+  return {
+    meterId,
+    usedPercent: raw,
+    // Response headers state resets in whole seconds; this endpoint adds sub-second jitter to the same instant.
+    resetAt: Number.isFinite(resetsAt) ? Math.round(resetsAt / 1000) * 1000 : undefined,
+  };
+}
+
+/** Read declared subscription windows. Unnamed top-level spending objects do not establish a model quota. */
+export function parseAnthropicUsage(value: unknown): AnthropicUsageReading {
+  const response = record(value);
+  if (!response) return { buckets: [], unmappedScopes: [] };
+  const limits = Array.isArray(response.limits) ? response.limits : [];
+  const buckets = new Map<string, AnthropicBucketUsage>();
+  const unmappedScopes: string[] = [];
+  const add = (raw: Record<string, unknown>, id: string) => {
+    const usage = bucket(raw, id);
+    if (usage) buckets.set(id, usage);
+  };
+  // Some plans expose only these fields; null is missing, not zero usage.
+  for (const [key, value] of Object.entries(response)) {
+    const raw = record(value);
+    if (!raw || key === "extra_usage") continue;
+    if (key === "five_hour") add(raw, ANTHROPIC_METER_IDS.session);
+    else if (key === "seven_day") add(raw, ANTHROPIC_METER_IDS.weekly_all);
+    else if (key === "seven_day_fable") add(raw, ANTHROPIC_METER_IDS.weekly_scoped);
+    else if (key.startsWith("seven_day_")) {
+      if (bucket(raw, key)) unmappedScopes.push(key);
+    }
+  }
+  const scoped = limits.map(record).filter((limit): limit is Record<string, unknown> =>
+    limit !== undefined && limit.kind === "weekly_scoped");
+  const chosen = scoped.length === 1 && !scopedModelName(scoped[0]!)
+    ? scoped[0]
+    : scoped.find((limit) => (scopedModelName(limit) ?? "").toLowerCase() === SCOPED_MODEL);
+  // Explicit limits take precedence over duplicated top-level windows.
+  for (const limit of limits) {
+    const raw = record(limit);
+    if (!raw) continue;
+    if (raw.kind === "session") add(raw, ANTHROPIC_METER_IDS.session);
+    else if (raw.kind === "weekly_all") add(raw, ANTHROPIC_METER_IDS.weekly_all);
+    else if (raw.kind === "weekly_scoped" || record(raw.scope) !== undefined) {
+      if (raw !== chosen) unmappedScopes.push(scopedModelName(raw) ?? "unnamed");
+      else add(raw, ANTHROPIC_METER_IDS.weekly_scoped);
+    }
+  }
+  return { buckets: [...buckets.values()], unmappedScopes: [...new Set(unmappedScopes)] };
+}
+
+function requestHeaders(accessToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    Accept: "application/json",
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "oauth-2025-04-20",
+    "User-Agent": USER_AGENT,
+  };
+}
+
+/** A usage request the provider refused on the credential, not the request. */
+export class AnthropicUnauthorizedError extends Error {
+  constructor(label: string, readonly status: number) {
+    super(`anthropic ${label} HTTP ${status}`);
+    this.name = "AnthropicUnauthorizedError";
+  }
+}
+
+async function fetchAnthropicJson(
+  url: string,
+  label: string,
+  accessToken: string,
+  fetchFn: FetchLike,
+  requestTimeoutMs: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  signal?.throwIfAborted();
+  const response = await fetchFn(url, {
+    headers: requestHeaders(accessToken),
+    signal: meterRequestSignal(requestTimeoutMs, signal),
+  });
+  if (response.status === 401) throw new AnthropicUnauthorizedError(label, response.status);
+  if (!response.ok) throw new Error(`anthropic ${label} HTTP ${response.status}`);
+  return response.json();
+}
+
+export async function fetchAnthropicUsage(
+  accessToken: string,
+  fetchFn: FetchLike,
+  requestTimeoutMs: number,
+  signal?: AbortSignal,
+): Promise<AnthropicUsageReading> {
+  return parseAnthropicUsage(
+    await fetchAnthropicJson(USAGE_URL, "usage", accessToken, fetchFn, requestTimeoutMs, signal),
+  );
+}
+
+export interface AnthropicMeterSamplerOptions {
+  readonly auth: SharedOAuthAuth;
+  /** Minimum age of the stalest meter before an account is polled again. */
+  readonly intervalMs?: number;
+  readonly requestTimeoutMs?: number;
+  readonly fetch?: FetchLike;
+}
+
+const DEFAULT_INTERVAL_MS = 10 * 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
+export class AnthropicMeterSampler {
+  private readonly auth: SharedOAuthAuth;
+  private readonly attemptedAt = new Map<string, number>();
+  private readonly intervalMs: number;
+  private readonly requestTimeoutMs: number;
+  private readonly fetchFn: FetchLike;
+
+  constructor(
+    private readonly ledger: Store,
+    options: AnthropicMeterSamplerOptions,
+  ) {
+    this.auth = options.auth;
+    this.intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.fetchFn = options.fetch ?? fetch;
+  }
+
+  /**
+   * Due-ness is judged on the **stalest** of the account's meters, not the
+   * freshest. Response headers keep the session and all-models meters
+   * current for an account that is running right now while leaving its
+   * scoped weekly meter missing or hours old, and it is precisely that meter
+   * this poll exists to supply; judging on the freshest reading would make a
+   * busy account permanently "not due" and never close the hole.
+   */
+  private due(accountId: string, now: number): boolean {
+    const attempted = this.attemptedAt.get(accountId);
+    if (attempted !== undefined && now - attempted < this.intervalMs) return false;
+    return Object.values(ANTHROPIC_METER_IDS).some((meterId) => {
+      const last = this.ledger.latestReading(accountId, meterId);
+      return last === undefined || now - last.at >= this.intervalMs;
+    });
+  }
+
+  /**
+   * One usage read, repairing the credential if the provider rejects it.
+   *
+   * A provider can invalidate an access token before its stated expiry, and
+   * expiry-driven refresh alone then leaves the account permanently
+   * unauthenticated with a working refresh token in hand. This poll is the
+   * one thing that touches every account on a schedule, so it is where that
+   * is caught and repaired. A 401 that survives a fresh token is a real
+   * authorization problem and is reported.
+   */
+  private async read(accountId: string, credential: OAuthCredential, signal?: AbortSignal): Promise<AnthropicUsageReading> {
+    try {
+      return await fetchAnthropicUsage(credential.access, this.fetchFn, this.requestTimeoutMs, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (!(error instanceof AnthropicUnauthorizedError)) throw error;
+      const repaired = await this.auth.refreshRejected(
+        accountId,
+        credential.access,
+        meterRequestSignal(this.requestTimeoutMs, signal),
+        AbortSignal.timeout(this.requestTimeoutMs),
+      );
+      signal?.throwIfAborted();
+      try {
+        return await fetchAnthropicUsage(repaired.access, this.fetchFn, this.requestTimeoutMs, signal);
+      } catch (second) {
+        signal?.throwIfAborted();
+        if (second instanceof AnthropicUnauthorizedError) await this.auth.reject(accountId, repaired.access, meterRequestSignal(this.requestTimeoutMs, signal));
+        throw second;
+      }
+    }
+  }
+
+  /**
+   * Samples every Anthropic account whose credential lives in the shared
+   * auth store and whose meters are due. Accounts credentialed in another
+   * custody domain are skipped, not failed: their own owner polls them. Never
+   * throws — a provider outage is a gap in evidence, not a controller fault.
+   */
+  async sample(now = Date.now(), signal?: AbortSignal): Promise<AnthropicSampleReport[]> {
+    const reports: AnthropicSampleReport[] = [];
+    for (const account of this.ledger.accounts()) {
+      if (signal?.aborted) break;
+      if (account.provider !== ANTHROPIC_PROVIDER) continue;
+      // Disabled accounts are unschedulable, so sampling them buys no
+      // evidence and their failures would linger in status forever.
+      if (!account.enabled) continue;
+      if (!this.due(account.id, now)) {
+        reports.push({ accountId: account.id, outcome: "not-due" });
+        continue;
+      }
+      this.attemptedAt.set(account.id, now);
+      const credential = await meterCredential(this.auth, account.id, this.requestTimeoutMs, signal);
+      if (!credential.ok) {
+        reports.push({ accountId: account.id, outcome: credential.outcome, detail: credential.detail });
+        if (signal?.aborted) this.attemptedAt.delete(account.id);
+        continue;
+      }
+      let usage: AnthropicUsageReading;
+      try {
+        usage = await this.read(account.id, credential.credential, signal);
+        signal?.throwIfAborted();
+      } catch (error) {
+        reports.push({ accountId: account.id, outcome: signal?.aborted ? "cancelled" : "request-failed", detail: String(error) });
+        if (signal?.aborted) this.attemptedAt.delete(account.id);
+        continue;
+      }
+      for (const scope of usage.unmappedScopes) {
+        reports.push({
+          accountId: account.id,
+          outcome: "unmapped-scope",
+          detail: `no meter declared for the weekly bucket scoped to ${scope}`,
+        });
+      }
+      if (usage.buckets.length === 0) {
+        reports.push({ accountId: account.id, outcome: "unreadable-response" });
+        continue;
+      }
+      for (const value of usage.buckets) {
+        const previous = this.ledger.latestReading(account.id, value.meterId);
+        const at = Date.now();
+        // A header reading is not this fact: it reports the windows one
+        // response was metered against, which is why this poll exists. So an
+        // equal instant is a correction the ledger applies, and only a
+        // genuinely newer stored reading makes this one stale.
+        if (previous && at < previous.at) {
+          reports.push({ accountId: account.id, meterId: value.meterId, outcome: "stale-reading" });
+          continue;
+        }
+        try {
+          this.ledger.recordReading(account.id, value.meterId, {
+            at,
+            usedPercent: Math.round(Math.max(0, Math.min(100, value.usedPercent))),
+            resetAt: value.resetAt,
+          });
+        } catch (thrown) {
+          // A session recorded a header reading between the check and the
+          // write. The fact is stored either way; drop the redundant loser.
+          reports.push({
+            accountId: account.id,
+            meterId: value.meterId,
+            outcome: "stale-reading",
+            detail: String(thrown),
+          });
+          continue;
+        }
+        reports.push({
+          accountId: account.id,
+          meterId: value.meterId,
+          outcome: "recorded",
+          usedPercent: value.usedPercent,
+        });
+      }
+    }
+    return reports;
+  }
+}

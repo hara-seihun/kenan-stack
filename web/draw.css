@@ -1,0 +1,15 @@
+.draw{position:fixed;inset:0;z-index:40;display:flex;flex-direction:column;background:#000;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);overscroll-behavior:none}
+.draw-bar{display:flex;align-items:center;gap:6px;padding:6px 8px}
+.draw-bar>span{flex:1}
+.draw-bar button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-width:44px;min-height:44px;padding:0 12px;background:transparent;border:0;color:#ddd}
+.draw-bar button.send{background:#ddd;color:#111;padding:0 18px;font-weight:600}
+.draw-bar button.send:disabled{background:#555;color:#222}
+.draw-error{margin:0 10px 6px;padding:8px 12px;border-radius:9px;background:#391d1d;border:1px solid #8c4a4a;font-size:14px}
+.draw-canvas{flex:1;min-height:0;width:100%;display:block;background:#fff;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;cursor:crosshair}
+.draw-tools{display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 10px}
+.draw-inks,.draw-widths{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+.draw-inks button{width:34px;height:34px;min-height:34px;padding:0;border-radius:50%;border:2px solid #444}
+.draw-inks button.on{border-color:#fff;box-shadow:0 0 0 2px #85b7e9}
+.draw-widths button{display:grid;place-items:center;width:44px;height:44px;padding:0;border-radius:50%;background:#1b1b1b;border:1px solid #333}
+.draw-widths button.on{border-color:#85b7e9;background:#263445}
+.draw-widths i{display:block;border-radius:50%}

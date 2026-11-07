@@ -1,0 +1,33 @@
+# Installed by deploy/prepare.sh; the supervisor is deploy/model-broker-supervisor/.
+[Unit]
+RefuseManualStop=yes
+Description=Kenan subscription model broker
+After=network-online.target kenan-port-access.service
+Wants=kenan-port-access.service
+Wants=network-online.target
+
+[Service]
+User=kenan
+Group=kenan
+WorkingDirectory=/home/kenan
+Environment=HOME=/home/kenan
+Environment="NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection"
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+RuntimeDirectory=kenan-model-broker
+
+# `systemctl reload` starts a new broker generation from the release `current` points to and lets
+# the old one finish its streams. Stop and restart are refused: they would refuse every call while
+# the old generation drains (2026-10-27 outage). A supervisor change uses `kenan-operator broker-restart`.
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/model-broker-supervisor.mjs run --state /run/kenan-model-broker --release /srv/kenan/broker/current --entry dist/cli.js --ports /etc/kenan/model-broker.json -- model-broker /etc/kenan/model-broker.json
+ExecReload=/usr/local/bin/node /usr/local/lib/kenan/model-broker-supervisor.mjs reload --state /run/kenan-model-broker
+Restart=on-failure
+RestartSec=2
+# A reload waits up to 90 s for the new generation to listen; let the supervisor give that verdict.
+TimeoutStartSec=120
+KillMode=mixed
+TimeoutStopSec=30min
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

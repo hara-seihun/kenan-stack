@@ -1,0 +1,25 @@
+--- a/res/res_rtp_asterisk.c
++++ b/res/res_rtp_asterisk.c
+@@ -9679,6 +9679,22 @@
+ 	}
+ #endif
+ 
++	/* PJSIP activates RTP after applying each successfully negotiated SDP.
++	 * A transfer can retain its SDP target while the sender's source changes.
++	 * Reopen the normal probation window on this control-plane event only;
++	 * symmetric RTP packet updates must not perpetually reopen learning.
++	 * ICE has its own authenticated nomination/learning path above.
++	 */
++	if (strictrtp && rtp->strict_rtp_state != STRICT_RTP_OPEN) {
++		struct ast_sockaddr target_address;
++
++		ast_rtp_instance_get_requested_target_address(instance, &target_address);
++		if (!ast_sockaddr_isnull(&target_address)) {
++			ast_verb(4, "%p -- Strict RTP learning after negotiated media activation\n", rtp);
++			rtp_learning_start(rtp);
++		}
++	}
++
+ 	ast_debug_dtls(3, "(%p) DTLS - ast_rtp_activate rtp=%p - setup and perform DTLS'\n", instance, rtp);
+ 
+ 	dtls_perform_setup(&rtp->dtls);

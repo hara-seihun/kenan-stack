@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""Read-only IMAP search over the Proton Bridge mailbox.
+
+Never mutates: mailboxes are opened with EXAMINE (readonly) and bodies fetched
+with BODY.PEEK so no \\Seen flag is set. The Bridge login comes from mail_identity's local cache (filled
+from Proton Pass) and is never printed.
+"""
+import base64, imaplib, json, sqlite3, ssl, subprocess, sys, email, os, re, time
+from datetime import datetime
+from email.header import decode_header, make_header
+from html.parser import HTMLParser
+# Keep direct SourceFileLoader callers working through the retained main symlink.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import mail_headers
+from mail_identity import ALL, MailIdentityError, fetch_message, fetch_messages, folder_positions, listed_folders, load_account, locate, parse_position, parse_reference, quote_box, uidvalidity
+
+
+def criteria_error(message):
+    raise MailIdentityError("invalid-criteria", message)
+
+
+def expression_tokens(expression):
+    tokens = []
+    i = 0
+    while i < len(expression):
+        c = expression[i]
+        if c.isspace():
+            i += 1
+        elif c in "()":
+            tokens.append((c, False))
+            i += 1
+        elif c == '"':
+            i += 1
+            value = ""
+            while i < len(expression) and expression[i] != '"':
+                if expression[i] == "\\":
+                    i += 1
+                    if i == len(expression) or expression[i] not in '\\"':
+                        criteria_error("quoted strings escape only quotes and backslashes")
+                value += expression[i]
+                i += 1
+            if i == len(expression):
+                criteria_error("unterminated quoted string")
+            tokens.append((value, True))
+            i += 1
+            if i < len(expression) and not expression[i].isspace() and expression[i] != ')':
+                criteria_error("missing separator after quoted string")
+        else:
+            end = i
+            while end < len(expression) and not expression[end].isspace() and expression[end] not in '()"':
+                end += 1
+            tokens.append((expression[i:end], False))
+            i = end
+    return tokens
+
+
+def search_criteria(arguments):
+    """Return (one IMAP expression, conjunctive local Unicode header filters).
+
+    --criteria EXPR and a single-expression argument use IMAP lexical syntax.
+    Otherwise each CLI argument is one key/value/parenthesis token; string values
+    retain their shell boundaries. Both forms share the RFC3501 grammar.
+    """
+    if any(any(ord(c) < 32 or ord(c) == 127 for c in arg) for arg in arguments):
+        criteria_error("control characters are forbidden")
+    if sum(map(len, arguments)) > 65536:
+        criteria_error("criteria exceed 64 KiB")
+    if arguments and arguments[0] == "--criteria":
+        if len(arguments) != 2 or not arguments[1].strip():
+            criteria_error("--criteria requires exactly one nonempty IMAP expression")
+        tokens = expression_tokens(arguments[1])
+    elif len(arguments) == 1:
+        if not arguments[0].strip():
+            criteria_error("empty expression")
+        tokens = expression_tokens(arguments[0])
+    else:
+        tokens = [(arg, False) for arg in arguments]
+    if not tokens:
+        return "ALL", []
+    index = 0
+    filters = []
+    flags = set("ALL ANSWERED DELETED DRAFT FLAGGED NEW OLD RECENT SEEN UNANSWERED UNDELETED UNDRAFT UNFLAGGED UNSEEN".split())
+    strings = set("BCC BODY CC FROM SUBJECT TEXT TO".split())
+    dates = set("BEFORE ON SENTBEFORE SENTON SENTSINCE SINCE".split())
+
+    def take():
+        nonlocal index
+        if index == len(tokens):
+            criteria_error("missing search operand")
+        token = tokens[index]
+        index += 1
+        return token
+
+    def value():
+        text, quoted = take()
+        if not quoted and text in {"(", ")"}:
+            criteria_error("expected string operand")
+        return text
+
+    def quote(text):
+        if not text.isascii():
+            criteria_error("non-ASCII value requires conjunctive SUBJECT, FROM or TO")
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def key(depth=0, boolean=False):
+        if depth > 64:
+            criteria_error("criteria nesting exceeds 64")
+        text, quoted = take()
+        if quoted:
+            criteria_error("a quoted string cannot be a search key")
+        name = text.upper()
+        if name == "(":
+            parts = []
+            while index < len(tokens) and tokens[index] != (")", False):
+                parts.append(key(depth + 1, boolean))
+            if not parts or index == len(tokens):
+                criteria_error("empty or unclosed group")
+            take()
+            return "(" + " ".join(parts) + ")"
+        if name in {"OR", "NOT"}:
+            children = [key(depth + 1, True) for _ in range(2 if name == "OR" else 1)]
+            return name + " " + " ".join(children)
+        if name in flags:
+            return name
+        if name in strings:
+            text = value()
+            if not text.isascii() and name in {"SUBJECT", "FROM", "TO"}:
+                if boolean:
+                    criteria_error("Unicode header predicates under OR/NOT are unsupported; semantics would change")
+                filters.append((name, text.casefold()))
+                return "ALL"
+            return name + " " + quote(text)
+        if name == "HEADER":
+            field, text = value(), value()
+            if not re.fullmatch(r"[!-9;-~]+", field):
+                criteria_error("invalid HEADER field name")
+            return name + " " + quote(field) + " " + quote(text)
+        if name in dates:
+            text = value()
+            if not re.fullmatch(r"[0-9]{1,2}-[A-Za-z]{3}-[0-9]{4}", text):
+                criteria_error("date must be DD-Mon-YYYY")
+            return name + " " + text
+        if name in {"LARGER", "SMALLER"}:
+            text = value()
+            if not re.fullmatch(r"[0-9]+", text):
+                criteria_error("size must be a nonnegative integer")
+            return name + " " + text
+        if name in {"KEYWORD", "UNKEYWORD"}:
+            text = value()
+            if not re.fullmatch(r'[^(){} %*"\\\]\x00-\x20\x7f-\uffff]+', text):
+                criteria_error("keyword must be an IMAP atom")
+            return name + " " + text
+        sequence = value() if name == "UID" else text
+        if re.fullmatch(r"(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?(?:,(?:[1-9][0-9]*|\*)(?::(?:[1-9][0-9]*|\*))?)*", sequence):
+            return ("UID " if name == "UID" else "") + sequence
+        criteria_error("unknown search key or invalid operand")
+
+    parts = []
+    while index < len(tokens):
+        parts.append(key())
+    return " ".join(parts), filters
+
+
+class HTMLText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+        self.hidden = 0
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a" and not self.hidden:
+            href = dict(attrs).get("href") or ""
+            self.links.append(href if href.startswith(("http://", "https://")) else "")
+        if tag in {"style", "script", "head"}:
+            self.hidden += 1
+        elif tag in {"p", "div", "br", "tr", "li"} and not self.hidden:
+            self.text.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag == "a" and not self.hidden and self.links:
+            href = self.links.pop()
+            if href:
+                self.text.append(f" <{href}>")
+        if tag in {"style", "script", "head"}:
+            self.hidden = max(0, self.hidden - 1)
+        elif tag in {"p", "div", "tr", "li"} and not self.hidden:
+            self.text.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+
+
+def connect():
+    return load_account().imap_connection()
+
+
+def dec(s):
+    try:
+        return str(make_header(decode_header(s or "")))
+    except Exception:
+        return s or ""
+
+
+def body(msg):
+    """Plain text for both single-part and multipart mail, excluding attachments."""
+    parts = [p for p in msg.walk() if not p.is_multipart()
+             and p.get_content_disposition() != "attachment"]
+    for content_type in ("text/plain", "text/html"):
+        for part in parts:
+            if part.get_content_type() != content_type:
+                continue
+            text = (part.get_payload(decode=True) or b"").decode(
+                part.get_content_charset() or "utf-8", "replace")
+            if content_type == "text/html":
+                parser = HTMLText()
+                parser.feed(text)
+                text = "\n".join(line.strip() for line in "".join(parser.text).splitlines()
+                                 if line.strip())
+            return text
+    return ""
+
+
+class Attachment:
+    def __init__(self, index, filename, content_type, content):
+        self.index = index
+        self.filename = filename
+        self.content_type = content_type
+        self.content = content
+
+
+def safe_filename(name, index):
+    """A single path component: no separators, controls or leading dots; never empty."""
+    name = re.sub(r'[\x00-\x1f\x7f/\\]', '_', name.replace('\r', ' ').replace('\n', ' ')).strip()
+    name = name.lstrip('.').strip()
+    if len(name.encode()) > 200:
+        stem, dot, ext = name.rpartition('.')
+        ext = dot + ext if dot and len(ext) <= 16 else ''
+        name = (stem if dot else name).encode()[:200 - len(ext.encode())].decode('utf-8', 'ignore') + ext
+    return name or f'attachment-{index}'
+
+
+def attachments(msg):
+    """Parts a mail client shows as attachments, in MIME order, with unique safe filenames.
+
+    A part is an attachment when it has Content-Disposition: attachment or a filename and is
+    not the text body; attached messages (message/rfc822) are kept whole as .eml files.
+    """
+    found = []
+
+    def visit(part):
+        disposition = part.get_content_disposition()
+        raw_name = part.get_filename()
+        name = dec(raw_name) if raw_name else None
+        if part.get_content_type() == 'message/rfc822' and (disposition == 'attachment' or name):
+            inner = part.get_payload()
+            content = inner[0].as_bytes() if isinstance(inner, list) and inner else (part.get_payload(decode=True) or b'')
+            subject = dec(inner[0].get('Subject')) if isinstance(inner, list) and inner else ''
+            found.append((name or ((subject or 'message') + '.eml'), 'message/rfc822', content))
+            return
+        if part.is_multipart():
+            for child in part.get_payload():
+                visit(child)
+            return
+        if disposition == 'attachment' or name:
+            found.append((name or '', part.get_content_type(), part.get_payload(decode=True) or b''))
+
+    visit(msg)
+    result, used = [], set()
+    for index, (name, content_type, content) in enumerate(found, 1):
+        filename = safe_filename(name, index)
+        stem, dot, ext = filename.rpartition('.')
+        candidate, n = filename, 2
+        while candidate.casefold() in used:
+            candidate = f'{stem} ({n}).{ext}' if dot and stem else f'{filename} ({n})'
+            n += 1
+        used.add(candidate.casefold())
+        result.append(Attachment(index, candidate, content_type, content))
+    return result
+
+
+def save_attachments(found, directory):
+    """Write each attachment into directory; returns absolute paths.
+
+    Never overwrites: an existing file with identical bytes is reused, a different one is
+    an output-exists error raised before anything is written.
+    """
+    directory = os.path.realpath(directory)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as error:
+        raise MailIdentityError('output-unwritable', f'cannot create {directory}: {error.strerror}') from error
+    plan = []
+    for item in found:
+        path = os.path.join(directory, item.filename)
+        if os.path.lexists(path):
+            if not os.path.isfile(path) or os.path.islink(path):
+                raise MailIdentityError('output-exists', f'{path} exists and is not a regular file')
+            with open(path, 'rb') as existing:
+                if existing.read() != item.content:
+                    raise MailIdentityError('output-exists', f'{path} exists with different content')
+            plan.append((path, item, False))
+        else:
+            plan.append((path, item, True))
+    for path, item, write in plan:
+        if write:
+            try:
+                with open(path, 'xb') as out:
+                    out.write(item.content)
+            except OSError as error:
+                raise MailIdentityError('output-unwritable', f'cannot write {path}: {error.strerror}') from error
+    return [(path, item) for path, item, _ in plan]
+
+
+def usage(status=0):
+    stream = sys.stdout if status == 0 else sys.stderr
+    print("""Usage: mail-search folders
+       mail-search position FOLDER [--criteria EXPR]
+       mail-search search FOLDER [--after TOKEN] [--idle-after TOKEN --idle SECONDS] [IMAP-CRITERIA ...]
+       mail-search wait FOLDER --timeout SECONDS [--since SECONDS] [--after TOKEN] [IMAP-CRITERIA ...]
+       mail-search read FOLDER REFERENCE [REFERENCE ...]
+       mail-search attachments FOLDER REFERENCE --out DIR
+       mail-search move FOLDER DESTINATION REFERENCE [REFERENCE ...]
+
+Search and read Proton Mail through the local Bridge without changing message
+flags. References are UID, UIDVALIDITY:UID or FOLDER/UIDVALIDITY:UID (never
+sequence numbers).
+FOLDER "*" means every folder new mail can land in: INBOX, Spam, Archive and
+every user folder and label (Proton filters file mail straight into folders);
+Sent, Drafts, Trash, Starred and All Mail are left out, and a message in
+several of them (a label) is listed once, by Message-ID. With "*", read,
+attachments and move find each reference's folder from its UIDVALIDITY (each
+folder has its own); an explicit FOLDER whose UIDVALIDITY doesn't match a
+reference is looked up the same way.
+Search stdout is TSV: UID, date, from, subject, UIDVALIDITY:UID, Message-ID,
+folder.
+Use --criteria for one IMAP expression (nested OR/NOT/groups supported), or
+separate KEY VALUE arguments, or one argument holding a whole expression.
+String values are escaped by grammar position; expressions are never quoted
+as values. Non-ASCII SUBJECT/FROM/TO conjunctions are filtered locally;
+Unicode inside OR/NOT is an explicit invalid-criteria error.
+Position prints "# next=TOKEN" using STATUS only, without searching messages.
+Search --after TOKEN searches only UIDs above that position, up to its starting
+STATUS snapshot; unchanged folders are not searched. A changed UIDVALIDITY or
+missing folder position is an explicit error: arrival cannot be inferred safely.
+Search also prints "# next=TOKEN" (the folder's position before searching:
+UIDVALIDITY:UID for one folder, an opaque token for "*").
+With --idle-after TOKEN --idle SECONDS it first waits (IMAP IDLE) until a
+message newer than TOKEN arrives or SECONDS pass, then searches; a folder
+already past TOKEN searches at once.
+Wait prints the matching messages that arrive within --timeout (and, with
+--since, matches received up to that many seconds before the call), or, if
+none, "# wait: timed-out; after=TOKEN" to continue from.
+Read ends with an Attachments section (name, type, decoded bytes).
+Attachments saves every attachment of one message into DIR (created if
+missing, never overwritten) and prints TSV: path, bytes, type, filename.
+A message without attachments is a no-attachments error.
+Move is the only command that changes a mailbox: it moves the referenced
+messages (all must exist, all with the folder's current UIDVALIDITY) to
+DESTINATION, which must be an existing folder (else a folder-missing error), and
+prints TSV: reference, destination.""", file=stream)
+    raise SystemExit(status)
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        usage()
+    if len(sys.argv) < 2:
+        usage(64)
+    mode = sys.argv[1]
+    if mode == "folders":
+        if len(sys.argv) != 2:
+            usage(64)
+    elif mode == "read":
+        if len(sys.argv) < 4:
+            usage(64)
+    elif mode in {"position", "search", "wait"}:
+        if len(sys.argv) < 3:
+            usage(64)
+    elif mode == "move":
+        if len(sys.argv) < 5:
+            usage(64)
+        for reference in sys.argv[4:]:
+            parse_reference(reference.rpartition("/")[2])
+    elif mode == "attachments":
+        if len(sys.argv) != 6 or sys.argv[4] != "--out" or not sys.argv[5]:
+            usage(64)
+        parse_reference(sys.argv[3].rpartition("/")[2])
+    else:
+        usage(64)
+
+    after, idle, wait, criteria = None, None, {"timeout": None, "after": None, "since": 0}, sys.argv[3:]
+    while criteria and criteria[0] in {"--idle", "--idle-after", "--timeout", "--after", "--since"} and len(criteria) > 1:
+        option, value, criteria = criteria[0], criteria[1], criteria[2:]
+        if option == "--idle-after" and mode == "search":
+            idle = (value, idle[1] if idle else None)
+        elif option == "--idle" and mode == "search" and re.fullmatch(r"[1-9][0-9]{0,3}", value):
+            idle = (idle[0] if idle else None, int(value))
+        elif option == "--timeout" and mode == "wait" and re.fullmatch(r"[1-9][0-9]{0,3}", value):
+            wait["timeout"] = int(value)
+        elif option == "--since" and mode == "wait" and re.fullmatch(r"[0-9]{1,4}", value):
+            wait["since"] = int(value)
+        elif option == "--after" and mode == "wait":
+            wait["after"] = value
+        elif option == "--after" and mode == "search":
+            after = value
+        else:
+            usage(64)
+    if mode == "wait" and wait["timeout"] is None:
+        usage(64)
+    if idle is not None and (idle[0] is None or idle[1] is None):
+        usage(64)
+    plan = search_criteria(criteria) if mode in {"position", "search", "wait"} else None
+    m = connect()
+    if mode == "folders":
+        for f in m.list()[1]:
+            print(f.decode())
+        return
+    box = sys.argv[2]
+    if mode in {"read", "attachments", "move"}:
+        references = sys.argv[3:] if mode == "read" else [sys.argv[3]] if mode == "attachments" else sys.argv[4:]
+        groups = locate(m, box, references)
+        if mode == "move":
+            for folder, refs in groups:
+                move_messages(m, folder, sys.argv[3], refs, select(m, folder, readonly=False))
+        elif mode == "read":
+            for folder, refs in groups:
+                validity = select(m, folder)
+                for reference in refs:
+                    print_message(m, folder, reference, validity)
+        else:
+            folder, (reference,) = groups[0]
+            validity = select(m, folder)
+            content = fetch_message(m, reference, validity, "BODY.PEEK[]")
+            m.logout()
+            found = attachments(email.message_from_bytes(content))
+            if not found:
+                raise MailIdentityError("no-attachments", f"Message {validity}:{reference.split(':')[-1]} has no attachments")
+            saved = save_attachments(found, sys.argv[5])
+            print(f"# {folder} {validity}:{reference.split(':')[-1]}: {len(saved)} attachments; columns=path,bytes,type,filename", file=sys.stderr)
+            for path, item in saved:
+                print(f"{path}\t{len(item.content)}\t{item.content_type}\t{item.filename}")
+            return
+        m.logout()
+        return
+    crit, header_filters = plan
+    folders = arrival_folders(m) if box == ALL else [box]
+    columns = "columns=UID,date,from,subject,UIDVALIDITY:UID,Message-ID,folder"
+    if mode == "position":
+        print(f"# next={encode_positions(box, folder_positions(m, folders))}")
+        m.logout()
+        return
+    if mode == "search":
+        if idle is not None:
+            if box == ALL:
+                idle_until_moved(m, folders, decode_positions(idle[0]), idle[1])
+            else:
+                idle_until_new(m, select(m, box), idle[1], idle[0])
+        # EXAMINE already returns UIDNEXT and UIDVALIDITY; ordinary searches need no STATUS round trips.
+        positions = folder_positions(m, folders) if after is not None else {}
+        bounds = None
+        if after is not None:
+            previous = decode_positions(after) if box == ALL else {box: parse_position(after)}
+            for folder in folders:
+                if folder not in previous:
+                    raise MailIdentityError("folder-position-missing", f"No scheduled UID position for {folder}; arrival cannot be determined")
+                if previous[folder][0] != positions[folder][0]:
+                    raise MailIdentityError("uidvalidity-changed", f"Folder identity changed in {folder}; arrival since the scheduled UID position cannot be determined")
+            bounds = {f: (positions[f][0], int(previous[f][1]) + 1, int(positions[f][1]))
+                      for f in folders if int(previous[f][1]) < int(positions[f][1])}
+        rows = search_folders(m, folders, crit, header_filters, None, bounds, positions if after is None else None)
+        print(f"# {box}: {len(rows)} hits for {crit!r} in {', '.join(folders)}; identity=IMAP-UID; {columns}", file=sys.stderr)
+        print(f"# next={encode_positions(box, positions)}", file=sys.stderr)
+        print_rows(rows)
+        m.logout()
+        return
+    deadline = time.monotonic() + wait["timeout"]
+    now = folder_positions(m, folders)
+    after = {}
+    if wait["after"] and box != ALL:
+        after = {box: parse_position(wait["after"])}
+    elif wait["after"] and wait["after"].startswith("F"):
+        after = decode_positions(wait["after"])
+    elif wait["after"]:  # one folder's UIDVALIDITY:UID, e.g. from a single-folder wait: its folder is the one with that UIDVALIDITY
+        (folder, (reference,)), = locate(m, ALL, [wait["after"]])
+        after = {folder: parse_reference(reference)}
+    baseline = {f: after[f] if f in after and after[f][0] == now[f][0] else now[f] for f in folders}
+    recent_since = time.time() - wait["since"] if wait["since"] else None
+    first = True
+    while True:
+        # A folder whose UIDVALIDITY changed mid-wait starts again from its newest message.
+        baseline.update({f: now[f] for f in folders if now[f][0] != baseline[f][0]})
+        # Once any folder moved past its baseline (or at once, when --since looks back) every folder is searched above its
+        # baseline, so a labelled message whose folder copy the sweep hadn't seen yet is still reported in its folder.
+        moved = first and recent_since is not None or any(int(now[f][1]) > int(baseline[f][1]) for f in folders)
+        first = False
+        rows = search_folders(m, folders, crit, header_filters, {f: (int(baseline[f][1]), recent_since) for f in folders}) if moved else []
+        if rows:
+            print(f"# {box}: {len(rows)} new for {crit!r}; identity=IMAP-UID; {columns}", file=sys.stderr)
+            print_rows(rows)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"# wait: timed-out; after={encode_positions(box, baseline)}", file=sys.stderr)
+            break
+        if box == ALL:
+            now = idle_until_moved(m, folders, now, remaining)
+        else:
+            idle_until_new(m, select(m, box), remaining, int(now[box][1]))
+            now = folder_positions(m, folders)
+    m.logout()
+
+
+# Mailboxes new mail never arrives in, or that only repeat mail held elsewhere: by special-use flag, and by name for servers without them.
+SKIP_FLAGS = {"\\noselect", "\\nonexistent", "\\sent", "\\drafts", "\\trash", "\\all", "\\flagged"}
+SKIP_NAMES = {"sent", "sent items", "sent mail", "sent messages", "drafts", "trash", "deleted items", "deleted messages", "all mail", "starred", "important"}
+SWEEP_SECONDS = 10
+
+
+def select(m, box, readonly=True):
+    """EXAMINE (or SELECT, for a move) a folder and return its UIDVALIDITY."""
+    try:
+        typ, _ = m.select(quote_box(box), readonly=readonly)
+    except imaplib.IMAP4.error as error:
+        raise MailIdentityError("folder-missing", f"cannot EXAMINE {box}") from error
+    if typ != "OK":
+        raise MailIdentityError("folder-missing", f"cannot EXAMINE {box}")
+    return uidvalidity(m)
+
+
+def folder_names(m):
+    """Every folder name the server lists."""
+    return [name for name, _ in listed_folders(m)]
+
+
+def arrival_folders(m):
+    """Every folder new mail can land in, INBOX first, then user folders, other mailboxes (Spam, Archive) and labels last,
+    so a labelled message is reported in its real folder."""
+    names = [name for name, flags in listed_folders(m)
+             if not flags & SKIP_FLAGS and name.lower().rsplit("/", 1)[-1] not in SKIP_NAMES]
+    rank = lambda name: (0 if name.upper() == "INBOX" else 1 if name.startswith("Folders/") else 3 if name.startswith("Labels/") else 2, name)
+    return sorted(names, key=rank)
+
+
+def encode_positions(box, positions):
+    """One folder's position is UIDVALIDITY:UID; the "*" position of many folders is one opaque token."""
+    if box != ALL:
+        return ":".join(positions[box])
+    return "F" + base64.urlsafe_b64encode(json.dumps({f: ":".join(p) for f, p in positions.items()}, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def decode_positions(token):
+    try:
+        if not token.startswith("F"):
+            raise ValueError
+        raw = json.loads(base64.urlsafe_b64decode(token[1:] + "=" * (-len(token[1:]) % 4)))
+        return {folder: parse_position(value) for folder, value in raw.items()}
+    except (ValueError, TypeError, AttributeError) as error:
+        raise MailIdentityError("invalid-reference", "a position for folder \"*\" is the after or next token an earlier \"*\" wait or search printed") from error
+
+
+def idle_until_moved(m, folders, known, seconds):
+    """Waits until any folder moved past `known` ({folder: (validity, uid)}; a folder not in it counts as moved once it
+    holds mail) or `seconds` pass, and returns the positions. IDLE on the all-mail folder, which every arriving message
+    enters wherever filters file it, wakes it at once; a STATUS sweep every SWEEP_SECONDS covers servers without one."""
+    listed = listed_folders(m)
+    watch = next((name for name, flags in listed if "\\all" in flags), None) or folders[0]
+    select(m, watch)
+    deadline = time.monotonic() + seconds
+    while True:
+        now = folder_positions(m, folders)
+        if any(f not in known and now[f][1] != "0" or f in known and (now[f][0] != known[f][0] or int(now[f][1]) > int(known[f][1])) for f in folders):
+            return now
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return now
+        if "IDLE" not in m.capabilities:
+            time.sleep(min(remaining, POLL_WITHOUT_IDLE))
+            continue
+        with m.idle(duration=min(remaining, SWEEP_SECONDS)) as idler:
+            for typ, _ in idler:
+                if typ == "EXISTS":
+                    break
+
+
+def search_folders(m, folders, crit, header_filters, newer, bounds=None, positions=None):
+    """[(folder, validity, uid, header, fields)] across folders; a message (by Message-ID) is listed in the first folder only."""
+    rows, seen = [], set()
+    for folder in folders:
+        if bounds is not None and folder not in bounds:
+            continue
+        validity = select(m, folder)
+        if positions is not None:
+            _, values = m.response("UIDNEXT")
+            if not values or len(values) != 1 or not isinstance(values[0], bytes) or not re.fullmatch(rb"[1-9][0-9]*", values[0]):
+                raise MailIdentityError("missing-uidnext", f"EXAMINE {folder} did not supply a valid UIDNEXT")
+            positions[folder] = (validity, str(int(values[0]) - 1))
+        if bounds is not None and validity != bounds[folder][0]:
+            raise MailIdentityError("uidvalidity-changed", f"Folder identity changed while searching {folder}; retry from STATUS")
+        for uid, h, fields in matching_rows(m, validity, folder, crit, header_filters, newer[folder] if newer else None, bounds[folder][1:] if bounds is not None else None):
+            message_id = (h.get("Message-ID") or "").strip()
+            if message_id and message_id in seen:
+                continue
+            seen.add(message_id)
+            rows.append((folder, validity, uid, h, fields))
+    return rows
+
+
+def print_message(m, folder, reference, validity):
+    content = fetch_message(m, reference, validity, "BODY.PEEK[]")
+    msg = email.message_from_bytes(content)
+    uid = reference.split(":")[-1]
+    print(f"===== {validity}:{uid}\tFrom: {dec(msg.get('From'))}\tDate: {msg.get('Date','')}")
+    print(f"Message-ID: {msg.get('Message-ID', '')}")
+    print(f"Folder: {folder}")
+    print(f"To: {dec(msg.get('To'))}")
+    print(f"Subject: {dec(msg.get('Subject'))}\n")
+    print(body(msg))
+    found = attachments(msg)
+    if found:
+        print(f"\nAttachments ({len(found)}):")
+        for item in found:
+            print(f"- {item.filename}\t{item.content_type}\t{len(item.content)} bytes")
+
+
+def move_messages(m, box, destination, references, validity):
+    """UID MOVE the referenced messages of the selected folder to an existing folder; prints reference and destination."""
+    if destination not in folder_names(m):
+        raise MailIdentityError("folder-missing", f"no folder {destination}; folders: {', '.join(folder_names(m))}")
+    uids = []
+    for reference in references:
+        expected, uid = parse_reference(reference)
+        if expected is not None and expected != validity:
+            raise MailIdentityError("uidvalidity-changed", "Mailbox identity changed; find the message again by Message-ID")
+        uids.append(uid)
+    typ, data = m.uid("SEARCH", None, "UID " + ",".join(uids))
+    present = set(data[0].split()) if typ == "OK" and data and data[0] else set()
+    missing = [uid for uid in uids if uid.encode() not in present]
+    if missing:
+        raise MailIdentityError("message-missing", f"no message with UID {', '.join(missing)} in {box}")
+    qdest = '"' + destination.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    typ, data = m.uid("MOVE", ",".join(uids), qdest)
+    if typ != "OK":
+        raise MailIdentityError("move-failed", f"UID MOVE to {destination} failed: {data}")
+    for uid in uids:
+        print(f"{validity}:{uid}\t{destination}")
+
+
+IDLE_PERIOD = 300
+POLL_WITHOUT_IDLE = 10
+
+
+def highest_uid(m):
+    """The newest message's UID (0 for an empty folder): a single cheap UID SEARCH on the selected folder."""
+    typ, data = m.uid("SEARCH", None, "UID *")
+    if typ != "OK" or not data or not isinstance(data[0], bytes):
+        raise MailIdentityError("search-failed", "UID SEARCH UID * failed")
+    return max((int(uid) for uid in data[0].split()), default=0)
+
+
+def idle_until_new(m, validity, seconds, known=None):
+    """Returns once the selected folder has a message newer than `known` (default: the newest now), or `seconds` pass.
+
+    `known` may be a TOKEN (VALIDITY:UID) from an earlier search: when the folder already moved past it, this returns at once,
+    so mail that arrived between two calls is never waited out. IDLE when the server offers it, else a short poll.
+    """
+    if isinstance(known, str):
+        validity_seen, _, uid = known.partition(":")
+        if validity_seen != validity or not uid.isdigit():
+            return
+        known = int(uid)
+    deadline = time.monotonic() + seconds
+    while True:
+        newest = highest_uid(m)
+        if known is None:
+            known = newest
+        if newest > known:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        if "IDLE" not in m.capabilities:
+            time.sleep(min(remaining, POLL_WITHOUT_IDLE))
+            continue
+        with m.idle(duration=min(remaining, IDLE_PERIOD)) as idler:
+            for typ, _ in idler:
+                if typ == "EXISTS":
+                    break
+
+
+def matching_uids(m, validity, box, crit, bounds=None):
+    try:
+        scope = None
+        if bounds is not None:
+            # Resolve the finite range first: never use N:* (IMAP reverses it when N is beyond the newest UID).
+            typ, data = m.uid("SEARCH", None, f"UID {bounds[0]}:{bounds[1]}")
+            if typ != "OK" or not data or not isinstance(data[0], bytes):
+                raise MailIdentityError("search-failed", "UID SEARCH range failed")
+            scope = {int(uid) for uid in data[0].split() if bounds[0] <= int(uid) <= bounds[1]}
+            if not scope:
+                return []
+        try:
+            local = mail_headers.search(m, validity, box, expression_tokens(crit), lambda why: MailIdentityError("search-failed", why), scope)
+        except (sqlite3.Error, OSError) as error:
+            raise MailIdentityError("search-cache-unavailable", "local mail search cache is unavailable; no server content scan was started") from error
+        if local is not None:
+            return sorted(local)
+        expression = f"UID {bounds[0]}:{bounds[1]} ({crit})" if bounds is not None else crit
+        typ, data = m.uid("SEARCH", None, expression)
+        if typ != "OK" or not data or not isinstance(data[0], bytes):
+            raise MailIdentityError("search-failed", "UID SEARCH failed")
+        return sorted(int(uid) for uid in data[0].split() if scope is None or int(uid) in scope)
+    except imaplib.IMAP4.error as error:
+        raise MailIdentityError("search-rejected", "server rejected UID SEARCH criteria") from error
+
+
+def matching_rows(m, validity, box, crit, header_filters, newer, bounds=None):
+    """Header rows of the newest 400 matches; with newer=(uid, since) only those above uid or received at or after since."""
+    uids = matching_uids(m, validity, box, crit, bounds)
+    if newer is not None:
+        baseline, since = newer
+        older = [uid for uid in uids if uid <= baseline]
+        uids = [uid for uid in uids if uid > baseline]
+        if since is not None and older:
+            dates = received_at(m, validity, older[-50:])
+            uids = sorted(set(uids) | {uid for uid in older[-50:] if dates.get(uid, 0) >= since})
+    rows = []
+    wanted = [str(uid) for uid in uids[-400:]]
+    contents = fetch_messages(m, wanted, validity, "BODY.PEEK[HEADER.FIELDS (DATE FROM TO SUBJECT MESSAGE-ID)]")
+    for uid in wanted:
+        if uid not in contents:
+            print(f"# message-missing: Message {validity}:{uid} is absent; find it again by Message-ID", file=sys.stderr)
+            continue
+        h = email.message_from_bytes(contents[uid])
+        fields = {name: dec(h.get(name.title())) for name in ("SUBJECT", "FROM", "TO")}
+        if any(value not in fields[key].casefold() for key, value in header_filters):
+            continue
+        rows.append((uid, h, fields))
+    return rows
+
+
+def received_at(m, validity, uids):
+    """{uid: INTERNALDATE as epoch seconds} for those of `uids` still in the folder."""
+    if not uids:
+        return {}
+    typ, data = m.uid("FETCH", ",".join(map(str, uids)), "(UID INTERNALDATE)")
+    if typ != "OK":
+        raise MailIdentityError("fetch-failed", f"UID FETCH INTERNALDATE failed in {validity}")
+    found = {}
+    for line in data or []:
+        if not isinstance(line, bytes):
+            continue
+        uid, date = re.search(rb"\bUID ([0-9]+)", line), re.search(rb'INTERNALDATE "([^"]+)"', line)
+        if uid and date:
+            found[int(uid[1])] = datetime.strptime(date[1].decode().strip(), "%d-%b-%Y %H:%M:%S %z").timestamp()
+    return found
+
+
+def print_rows(rows):
+    for folder, validity, uid, h, fields in rows:
+        row = [uid, h.get('Date', ''), fields['FROM'], fields['SUBJECT'], f"{validity}:{uid}", h.get('Message-ID', ''), folder]
+        print("\t".join(str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ") for value in row))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except MailIdentityError as error:
+        raise SystemExit(str(error))

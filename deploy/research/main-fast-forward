@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuse history rewinds on research remotes.
+# usage (git): main-fast-forward REF OLD NEW
+[ "$1" = refs/heads/main ] || exit 0
+zero=0000000000000000000000000000000000000000
+[ "$2" != "$zero" ] || exit 0
+if [ "$3" = "$zero" ]; then echo "main_rewrite_refused: main of $(basename "$(pwd)") cannot be deleted" >&2; exit 1; fi
+if ! git merge-base --is-ancestor "$2" "$3"; then
+  echo "main_rewrite_refused: $(basename "$(pwd)") main only moves forward, and $3 does not contain $2 (an amended or rebased published commit). Fetch origin, rebase your work onto origin/main and push that; to change published history, ask the owner" >&2
+  exit 1
+fi

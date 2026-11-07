@@ -1,0 +1,235 @@
+/* Organized layout (web/organized), loaded with its chunk. Colours: Carol's preferences.md, precomputed #RRGGBBAA only. */
+.organized{--page:#0e0f0e;--text:#eef1ee;--meta:#a3aba5;height:100dvh;display:flex;flex-direction:column;background:var(--page);color:var(--text);font-family:Roboto,"Segoe UI",system-ui,sans-serif;font-size:16px;padding-top:env(safe-area-inset-top)}
+.organized button{font:inherit}
+.org-screen{flex:1;display:flex;flex-direction:column;min-height:0;position:relative}
+.org-head{display:flex;align-items:center;gap:8px;padding:14px 16px 6px 20px;min-height:60px}
+.org-head h1{font-size:22px;font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0}
+.org-back,.org-icon{background:transparent;border:0;color:#cfd6cf;font-size:24px;min-width:44px;min-height:44px;padding:0;border-radius:12px}
+.org-back{margin-left:-12px;font-size:28px}
+.org-count{background:#eef1ee;color:#0e0f0e;border-radius:10px;padding:2px 9px;font-weight:800;font-size:15px}
+.org-link{margin-left:auto;background:transparent;border:0;color:#a3aba5;text-transform:none;letter-spacing:0;font-size:14px;min-height:44px;padding:0 4px}
+.org-hint{margin:6px 20px;color:#a3aba5;font-size:14px}
+.org-pop{position:fixed;z-index:6;overscroll-behavior:contain;display:flex;flex-direction:column;min-width:200px;background:#161816;border:1px solid #2a2e2b;border-radius:12px;padding:6px;box-shadow:0 12px 30px #000c}
+.org-pop button{flex:none;background:transparent;border:0;text-align:left;padding:10px 12px;min-height:44px;color:var(--text);border-radius:8px}
+.org-pop button:hover,.org-item:hover{background:#232523}
+.org-open{flex:1;min-width:0;display:flex;align-items:center;gap:12px;background:transparent;border:0;padding:10px 4px 10px 10px;color:var(--text);text-align:left;border-radius:12px}
+.org-tile{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-size:18px;flex:none}
+.org-body{flex:1;min-width:0;display:flex;flex-direction:column}
+.org-body .t{font-size:16px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.org-body .m{font-size:14px;color:var(--text);opacity:.82;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.org-body .t:has(.tt){display:flex;align-items:center;min-width:0}
+.org-body .t .tt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.org-body .t.ur{font-weight:700}
+.org-unread{flex:none;margin-left:6px;font-size:12.5px;line-height:1;font-weight:400}
+/* Pinned projects as compact chips that wrap onto as many lines as they need, never a sideways row (Carol 2026-10-28). */
+.org-pins{display:flex;flex-wrap:wrap;gap:6px;margin:0 16px}
+.org-pin{flex:1 1 130px;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:1px;text-align:left;border:0;border-left:3px solid;border-radius:10px;padding:6px 10px;min-height:0;color:var(--text)}
+.org-pin .t{font-size:14px;font-weight:500;display:flex;align-items:baseline;gap:4px;min-width:0;overflow-wrap:anywhere}
+.org-nav-pin .tt{flex:1;min-width:0}
+.org-pin .m{font-size:12px;color:var(--text);opacity:.85}
+.organized:not(.wide) .org-pins{gap:8px}
+.organized:not(.wide) .org-pin{flex:1 1 150px;border-left-width:4px;border-radius:12px;padding:10px 12px;min-height:48px;justify-content:center;gap:2px}
+.organized:not(.wide) .org-pin .t{font-size:16px}
+.org-pins .org-pin .t,.org-pins .org-pin .t .tt{white-space:normal;overflow:visible;overflow-wrap:anywhere}
+.organized:not(.wide) .org-pin .m{font-size:13px}
+.org-home-foot{padding:8px 16px 4px}
+.org-quick{display:flex;gap:10px;align-items:center}
+.org-quick button{flex:1;display:flex;align-items:center;gap:8px;border:1px solid #262a27;border-radius:12px;padding:10px 12px;min-height:48px;background:#131513;color:#e3e7e3;font-size:15px}
+.org-quick b{margin-left:auto;font-size:13px;color:#a3aba5;font-weight:500}
+.org-footline{margin:10px 4px 0;font-size:13px;color:#a3aba5}
+.org-tabs{display:flex;border-top:1px solid #1d201e;background:var(--page);padding-bottom:env(safe-area-inset-bottom)}
+.org-tabs button{flex:1;min-height:56px;background:transparent;border:0;color:#a3aba5;font-size:15px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:0}
+.org-tabs [aria-current=page]{color:var(--text);font-weight:700}
+.org-tabs .org-unread{margin-left:0}
+.org-n{font-size:12px;background:#2a2e2b;color:#e3e7e3;border-radius:8px;padding:0 6px}
+.org-seg{display:flex;gap:4px;margin:4px 16px 0;border-bottom:1px solid #1d201e;overflow-x:auto}
+.org-seg button{background:transparent;border:0;border-bottom:2px solid transparent;border-radius:0;color:#a3aba5;padding:10px 8px;min-height:44px;font-size:15px;white-space:nowrap}
+.org-seg [aria-selected=true]{color:var(--text);border-bottom-color:var(--text);font-weight:600}
+.org-sheet{position:fixed;top:0;right:0;bottom:0;z-index:21;width:min(320px,88vw);background:#161816;border-left:1px solid #2a2e2b;padding:max(18px,env(safe-area-inset-top)) 14px max(14px,env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:2px;overflow:auto}
+.org-who{display:flex;align-items:center;gap:10px;padding:6px 8px 16px;border-bottom:1px solid #262a27;margin-bottom:8px}
+.org-who>div{flex:1;min-width:0}
+.org-who small{display:block;color:#a3aba5;font-size:13px}
+.org-avatar{width:40px;height:40px;border-radius:50%;background:#4d6123;display:grid;place-items:center;font-weight:700}
+.org-label{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#9aa39c;padding:6px 10px 2px;margin:0;font-weight:600}
+.org-switch{display:flex;background:#0e0f0e;border-radius:10px;padding:3px;margin:2px 10px 10px}
+.org-switch button{flex:1;background:transparent;border:0;padding:8px 0;min-height:44px;color:#a3aba5;border-radius:8px;font-size:15px}
+.org-switch [aria-checked=true]{background:#eef1ee;color:#0e0f0e;font-weight:700}
+.org-item,.org-sheet>button,.org-nav-menu>button{display:flex;align-items:center;gap:12px;width:100%;background:transparent;border:0;text-align:left;padding:12px 10px;min-height:48px;border-radius:10px;color:#e6ebe6;font-size:16px}
+.org-item small{margin-left:auto;font-size:13px;color:#a3aba5}
+.org-sheet hr,.org-nav-menu hr{border:0;border-top:1px solid #262a27;margin:8px 0;width:100%}
+.org-tip{left:16px;right:16px;transform:none;max-width:none;padding:10px 6px 10px 14px}
+.org-tip span{white-space:normal;overflow:visible;flex:1;line-height:1.35}
+.organized.wide .org-tip{left:auto;right:24px;bottom:24px;width:min(440px,calc(100vw - 48px))}
+.org-shared{font-size:12px;color:#a3aba5;border:1px solid #2a2e2b;border-radius:6px;padding:1px 6px}
+.org-menu-anchor{position:relative}
+.org-full{background:var(--page)}
+.org-topic .transcript,.org-full .panel{flex:1}
+.organized .message.human{background:#4d6123;border-color:#7fa538}
+.organized .composer{background:#131513;border-color:#262a27}
+.org-nav{display:flex;flex-direction:column;gap:2px;flex:none;border-right:1px solid #1d201e;padding:14px 10px;overflow:auto}
+.org-nav>button{background:transparent;border:0;text-align:left;padding:10px;min-height:44px;border-radius:10px;color:#e6ebe6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.org-nav>button[aria-current=page]{background:#232523;font-weight:600}
+.org-nav>.org-nav-pin{display:flex;align-items:center}
+.org-nav-pin .tt{overflow:hidden;text-overflow:ellipsis}
+.org-nav .org-h{margin:16px 10px 4px}
+.org-nav-menu{margin-top:auto}
+.organized.wide{flex-direction:row}
+.organized.wide .org-row.on{box-shadow:inset 0 0 0 2px #f3f3f3}
+.org-list{flex:none;display:flex;flex-direction:column;border-right:1px solid #1d201e;min-height:0;position:relative}
+.org-detail{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0}
+.organized .org-divider{position:relative;flex:none;margin:0 -6px}
+@media(prefers-reduced-motion:reduce){.organized *{transition:none!important;animation:none!important}}
+/* Stacking order (Carol 2026-10-22: the now-line drew over the new-event sheet): the calendar grid is its own stacking
+   context (isolation) with layers 1–3 (event, now-line, dragged event); page controls stay below 20; overlays are
+   scrim 20, side sheet 21, bottom sheet 22, toast 30. home.test.ts checks this. */
+.org-cal{flex:1;display:flex;flex-direction:column;min-height:0;position:relative}
+.org-cal-switch{margin:4px 16px 0}
+.org-cal-nav{display:flex;align-items:center;gap:4px;margin:8px 10px 4px}
+.org-cal-nav strong{flex:1;font-size:17px;text-align:center}
+.org-wk-head{display:grid;margin:0 8px}
+.org-wk-head button{background:transparent;border:0;color:#a3aba5;font-size:12px;padding:4px 0;min-height:48px;border-radius:10px}
+.org-wk-head b{display:block;font-size:16px;color:#eef1ee}
+.org-wk-head .on b{background:#eef1ee;color:#0e0f0e;border-radius:50%;width:28px;height:28px;line-height:28px;margin:2px auto 0}
+.org-allday{display:flex;flex-wrap:wrap;gap:4px;margin:4px 12px 4px 56px}
+.org-allday button{font-size:13px;border:0;border-left:3px solid;border-radius:6px;padding:4px 8px;min-height:32px;color:#f3f3f3;text-align:left}
+.org-allday small{color:#cfd6cf}
+.org-hours{flex:1;overflow:auto;isolation:isolate;touch-action:pan-y;margin:4px 8px 0;overscroll-behavior:contain}
+.org-hours-in{position:relative}
+.org-hours .hr{position:absolute;left:0;right:0;border-top:1px solid #1d201e;font-size:12px;color:#a3aba5}
+.org-hours .hr span{display:block;width:44px;padding-top:2px;white-space:nowrap;overflow:hidden;text-overflow:clip}
+.org-hours .ev{position:absolute;border:0;border-left:3px solid;border-radius:8px;padding:3px 6px;font-size:13px;overflow:hidden;color:#f3f3f3;line-height:1.25;text-align:left;display:block;z-index:1;overflow-wrap:break-word}
+.org-hours .ev small{color:#cfd6cf}
+.org-hours .ev{user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.org-hours .ev.ghosted{opacity:.35}
+.org-hours .ev.lifted{z-index:3;pointer-events:none;box-shadow:0 10px 24px #000d;transform:scale(1.02);transform-origin:top left}
+.org-hours .ev.wk{min-height:0;border-left-width:2px;border-radius:4px;padding:2px 3px;font-size:11px;line-height:13px;font-weight:500;box-shadow:0 0 0 1px var(--page)}
+.org-hours .ev.wk .t{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;text-overflow:ellipsis}
+.org-hours .ev.wk .t.one{display:block;white-space:nowrap}
+.org-hours .ev.wk small{display:block;font-size:11px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.org-hours .grip{position:absolute;left:0;right:0;bottom:0;height:12px;cursor:ns-resize}
+@media(pointer:fine){.org-hours .ev{cursor:grab}}
+.org-hours .today{position:absolute;top:0;bottom:0;background:#ffffff08}
+.org-hours .now{position:absolute;height:2px;background:#e83a3a;z-index:2;pointer-events:none}
+.org-hours .now::before{content:'';position:absolute;left:-5px;top:-4px;width:10px;height:10px;border-radius:50%;background:#e83a3a}
+.org-mo{display:grid;grid-template-columns:repeat(7,1fr);margin:6px 10px 0;overflow:auto;flex:1;align-content:start}
+.org-mo .h{font-size:12px;color:#a3aba5;text-align:center;padding:6px 0}
+.org-mo .c{cursor:pointer;min-height:72px;background:transparent;border:0;border-top:1px solid #1d201e;border-radius:0;padding:5px 1px 2px;color:#dfe3df;font-size:14px;display:flex;flex-direction:column;align-items:stretch;gap:2px;overflow:hidden}
+.org-mo .c.o{color:#5d645f}
+.org-mo .c>span:first-child{align-self:center}
+.org-mo .c.on>span:first-child{background:#eef1ee;color:#0e0f0e;border-radius:50%;padding:2px 7px;font-weight:700}
+.org-mo .c i{display:block;border-left:2px solid;border-radius:4px;font-size:11px;font-style:normal;padding:1px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#f3f3f3;text-align:left}
+.org-mo .c i.more{border:0;color:#a3aba5}
+.org-zoom{position:absolute;left:12px;bottom:max(12px,env(safe-area-inset-bottom));display:flex;gap:6px;z-index:3}
+@media(pointer:coarse){.org-zoom{display:none}}
+.org-ev-title{display:flex;align-items:center;gap:10px}
+.org-ev-title h2{margin:0;font-size:20px}
+.org-ev-title .dot{width:14px;height:14px;border-radius:4px;flex:none}
+.org-ev-line{margin:8px 0 0 24px;color:#dfe3df}
+.org-ev-notes{white-space:pre-wrap;color:#a3aba5}
+.org-ev-form .org-ev-name{font-size:20px;border:0;border-bottom:1px solid #3d403d;border-radius:0;background:transparent;padding-left:2px}
+.org-ev-row{display:flex;align-items:center;gap:8px;min-height:44px;flex-wrap:wrap}
+.org-ev-row>span{width:56px;color:#a3aba5}
+.org-ev-row input[type=checkbox]{width:22px;height:22px;accent-color:#7fa538;margin-left:auto}
+.org-ev-row input[type=time]{width:132px;padding:10px 8px}
+.org-ev-form label.org-ev-row{flex-direction:row;gap:8px}
+.org-date{background:#0e0f0e;border:1px solid #2a2e2b;border-radius:10px;padding:8px 12px;min-height:44px;color:#eef1ee;font-size:16px}
+.org-dp-pop{width:100%}
+.org-ev-colors{display:flex;gap:10px;flex-wrap:wrap}
+.org-ev-colors button{width:36px;height:36px;min-height:36px;border-radius:50%;border:2px solid transparent;padding:0;min-width:36px;flex:none}
+.org-ev-colors [aria-checked=true]{border-color:#eef1ee;box-shadow:0 0 0 2px #0e0f0e inset}
+.org-dp{margin:4px 0}
+.org-dp-nav{display:flex;align-items:center}
+.org-dp-nav strong{flex:1;text-align:center;font-size:16px}
+.org-dp-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
+.org-dp-grid span{font-size:12px;color:#a3aba5;padding:4px 0}
+.org-dp-grid button{background:transparent;border:0;color:#eef1ee;min-height:44px;border-radius:50%;font-size:16px;aspect-ratio:1;max-height:48px;justify-self:center;width:100%;max-width:48px;padding:0}
+.org-dp-grid .o{color:#5d645f}
+.org-dp-grid .t{box-shadow:inset 0 0 0 1px #7fa538}
+.org-dp-grid [aria-pressed=true]{background:#eef1ee;color:#0e0f0e;font-weight:700}
+.org-emoji{display:grid;grid-template-columns:repeat(auto-fill,minmax(48px,1fr));gap:4px}
+.org-emoji button{background:transparent;border:0;font-size:26px;min-height:48px;border-radius:10px}
+.org-emoji [aria-checked=true]{background:#232523}
+.org-status{display:block;width:calc(100% - 40px);margin:6px 20px 0;text-align:left;background:transparent;border:0;border-left:3px solid;border-radius:0;padding:4px 0 4px 12px;color:#dfe3df;font-size:15px;line-height:1.5;min-height:44px}
+.org-status small{display:block;color:#a3aba5;font-size:13px;margin-top:4px}
+a.org-open{text-decoration:none}
+/* Home and To-do density (Carol 2026-10-21: "a bit big"; 2026-10-22: the To-do screen as dense as Home). One knob: --home on .org-dense scales type, rows,
+   headers, tabs and add fields; touch targets stay ≥44px. Chat message text is never scaled (16px). */
+.org-dense .org-head{min-height:calc(60px*var(--home));padding-top:calc(14px*var(--home))}
+.org-dense .org-head h1{font-size:calc(22px*var(--home))}
+.org-dense .org-link{font-size:calc(14px*var(--home))}
+.org-dense .org-open{padding:calc(10px*var(--home)*var(--home)) 4px calc(10px*var(--home)*var(--home)) 10px;gap:calc(12px*var(--home))}
+.org-dense .org-tile{width:calc(36px*var(--home));height:calc(36px*var(--home));font-size:calc(18px*var(--home))}
+.org-dense .org-body .t{font-size:calc(16px*var(--home))}
+.org-dense .org-body .m{font-size:calc(14px*var(--home))}
+.org-dense .org-quick button{font-size:calc(15px*var(--home));min-height:44px;padding:calc(10px*var(--home)) 12px}
+.org-dense .org-footline{font-size:calc(13px*var(--home));margin-top:calc(10px*var(--home))}
+.org-dense .org-count{font-size:calc(15px*var(--home))}
+.org-dense .org-seg{margin-top:calc(4px*var(--home))}
+.org-dense .org-seg button{font-size:calc(15px*var(--home));padding:calc(10px*var(--home)) 8px;min-height:44px}
+.org-demo{flex:none;background:#232523;border:1px solid #3d403d;color:#eef1ee;border-radius:8px;padding:1px 8px;font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+/* Chat groups: Chats sections, each one colour family (colors.ts FAMILIES). */
+.org-hn{margin-left:6px;font-weight:500;letter-spacing:0;color:#7d857f}
+.org-gh .org-link{font-size:18px;min-width:44px}
+.org-fam{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:10px;vertical-align:-1px}
+.org-emoji-small{grid-template-columns:repeat(auto-fill,minmax(40px,1fr));max-height:180px;overflow:auto}
+.org-emoji-small button{font-size:22px;min-height:44px}
+.org-dense .org-main{margin:0 0 calc(10px*var(--home))}
+.org-dense .org-main .org-open{padding-right:12px}
+/* Dated to-dos in the calendar's all-day strip and month cells: a ☐ chip, outlined rather than filled like events. */
+.org-tchip{display:inline-flex;align-items:center;border:1px dashed #ffc21acc;border-radius:6px;background:#ffc21a1a;color:#f3f3f3;font-size:13px;min-height:32px;max-width:100%}
+.org-tchip button{background:transparent;border:0;color:inherit;font-size:13px;padding:4px 6px;min-height:32px;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.org-tchip .box{min-width:32px;padding:0;font-size:15px;line-height:1}
+.org-tchip.done{opacity:.6}
+.org-tchip.done .tx{text-decoration:line-through}
+.org-mo .c .org-tchip{display:flex;min-height:0;font-size:11px;border-radius:4px}
+.org-mo .c .org-tchip button{font-size:11px;min-height:0;padding:1px 2px}
+.org-mo .c .org-tchip .box{min-width:14px;font-size:11px}
+/* Row drag (rowDrag.ts), To-do and 🛒 To buy: a long-pressed row lifts above its neighbours (layer 3 in the list's own stacking context, below
+   the overlays) and a line, drawn over it, shows where it will land; the section it would land in is tinted. */
+.org-row-dragging,.org-row-dragging *{user-select:none!important;-webkit-user-select:none!important;-webkit-touch-callout:none!important;touch-action:none}
+.org-todo-card{margin:6px 12px 0;padding:0 10px;border:1px solid #ffffff26;border-radius:10px;background:#1b1f1c;font-size:14px;line-height:1.45;flex:none}
+.org-todo-card.open{max-height:45vh;overflow:auto;padding-bottom:8px}
+.org-todo-card-head{display:flex;gap:6px;align-items:center;width:100%;min-height:36px;background:transparent;border:0;padding:0;color:var(--text);font:inherit;text-align:left}
+.org-todo-card-head strong{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.org-todo-card-head .when{font-size:13px;color:#a3aba5;white-space:nowrap;flex:none}
+.org-todo-card-head .chev{margin-left:auto;color:#a3aba5;flex:none}
+.org-todo-card-body{overflow-wrap:anywhere}
+.org-todo-card-body>:first-child{margin-top:0}
+.org-todo-card-body>:last-child{margin-bottom:0}
+.org-todo-card-body a{color:#9bc5ef}
+.org-newchat{margin-left:auto;background:#232523;border:1px solid #4a4d4a;color:#e8e8ea;border-radius:999px;padding:8px 14px;min-height:44px;font-size:15px;font-weight:600;flex:none;white-space:nowrap}
+.org-newchat-h{font-size:12px;letter-spacing:.12em;font-weight:800;color:#9a9aa2;text-transform:uppercase;margin:6px 0 0}
+.org-newchat-people{max-height:112px;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column}
+.org-newchat-person{display:flex;flex-direction:row;align-items:center;gap:12px;min-height:48px;padding:0 4px;font-size:17px;color:#eef1ee;flex:none}
+.org-newchat-person input{width:22px;height:22px;padding:0;accent-color:#9bc53d;margin:0;flex:none}
+.org-newchat-actions{justify-content:stretch;flex-wrap:nowrap}
+.org-newchat-actions button{flex:1;min-height:48px;font-size:16px;border-radius:12px}
+.org-start{background:#4d6123;border:1px solid #7fa538;color:#eef1ee;font-weight:700}
+.org-start:disabled{opacity:.6}
+/* 📰 What's new: the menu's dot (on its tile and on Home's ☰) and the page, in message-sized text */
+.organized .cm-tile,.organized .org-icon{position:relative}
+.organized .cm-dot{position:absolute;top:7px;right:calc(50% - 19px);width:8px;height:8px;border-radius:50%;background:#b9dd6a;box-shadow:0 0 0 2px #1b1d1b}
+.organized .org-icon .cm-dot{top:9px;right:7px}
+.org-news ul{list-style:none;margin:0 20px;padding:0}
+.org-news li{font-size:1rem;line-height:1.45;color:#e3e7e3;padding:7px 0;border-bottom:1px solid #ffffff10}
+.org-news li.fresh{border-left:3px solid #b9dd6a;padding-left:10px;margin-left:-13px}
+.org-news li.behind{color:#a3aba5;font-size:.9rem}
+.organized .cm-tile{white-space:normal;line-height:1.15;text-align:center}
+.org-nav .cm-tiles{flex-wrap:nowrap}
+.org-nav .cm-tile{flex:1 1 0;font-size:11.5px;white-space:nowrap}
+.org-news li b{font-weight:600;color:#b9dd6a}
+.org-member-color{display:flex;flex-direction:column;gap:6px;margin:10px 0}
+.org-member-color strong{font-size:14px}
+.blank-trigger.org-blank{min-height:44px;width:44px;border-radius:999px;background:#232523;border:1px solid #4a4d4a}
+.org-sheet.nav-drawer{transform:translateX(100%);will-change:transform}
+.org-sheet.nav-drawer.open{transform:translateX(0)}
+
+/* Rules for the app shell's own parts, where they sit inside the Organized layout. */
+html.shell-screen #root>.organized{position:fixed;inset:0;height:auto}
+.org-sheet .cm{border-top:0;padding-top:0}
+html.sky-on:has(.organized) .sky{background:#0e0f0e}
+.sky-on .organized,.sky-on .org-full{background:transparent}
+.sky-on .sidebar,.sky-on .org-sheet{background:#ffffff08}
+html.sky-on .org-sheet.open~:not(.org-scrim,.org-sheet){opacity:0}
+.sky-on .main,.sky-on .organized>.org-screen,.sky-on .organized>.org-tabs{will-change:opacity}
+.org-home .system-section { margin: 12px 8px; }

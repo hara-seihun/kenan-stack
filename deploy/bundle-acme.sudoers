@@ -1,0 +1,2 @@
+# Household operators prepare Acme bundles and queue the handoff as the repository owner.
+%kenan-operators ALL=(kenan) NOPASSWD: /usr/local/libexec/kenan-bundle-acme *

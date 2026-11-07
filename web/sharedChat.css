@@ -1,0 +1,20 @@
+/* Shared chats align by the reader, not by human/agent role. Match the reader's 10% bubble fill,
+   without fading text or files. Specificity keeps chat member colours and Organized's human style
+   from replacing this translucency, whichever lazy stylesheet arrives last. */
+:root:root:root .transcript.shared .message:not(.mine){
+  --incoming-color:var(--tint,var(--my-bubble,#c0c0c8));
+  --incoming-edge:color-mix(in srgb,var(--incoming-color),#fff 25%);
+  margin-left:0;
+  margin-right:40px;
+  background:color-mix(in srgb,var(--incoming-color) 10%,transparent);
+  border:1px solid color-mix(in srgb,var(--incoming-edge) 10%,transparent);
+  border-radius:15px;
+  padding:14px 18px;
+  color:#fff;
+}
+:root .transcript.shared .message:not(.mine) :is(time,small){color:#ffffffc8}
+@media(max-width:700px){
+  :root:root:root .transcript.shared .message:not(.mine){margin-right:18px}
+}
+
+.membership-notice { align-self: center; text-align: center; font-size: .8rem; opacity: .65; margin: .5rem 0; }

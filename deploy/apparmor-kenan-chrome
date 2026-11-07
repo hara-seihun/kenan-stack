@@ -1,0 +1,8 @@
+abi <abi/5.0>,
+include <tunables/global>
+
+# Ubuntu blocks unprivileged user namespaces; Chrome's sandbox needs them.
+profile kenan-chrome /srv/kenan/toolchains/chrome-*/chrome flags=(unconfined) {
+  userns,
+  @{exec_path} mr,
+}

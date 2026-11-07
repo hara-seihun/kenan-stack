@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep Kenan PostgreSQL alive when WAL archiving or disk headroom fails
+After=kenan-postgres.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kenan-wal-guard
+TimeoutStartSec=15min

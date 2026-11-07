@@ -1,0 +1,13 @@
+[Unit]
+Description=Close background jobs a host reboot killed and restart the --keep ones
+After=kenan-bg-launch.socket local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/kenan-bg-native/recover.mjs
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

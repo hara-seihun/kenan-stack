@@ -1,0 +1,21 @@
+[Unit]
+Description=Browser Use Cloud broker (holds the API key; serves cloud-browser over /run/cloud-browser/broker.sock)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/kenan/browser-use/broker.py
+RuntimeDirectory=cloud-browser
+RuntimeDirectoryMode=0755
+StateDirectory=cloud-browser
+Environment=BROWSER_USE_KEY_FILE=/etc/kenan-session-scope/browser-use/api-key
+# Agents can create separate work research profiles. The notetaker remains limited to its Meet profile.
+# The shared account also holds personal profiles, which must remain inaccessible.
+Environment=BROWSER_USE_PRIVILEGED_UIDS=
+Environment=BROWSER_USE_ALLOWED_PROFILES=kenan=kenan,kenan-*;pi2-acme=work-profile
+Environment=BROWSER_USE_EXCLUDED_PROFILES=personal-profile,personal-profile-*
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

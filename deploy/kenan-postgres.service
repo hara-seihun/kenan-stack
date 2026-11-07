@@ -1,0 +1,20 @@
+[Unit]
+Description=Kenan rewrite PostgreSQL 18
+After=local-fs.target
+StartLimitIntervalSec=0
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+ExecStart=/usr/lib/postgresql/18/bin/postgres -D /var/lib/kenan/postgres -c listen_addresses= -c unix_socket_directories=/run/kenan/pg -c unix_socket_permissions=0777
+RuntimeDirectory=kenan/pg kenan/backup
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+RestartSteps=8
+RestartMaxDelaySec=120
+[Install]
+WantedBy=multi-user.target

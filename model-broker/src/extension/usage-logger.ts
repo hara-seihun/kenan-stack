@@ -1,0 +1,3 @@
+export interface MeterReading{readonly at:number;readonly usedPercent:number;readonly resetAt?:number;}
+export function anthropicMeterReadings(headers:Record<string,string>,at:number):{meterId:string;reading:MeterReading}[]{const values:ReturnType<typeof anthropicMeterReadings>=[];for(const window of ["5h","7d","7d_oi"]){const utilization=headers[`anthropic-ratelimit-unified-${window}-utilization`];if(utilization===undefined)continue;const reset=Number(headers[`anthropic-ratelimit-unified-${window}-reset`]);values.push({meterId:`anthropic-${window}`,reading:{at,usedPercent:Number(utilization)*100,resetAt:Number.isFinite(reset)?reset*1000:undefined}});}return values;}
+

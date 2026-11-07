@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop headless automation Chrome browsers whose launcher has gone
+
+[Service]
+Type=oneshot
+Slice=batch.slice
+ExecStart=/usr/local/sbin/kenan-chrome-reap
+TimeoutStartSec=2min

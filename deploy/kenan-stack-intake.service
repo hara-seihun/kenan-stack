@@ -1,0 +1,11 @@
+[Unit]
+Description=Import the newest Kenan Stack promotion and deploy both channels
+After=network-online.target
+[Service]
+Type=oneshot
+Environment=HOME=/home/kenan
+Environment=PATH=/home/kenan/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /home/kenan/.local/lib/kenan-stack-intake/stack-bundle-intake.py
+TimeoutStartSec=70min
+# This must survive the Beta restart it performs.
+KillMode=control-group

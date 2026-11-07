@@ -1,0 +1,14 @@
+# Kenan Stack repository
+
+Read DESIGN.md first. It is short and it is the contract for how this system works.
+
+**Adding a feature starts by making the system simpler** (Alice). First look for complexity to remove; reuse or replace what exists instead of layering on top of it; prefer deleting. Leave the system no bigger than you found it.
+
+- TypeScript ESM, Node 24, `.js` relative imports. Server code under `server/`, shared contract in `shared/contract.ts`, web app under `web/`.
+- Keep it small. No recovery/custody layers, triggers, audits or workflow engines. Provider errors use only the bounded same-session durable continuation in DESIGN.md; no tool or original-input replay. Other failures return a plain error; Kenaznia fixes them on heartbeat.
+- Every human message must be admitted in milliseconds and answered within seconds. Do not put anything slow on that path.
+- Check a UI change in a real browser before deploying: `npm run build`, then `npx tsx bench/ui/serve.ts PORT` runs the real app on a throwaway `kenan_test` schema logged in as Alice and prints the origin and a private cookie-file path for Playwright (never the cookie value; pass the path as COOKIE_FILE) (`bench/ui/check-*.mjs` are examples).
+- Run `npm run check` (types) and check the changed behavior once directly. Do not add regression tests or make suites release gates. Existing checks should use current supported interfaces and preserve meaningful behavior assertions. `npm test -- PATHS` runs selected Vitest files serially and builds their native foreground runner. Timing checks live in `*.timing.test.ts`, run after the other files, and use a private PostgreSQL process. Local PostgreSQL server binaries are required (`pg_config --bindir`, or `TEST_POSTGRES_BIN`). Keep wall-clock bounds, never loosen them.
+- Deploy: new code goes to Beta first with `deploy/deploy.sh beta`; once it's good there, `deploy/promote.sh` deploys exactly Beta's live commit to production. `deploy/deploy.sh production` refuses any other commit (`deploy_production_not_beta`) unless you pass `--rollback`. Deploys stage the build first; frontend-only updates keep the backend running, and backend changes restart once. Push your commit to the shared repository first; a deploy that lacks a commit live on that channel is refused with the missing commits listed. Merge them in, or pass `--rollback` to remove them deliberately.
+
+- Time-bound work wakes itself: the `wake` tool (`server/agents/wakes.ts`, table `wake`) resumes an agent at a time, on new mail/Signal/text, or whichever comes first. Signal wakes carry a required conversation scope (`chat`: direct, one group, or any), so a contact's group messages never fire a DM wake. Don't add heartbeat- or model-polling for waits; extend `WakeEvent` with a new source instead. Person config `signalStore` (path or null) is required by `loadConfig`.

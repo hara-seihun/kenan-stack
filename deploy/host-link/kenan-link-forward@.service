@@ -1,0 +1,19 @@
+[Unit]
+Description=Kenan private link to %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+RuntimeDirectory=kenan-link
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+EnvironmentFile=/etc/kenan/link-forward/%i.env
+ExecStart=/usr/local/libexec/kenan-link-forward
+Restart=always
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

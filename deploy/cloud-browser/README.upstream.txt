@@ -1,0 +1,5 @@
+Cloud browser (Browser Use Cloud, US residential egress, ~USD 0.02/h). Install on this host:
+  sudo install -d /usr/local/lib/kenan/browser-use && sudo install -m755 cloud-browser /usr/local/lib/kenan/browser-use/ && sudo install -m644 cloud-browser.py broker.py /usr/local/lib/kenan/browser-use/
+  sudo ln -sf /usr/local/lib/kenan/browser-use/cloud-browser /usr/local/bin/cloud-browser
+Key: /etc/kenan-session-scope/browser-use/api-key (root 0400), read only by broker.py (root systemd service: ExecStart=python3 /usr/local/lib/kenan/browser-use/broker.py, RuntimeDirectory=cloud-browser, StateDirectory=cloud-browser, Environment=BROWSER_USE_KEY_FILE=/etc/kenan-session-scope/browser-use/api-key BROWSER_USE_PRIVILEGED_UIDS=1002).
+Client needs /run/user/UID/cloud-browser to exist (user lingering). Use: cloud-browser start PROFILE --minutes 60 ; cloud-browser upload SESSION FILE [--selector CSS] ; cloud-browser stop SESSION ; cloud-browser profile-create NAME ; cloud-browser balance. start prints session_id and writes an agent-browser config with the CDP endpoint to /run/user/UID/cloud-browser/SESSION.json. CDP and live-view URLs are secrets.

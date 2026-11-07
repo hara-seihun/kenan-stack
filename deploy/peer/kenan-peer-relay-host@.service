@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenan peer relay %i between two Kenaznias on this host (root reaches both people's peer sockets)
+After=kenan@beta.service kenan@production.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/peer-relay/peer-relay.mjs /etc/kenan/peer-relay/%i.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

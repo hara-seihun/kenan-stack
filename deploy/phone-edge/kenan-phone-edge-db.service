@@ -1,0 +1,15 @@
+[Unit]
+Description=Database port for the phone edge's call bridges (mesh only, the edge's address only)
+After=tailscaled-mesh.service kenan-postgres.service
+Wants=tailscaled-mesh.service
+
+[Service]
+# Peer authentication: the bridges reach Postgres as this Unix user, so its role (deploy/phone-edge/edge-db.sql) is all they get.
+User=kenan_phone_edge
+EnvironmentFile=/etc/kenan/phone-edge.env
+ExecStart=/usr/bin/socat TCP-LISTEN:${PORT},bind=${BIND},fork,reuseaddr,range=${EDGE}/32 UNIX-CONNECT:/run/kenan/pg/.s.PGSQL.5432
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

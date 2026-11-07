@@ -1,0 +1,14 @@
+[Unit]
+Description=Browser Use Cloud API broker
+After=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/lib/kenan/browser-use/broker.py
+RuntimeDirectory=cloud-browser
+StateDirectory=cloud-browser
+Restart=always
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cloud-browser /run/cloud-browser
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target

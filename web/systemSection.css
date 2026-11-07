@@ -1,0 +1,5 @@
+.system-section { margin: 12px 0; min-width: 0; }
+.system-section > summary { cursor: pointer; padding: 10px 12px; color: var(--muted, #a9b1ab); font-size: 13px; font-weight: 600; }
+.system-count { font-weight: 400; font-variant-numeric: tabular-nums; }
+.system-section[open] > summary { margin-bottom: 4px; }
+.sidebar .system-section { margin: 6px 0; }

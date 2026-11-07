@@ -1,0 +1,6 @@
+[Unit]
+Description=Recover enabled Kenan channels independently of their tool processes
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kenan-runtime-recover
+TimeoutStartSec=60s

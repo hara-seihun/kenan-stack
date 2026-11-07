@@ -1,0 +1,14 @@
+.composer-controls .mic{display:grid;place-items:center;width:44px;height:44px;min-height:44px;padding:0;border-radius:50%;background:#151515;border:1px solid #363636;color:#cfcfcf;flex-shrink:0}
+.composer-controls .mic:hover{background:#1e1e1e}
+.composer-controls .mic[aria-busy=true]{opacity:.6}
+.composer-controls .mic.recording{border-color:#7f9a2e;background:#1b2210}
+.mic-wave{display:flex;align-items:center;gap:2px;height:18px}
+.mic-wave i{display:block;width:3px;height:18px;border-radius:2px;background:#b5d334;transform-origin:center;transition:transform 60ms linear}
+.composer-controls .mic-chip{display:flex;align-items:center;gap:5px;min-height:44px;height:44px;padding:0 10px 0 12px;border-radius:22px;font-size:12px;font-variant-numeric:tabular-nums;color:#c9d98f;background:#1b2210;border-color:#3d4a1c}
+.composer-controls .send.live{background:#fff;border-color:#fff;color:#000;font-weight:600;box-shadow:0 0 0 3px #ffffff38}
+.mic-problem{display:flex;align-items:center;gap:8px;margin:0 0 6px;font-size:13px;color:#f0c8c0}
+.mic-problem>span{flex:1}
+.mic-problem button{min-height:32px;padding:4px 10px;font-size:13px}
+.mic-stop{width:10px;height:10px;border-radius:2px;background:currentColor}
+.composer-controls .mic-finishing{border:1px solid #3d4a1c;padding:0 12px}
+.mic-later{color:#9fb06a}

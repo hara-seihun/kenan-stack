@@ -1,0 +1,7 @@
+[Unit]
+Description=Detect overdue peer messages independently of the remote relay
+After=kenan@beta.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/peer-relay/watch-outbox.mjs /etc/kenan/peer-watch.json
+TimeoutStartSec=45
