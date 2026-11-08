@@ -1,0 +1,7 @@
+[Unit]
+Description=Bring the phone edge's finished call logs and recordings home
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kenan-phone-edge-pull
+TimeoutStartSec=300

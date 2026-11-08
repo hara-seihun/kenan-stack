@@ -1,0 +1,3 @@
+<resources>
+    <string name="phone_control_description">Lets your Kenan agents look at the screen, tap, scroll, type and open apps for you, only during a session you can see: \"Kenan is using your phone · Stop\" stays in your notifications the whole time, Stop ends it at once, and it ends by itself after 10 minutes without activity. It never sends texts and never types passwords except saved ones from your vault.</string>
+</resources>

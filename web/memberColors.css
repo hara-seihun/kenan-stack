@@ -1,0 +1,8 @@
+:root:root:root:root .message.tinted{background:color-mix(in srgb,var(--tint) 14%,transparent);border:1px solid color-mix(in srgb,var(--tint) 40%,transparent);border-left:4px solid var(--tint);border-radius:15px;padding:14px 18px;color:#f3f3f3}
+:root:root:root:root .message.tinted .message-meta strong{color:color-mix(in srgb,var(--tint) 62%,#fff)}
+.message-colors{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-start}
+.message-colors.message-colors button{flex:none;box-sizing:border-box;width:28px;height:28px;min-width:0;min-height:0;padding:0;border-radius:50%;border:2px solid transparent}
+.message-colors.message-colors button[aria-checked=true]{border-color:#fff}
+.message-colors.message-colors .none{width:auto;padding:0 10px;border-radius:14px;border:1px solid #555;background:transparent;color:#d0d0d0;font-size:12px}
+.message-colors.message-colors .none[aria-checked=true]{border-color:#fff}
+.menu>div>.mc-row{flex-direction:column;align-items:flex-start;gap:6px}

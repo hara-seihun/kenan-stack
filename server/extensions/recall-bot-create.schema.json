@@ -1,0 +1,3611 @@
+{
+ "root": {
+  "type": "object",
+  "required": [
+   "meeting_url"
+  ],
+  "properties": {
+   "meeting_url": {
+    "type": "string"
+   },
+   "bot_name": {
+    "type": "string",
+    "minLength": 1,
+    "default": "Meeting Notetaker",
+    "maxLength": 100
+   },
+   "recording_config": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/BotRecordingConfigRequest"
+     }
+    ],
+    "nullable": true
+   },
+   "automatic_leave": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/AutomaticLeaveRequest"
+     }
+    ],
+    "nullable": true
+   },
+   "metadata": {
+    "type": "object",
+    "additionalProperties": {
+     "type": "string"
+    }
+   },
+   "chat": {
+    "allOf": [
+     {
+      "$ref": "#/components/schemas/ChatRequest"
+     }
+    ],
+    "nullable": true
+   }
+  }
+ },
+ "schemas": {
+  "BotRecordingConfigRequest": {
+   "type": "object",
+   "properties": {
+    "transcript": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigTranscriptArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "realtime_endpoints": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointRequest"
+     },
+     "default": []
+    },
+    "retention": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigRetentionRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "video_mixed_layout": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/VideoMixedLayoutEnum"
+      }
+     ],
+     "default": "speaker_view"
+    },
+    "video_mixed_mp4": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "participant_events": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true,
+     "default": {}
+    },
+    "meeting_metadata": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true,
+     "default": {}
+    },
+    "video_mixed_participant_video_when_screenshare": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/VideoMixedParticipantVideoWhenScreenshareEnum"
+      }
+     ],
+     "default": "overlap"
+    },
+    "start_recording_on": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/StartRecordingOnEnum"
+      }
+     ],
+     "default": "participant_join"
+    },
+    "include_bot_in_recording": {
+     "$ref": "#/components/schemas/BotIncludeInRecordingRequest"
+    },
+    "metadata": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    },
+    "audio_mixed_raw": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "audio_mixed_mp3": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "video_separate_mp4": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "audio_separate_raw": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "audio_separate_mp3": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "video_mixed_flv": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "video_separate_png": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    },
+    "video_separate_h264": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigBaseArtifactRequest"
+      }
+     ],
+     "nullable": true
+    }
+   }
+  },
+  "BotRecordingConfigTranscriptArtifactRequest": {
+   "type": "object",
+   "properties": {
+    "metadata": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    },
+    "provider": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigTranscriptProviderRequest"
+      }
+     ]
+    },
+    "diarization": {
+     "$ref": "#/components/schemas/BotRecordingConfigTranscriptDiarizationRequest"
+    }
+   },
+   "required": [
+    "provider"
+   ]
+  },
+  "BotRecordingConfigTranscriptProviderRequest": {
+   "type": "object",
+   "properties": {
+    "recallai_streaming": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/RecallaiStreamingTranscriptionRequest"
+      }
+     ]
+    },
+    "assembly_ai_async_chunked": {
+     "properties": {
+      "audio_end_at": {
+       "type": "integer"
+      },
+      "audio_start_from": {
+       "type": "integer"
+      },
+      "auto_chapters": {
+       "type": "boolean",
+       "default": false
+      },
+      "auto_highlights": {
+       "type": "boolean",
+       "default": false
+      },
+      "content_safety": {
+       "type": "boolean",
+       "default": false
+      },
+      "content_safety_confidence": {
+       "type": "integer",
+       "default": 50,
+       "minimum": 25,
+       "maximum": 100
+      },
+      "custom_spelling": {
+       "type": "array",
+       "items": {
+        "x-fern-sdk-group-name": "transcripts",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+         "from": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "to": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "from",
+         "to"
+        ]
+       }
+      },
+      "disfluencies": {
+       "type": "boolean",
+       "default": false
+      },
+      "entity_detection": {
+       "type": "boolean",
+       "default": false
+      },
+      "filter_profanity": {
+       "type": "boolean",
+       "default": false
+      },
+      "format_text": {
+       "type": "boolean",
+       "default": true
+      },
+      "iab_categories": {
+       "type": "boolean",
+       "default": false
+      },
+      "keyterms_prompt": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "language_code": {
+       "oneOf": [
+        {
+         "anyOf": [
+          {
+           "type": "string",
+           "x-fern-sdk-group-name": "transcripts",
+           "enum": [
+            "en",
+            "en_au",
+            "en_uk",
+            "en_us",
+            "es",
+            "fr",
+            "de",
+            "it",
+            "pt",
+            "nl",
+            "af",
+            "sq",
+            "am",
+            "ar",
+            "hy",
+            "as",
+            "az",
+            "ba",
+            "eu",
+            "be",
+            "bn",
+            "bs",
+            "br",
+            "bg",
+            "my",
+            "ca",
+            "zh",
+            "hr",
+            "cs",
+            "da",
+            "et",
+            "fo",
+            "fi",
+            "gl",
+            "ka",
+            "el",
+            "gu",
+            "ht",
+            "ha",
+            "haw",
+            "he",
+            "hi",
+            "hu",
+            "is",
+            "id",
+            "ja",
+            "jw",
+            "kn",
+            "kk",
+            "km",
+            "ko",
+            "lo",
+            "la",
+            "lv",
+            "ln",
+            "lt",
+            "lb",
+            "mk",
+            "mg",
+            "ms",
+            "ml",
+            "mt",
+            "mi",
+            "mr",
+            "mn",
+            "ne",
+            "no",
+            "nn",
+            "oc",
+            "pa",
+            "ps",
+            "fa",
+            "pl",
+            "ro",
+            "ru",
+            "sa",
+            "sr",
+            "sn",
+            "sd",
+            "si",
+            "sk",
+            "sl",
+            "so",
+            "su",
+            "sw",
+            "sv",
+            "tl",
+            "tg",
+            "ta",
+            "tt",
+            "te",
+            "th",
+            "bo",
+            "tr",
+            "tk",
+            "uk",
+            "ur",
+            "uz",
+            "vi",
+            "cy",
+            "yi",
+            "yo"
+           ],
+           "x-aai-enum": {
+            "en": {
+             "label": "English (global)"
+            },
+            "en_au": {
+             "label": "English (Australian)"
+            },
+            "en_uk": {
+             "label": "English (British)"
+            },
+            "en_us": {
+             "label": "English (US)"
+            },
+            "es": {
+             "label": "Spanish"
+            },
+            "fr": {
+             "label": "French"
+            },
+            "de": {
+             "label": "German"
+            },
+            "it": {
+             "label": "Italian"
+            },
+            "pt": {
+             "label": "Portuguese"
+            },
+            "nl": {
+             "label": "Dutch"
+            },
+            "af": {
+             "label": "Afrikaans"
+            },
+            "sq": {
+             "label": "Albanian"
+            },
+            "am": {
+             "label": "Amharic"
+            },
+            "ar": {
+             "label": "Arabic"
+            },
+            "hy": {
+             "label": "Armenian"
+            },
+            "as": {
+             "label": "Assamese"
+            },
+            "az": {
+             "label": "Azerbaijani"
+            },
+            "ba": {
+             "label": "Bashkir"
+            },
+            "eu": {
+             "label": "Basque"
+            },
+            "be": {
+             "label": "Belarusian"
+            },
+            "bn": {
+             "label": "Bengali"
+            },
+            "bs": {
+             "label": "Bosnian"
+            },
+            "br": {
+             "label": "Breton"
+            },
+            "bg": {
+             "label": "Bulgarian"
+            },
+            "my": {
+             "label": "Burmese"
+            },
+            "ca": {
+             "label": "Catalan"
+            },
+            "zh": {
+             "label": "Chinese"
+            },
+            "hr": {
+             "label": "Croatian"
+            },
+            "cs": {
+             "label": "Czech"
+            },
+            "da": {
+             "label": "Danish"
+            },
+            "et": {
+             "label": "Estonian"
+            },
+            "fo": {
+             "label": "Faroese"
+            },
+            "fi": {
+             "label": "Finnish"
+            },
+            "gl": {
+             "label": "Galician"
+            },
+            "ka": {
+             "label": "Georgian"
+            },
+            "el": {
+             "label": "Greek"
+            },
+            "gu": {
+             "label": "Gujarati"
+            },
+            "ht": {
+             "label": "Haitian"
+            },
+            "ha": {
+             "label": "Hausa"
+            },
+            "haw": {
+             "label": "Hawaiian"
+            },
+            "he": {
+             "label": "Hebrew"
+            },
+            "hi": {
+             "label": "Hindi"
+            },
+            "hu": {
+             "label": "Hungarian"
+            },
+            "is": {
+             "label": "Icelandic"
+            },
+            "id": {
+             "label": "Indonesian"
+            },
+            "ja": {
+             "label": "Japanese"
+            },
+            "jw": {
+             "label": "Javanese"
+            },
+            "kn": {
+             "label": "Kannada"
+            },
+            "kk": {
+             "label": "Kazakh"
+            },
+            "km": {
+             "label": "Khmer"
+            },
+            "ko": {
+             "label": "Korean"
+            },
+            "lo": {
+             "label": "Lao"
+            },
+            "la": {
+             "label": "Latin"
+            },
+            "lv": {
+             "label": "Latvian"
+            },
+            "ln": {
+             "label": "Lingala"
+            },
+            "lt": {
+             "label": "Lithuanian"
+            },
+            "lb": {
+             "label": "Luxembourgish"
+            },
+            "mk": {
+             "label": "Macedonian"
+            },
+            "mg": {
+             "label": "Malagasy"
+            },
+            "ms": {
+             "label": "Malay"
+            },
+            "ml": {
+             "label": "Malayalam"
+            },
+            "mt": {
+             "label": "Maltese"
+            },
+            "mi": {
+             "label": "Maori"
+            },
+            "mr": {
+             "label": "Marathi"
+            },
+            "mn": {
+             "label": "Mongolian"
+            },
+            "ne": {
+             "label": "Nepali"
+            },
+            "no": {
+             "label": "Norwegian"
+            },
+            "nn": {
+             "label": "Norwegian Nynorsk"
+            },
+            "oc": {
+             "label": "Occitan"
+            },
+            "pa": {
+             "label": "Panjabi"
+            },
+            "ps": {
+             "label": "Pashto"
+            },
+            "fa": {
+             "label": "Persian"
+            },
+            "pl": {
+             "label": "Polish"
+            },
+            "ro": {
+             "label": "Romanian"
+            },
+            "ru": {
+             "label": "Russian"
+            },
+            "sa": {
+             "label": "Sanskrit"
+            },
+            "sr": {
+             "label": "Serbian"
+            },
+            "sn": {
+             "label": "Shona"
+            },
+            "sd": {
+             "label": "Sindhi"
+            },
+            "si": {
+             "label": "Sinhala"
+            },
+            "sk": {
+             "label": "Slovak"
+            },
+            "sl": {
+             "label": "Slovenian"
+            },
+            "so": {
+             "label": "Somali"
+            },
+            "su": {
+             "label": "Sundanese"
+            },
+            "sw": {
+             "label": "Swahili"
+            },
+            "sv": {
+             "label": "Swedish"
+            },
+            "tl": {
+             "label": "Tagalog"
+            },
+            "tg": {
+             "label": "Tajik"
+            },
+            "ta": {
+             "label": "Tamil"
+            },
+            "tt": {
+             "label": "Tatar"
+            },
+            "te": {
+             "label": "Telugu"
+            },
+            "th": {
+             "label": "Thai"
+            },
+            "bo": {
+             "label": "Tibetan"
+            },
+            "tr": {
+             "label": "Turkish"
+            },
+            "tk": {
+             "label": "Turkmen"
+            },
+            "uk": {
+             "label": "Ukrainian"
+            },
+            "ur": {
+             "label": "Urdu"
+            },
+            "uz": {
+             "label": "Uzbek"
+            },
+            "vi": {
+             "label": "Vietnamese"
+            },
+            "cy": {
+             "label": "Welsh"
+            },
+            "yi": {
+             "label": "Yiddish"
+            },
+            "yo": {
+             "label": "Yoruba"
+            }
+           }
+          },
+          {
+           "type": "string"
+          }
+         ]
+        },
+        {
+         "type": "string",
+         "nullable": true
+        }
+       ],
+       "default": "en_us",
+       "x-ts-type": "LiteralUnion<TranscriptLanguageCode, string> | null",
+       "x-go-type": "TranscriptLanguageCode"
+      },
+      "language_codes": {
+       "type": "array",
+       "items": {
+        "type": "string",
+        "x-fern-sdk-group-name": "transcripts",
+        "enum": [
+         "en",
+         "en_au",
+         "en_uk",
+         "en_us",
+         "es",
+         "fr",
+         "de",
+         "it",
+         "pt",
+         "nl",
+         "af",
+         "sq",
+         "am",
+         "ar",
+         "hy",
+         "as",
+         "az",
+         "ba",
+         "eu",
+         "be",
+         "bn",
+         "bs",
+         "br",
+         "bg",
+         "my",
+         "ca",
+         "zh",
+         "hr",
+         "cs",
+         "da",
+         "et",
+         "fo",
+         "fi",
+         "gl",
+         "ka",
+         "el",
+         "gu",
+         "ht",
+         "ha",
+         "haw",
+         "he",
+         "hi",
+         "hu",
+         "is",
+         "id",
+         "ja",
+         "jw",
+         "kn",
+         "kk",
+         "km",
+         "ko",
+         "lo",
+         "la",
+         "lv",
+         "ln",
+         "lt",
+         "lb",
+         "mk",
+         "mg",
+         "ms",
+         "ml",
+         "mt",
+         "mi",
+         "mr",
+         "mn",
+         "ne",
+         "no",
+         "nn",
+         "oc",
+         "pa",
+         "ps",
+         "fa",
+         "pl",
+         "ro",
+         "ru",
+         "sa",
+         "sr",
+         "sn",
+         "sd",
+         "si",
+         "sk",
+         "sl",
+         "so",
+         "su",
+         "sw",
+         "sv",
+         "tl",
+         "tg",
+         "ta",
+         "tt",
+         "te",
+         "th",
+         "bo",
+         "tr",
+         "tk",
+         "uk",
+         "ur",
+         "uz",
+         "vi",
+         "cy",
+         "yi",
+         "yo"
+        ],
+        "x-aai-enum": {
+         "en": {
+          "label": "English (global)"
+         },
+         "en_au": {
+          "label": "English (Australian)"
+         },
+         "en_uk": {
+          "label": "English (British)"
+         },
+         "en_us": {
+          "label": "English (US)"
+         },
+         "es": {
+          "label": "Spanish"
+         },
+         "fr": {
+          "label": "French"
+         },
+         "de": {
+          "label": "German"
+         },
+         "it": {
+          "label": "Italian"
+         },
+         "pt": {
+          "label": "Portuguese"
+         },
+         "nl": {
+          "label": "Dutch"
+         },
+         "af": {
+          "label": "Afrikaans"
+         },
+         "sq": {
+          "label": "Albanian"
+         },
+         "am": {
+          "label": "Amharic"
+         },
+         "ar": {
+          "label": "Arabic"
+         },
+         "hy": {
+          "label": "Armenian"
+         },
+         "as": {
+          "label": "Assamese"
+         },
+         "az": {
+          "label": "Azerbaijani"
+         },
+         "ba": {
+          "label": "Bashkir"
+         },
+         "eu": {
+          "label": "Basque"
+         },
+         "be": {
+          "label": "Belarusian"
+         },
+         "bn": {
+          "label": "Bengali"
+         },
+         "bs": {
+          "label": "Bosnian"
+         },
+         "br": {
+          "label": "Breton"
+         },
+         "bg": {
+          "label": "Bulgarian"
+         },
+         "my": {
+          "label": "Burmese"
+         },
+         "ca": {
+          "label": "Catalan"
+         },
+         "zh": {
+          "label": "Chinese"
+         },
+         "hr": {
+          "label": "Croatian"
+         },
+         "cs": {
+          "label": "Czech"
+         },
+         "da": {
+          "label": "Danish"
+         },
+         "et": {
+          "label": "Estonian"
+         },
+         "fo": {
+          "label": "Faroese"
+         },
+         "fi": {
+          "label": "Finnish"
+         },
+         "gl": {
+          "label": "Galician"
+         },
+         "ka": {
+          "label": "Georgian"
+         },
+         "el": {
+          "label": "Greek"
+         },
+         "gu": {
+          "label": "Gujarati"
+         },
+         "ht": {
+          "label": "Haitian"
+         },
+         "ha": {
+          "label": "Hausa"
+         },
+         "haw": {
+          "label": "Hawaiian"
+         },
+         "he": {
+          "label": "Hebrew"
+         },
+         "hi": {
+          "label": "Hindi"
+         },
+         "hu": {
+          "label": "Hungarian"
+         },
+         "is": {
+          "label": "Icelandic"
+         },
+         "id": {
+          "label": "Indonesian"
+         },
+         "ja": {
+          "label": "Japanese"
+         },
+         "jw": {
+          "label": "Javanese"
+         },
+         "kn": {
+          "label": "Kannada"
+         },
+         "kk": {
+          "label": "Kazakh"
+         },
+         "km": {
+          "label": "Khmer"
+         },
+         "ko": {
+          "label": "Korean"
+         },
+         "lo": {
+          "label": "Lao"
+         },
+         "la": {
+          "label": "Latin"
+         },
+         "lv": {
+          "label": "Latvian"
+         },
+         "ln": {
+          "label": "Lingala"
+         },
+         "lt": {
+          "label": "Lithuanian"
+         },
+         "lb": {
+          "label": "Luxembourgish"
+         },
+         "mk": {
+          "label": "Macedonian"
+         },
+         "mg": {
+          "label": "Malagasy"
+         },
+         "ms": {
+          "label": "Malay"
+         },
+         "ml": {
+          "label": "Malayalam"
+         },
+         "mt": {
+          "label": "Maltese"
+         },
+         "mi": {
+          "label": "Maori"
+         },
+         "mr": {
+          "label": "Marathi"
+         },
+         "mn": {
+          "label": "Mongolian"
+         },
+         "ne": {
+          "label": "Nepali"
+         },
+         "no": {
+          "label": "Norwegian"
+         },
+         "nn": {
+          "label": "Norwegian Nynorsk"
+         },
+         "oc": {
+          "label": "Occitan"
+         },
+         "pa": {
+          "label": "Panjabi"
+         },
+         "ps": {
+          "label": "Pashto"
+         },
+         "fa": {
+          "label": "Persian"
+         },
+         "pl": {
+          "label": "Polish"
+         },
+         "ro": {
+          "label": "Romanian"
+         },
+         "ru": {
+          "label": "Russian"
+         },
+         "sa": {
+          "label": "Sanskrit"
+         },
+         "sr": {
+          "label": "Serbian"
+         },
+         "sn": {
+          "label": "Shona"
+         },
+         "sd": {
+          "label": "Sindhi"
+         },
+         "si": {
+          "label": "Sinhala"
+         },
+         "sk": {
+          "label": "Slovak"
+         },
+         "sl": {
+          "label": "Slovenian"
+         },
+         "so": {
+          "label": "Somali"
+         },
+         "su": {
+          "label": "Sundanese"
+         },
+         "sw": {
+          "label": "Swahili"
+         },
+         "sv": {
+          "label": "Swedish"
+         },
+         "tl": {
+          "label": "Tagalog"
+         },
+         "tg": {
+          "label": "Tajik"
+         },
+         "ta": {
+          "label": "Tamil"
+         },
+         "tt": {
+          "label": "Tatar"
+         },
+         "te": {
+          "label": "Telugu"
+         },
+         "th": {
+          "label": "Thai"
+         },
+         "bo": {
+          "label": "Tibetan"
+         },
+         "tr": {
+          "label": "Turkish"
+         },
+         "tk": {
+          "label": "Turkmen"
+         },
+         "uk": {
+          "label": "Ukrainian"
+         },
+         "ur": {
+          "label": "Urdu"
+         },
+         "uz": {
+          "label": "Uzbek"
+         },
+         "vi": {
+          "label": "Vietnamese"
+         },
+         "cy": {
+          "label": "Welsh"
+         },
+         "yi": {
+          "label": "Yiddish"
+         },
+         "yo": {
+          "label": "Yoruba"
+         }
+        }
+       },
+       "nullable": true
+      },
+      "language_confidence_threshold": {
+       "type": "number",
+       "format": "float",
+       "minimum": 0,
+       "maximum": 1,
+       "default": 0
+      },
+      "language_detection": {
+       "type": "boolean",
+       "default": false
+      },
+      "language_detection_options": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "expected_languages": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "fallback_language": {
+         "type": "string",
+         "default": "auto"
+        },
+        "code_switching": {
+         "type": "boolean",
+         "default": false
+        },
+        "code_switching_confidence_threshold": {
+         "type": "number",
+         "minimum": 0,
+         "maximum": 1,
+         "default": 0.3
+        }
+       }
+      },
+      "multichannel": {
+       "type": "boolean",
+       "default": false
+      },
+      "prompt": {
+       "type": "string"
+      },
+      "punctuate": {
+       "type": "boolean",
+       "default": true
+      },
+      "redact_pii": {
+       "type": "boolean",
+       "default": false
+      },
+      "redact_pii_audio": {
+       "type": "boolean",
+       "default": false
+      },
+      "redact_pii_audio_options": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "return_redacted_no_speech_audio": {
+         "type": "boolean",
+         "default": false
+        }
+       }
+      },
+      "redact_pii_audio_quality": {
+       "type": "string",
+       "x-fern-sdk-group-name": "transcripts",
+       "enum": [
+        "mp3",
+        "wav"
+       ],
+       "x-fern-enum": {
+        "mp3": {
+         "casing": {
+          "camel": "mp3",
+          "snake": "mp3",
+          "pascal": "Mp3",
+          "screamingSnake": "MP3"
+         }
+        },
+        "wav": {}
+       },
+       "x-aai-enum": {
+        "mp3": {
+         "label": "MP3"
+        },
+        "wav": {
+         "label": "WAV"
+        }
+       }
+      },
+      "redact_pii_policies": {
+       "type": "array",
+       "items": {
+        "x-fern-sdk-group-name": "transcripts",
+        "type": "string",
+        "enum": [
+         "account_number",
+         "banking_information",
+         "blood_type",
+         "credit_card_cvv",
+         "credit_card_expiration",
+         "credit_card_number",
+         "date",
+         "date_interval",
+         "date_of_birth",
+         "drivers_license",
+         "drug",
+         "duration",
+         "email_address",
+         "event",
+         "filename",
+         "gender_sexuality",
+         "healthcare_number",
+         "injury",
+         "ip_address",
+         "language",
+         "location",
+         "marital_status",
+         "medical_condition",
+         "medical_process",
+         "money_amount",
+         "nationality",
+         "number_sequence",
+         "occupation",
+         "organization",
+         "travel document_number",
+         "password",
+         "person_age",
+         "person_name",
+         "phone_number",
+         "physical_attribute",
+         "political_affiliation",
+         "religion",
+         "statistics",
+         "time",
+         "url",
+         "us_social_security_number",
+         "username",
+         "vehicle_id",
+         "zodiac_sign"
+        ],
+        "x-fern-enum": {
+         "account_number": {},
+         "banking_information": {},
+         "blood_type": {},
+         "credit_card_cvv": {},
+         "credit_card_expiration": {},
+         "credit_card_number": {},
+         "date": {},
+         "date_interval": {},
+         "date_of_birth": {},
+         "drivers_license": {},
+         "drug": {},
+         "duration": {},
+         "email_address": {},
+         "event": {},
+         "filename": {},
+         "gender_sexuality": {},
+         "healthcare_number": {},
+         "injury": {},
+         "ip_address": {},
+         "language": {},
+         "location": {},
+         "marital_status": {},
+         "medical_condition": {},
+         "medical_process": {},
+         "money_amount": {},
+         "nationality": {},
+         "number_sequence": {},
+         "occupation": {},
+         "organization": {},
+         "travel document_number": {},
+         "password": {},
+         "person_age": {},
+         "person_name": {},
+         "phone_number": {},
+         "physical_attribute": {},
+         "political_affiliation": {},
+         "religion": {},
+         "statistics": {},
+         "time": {},
+         "url": {},
+         "us_social_security_number": {},
+         "username": {},
+         "vehicle_id": {},
+         "zodiac_sign": {}
+        },
+        "x-aai-enum": {
+         "account_number": {
+          "label": "Account number"
+         },
+         "banking_information": {
+          "label": "Banking information"
+         },
+         "blood_type": {
+          "label": "Blood type"
+         },
+         "credit_card_cvv": {
+          "label": "Credit card CVV"
+         },
+         "credit_card_expiration": {
+          "label": "Credit card expiration"
+         },
+         "credit_card_number": {
+          "label": "Credit card number"
+         },
+         "date": {
+          "label": "Date"
+         },
+         "date_interval": {
+          "label": "Date interval"
+         },
+         "date_of_birth": {
+          "label": "Date of birth"
+         },
+         "drivers_license": {
+          "label": "Driver's license"
+         },
+         "drug": {
+          "label": "Drug"
+         },
+         "duration": {
+          "label": "Duration"
+         },
+         "email_address": {
+          "label": "Email address"
+         },
+         "event": {
+          "label": "Event"
+         },
+         "filename": {
+          "label": "Filename"
+         },
+         "gender_sexuality": {
+          "label": "Gender sexuality"
+         },
+         "healthcare_number": {
+          "label": "Healthcare number"
+         },
+         "injury": {
+          "label": "Injury"
+         },
+         "ip_address": {
+          "label": "IP address"
+         },
+         "language": {
+          "label": "Language"
+         },
+         "location": {
+          "label": "Location"
+         },
+         "marital_status": {
+          "label": "Marital status"
+         },
+         "medical_condition": {
+          "label": "Medical condition"
+         },
+         "medical_process": {
+          "label": "Medical process"
+         },
+         "money_amount": {
+          "label": "Money amount"
+         },
+         "nationality": {
+          "label": "Nationality"
+         },
+         "number_sequence": {
+          "label": "Number sequence"
+         },
+         "occupation": {
+          "label": "Occupation"
+         },
+         "organization": {
+          "label": "Organization"
+         },
+         "travel document_number": {
+          "label": "travel document number"
+         },
+         "password": {
+          "label": "Password"
+         },
+         "person_age": {
+          "label": "Person age"
+         },
+         "person_name": {
+          "label": "Person name"
+         },
+         "phone_number": {
+          "label": "Phone number"
+         },
+         "physical_attribute": {
+          "label": "Physical attribute"
+         },
+         "political_affiliation": {
+          "label": "Political affiliation"
+         },
+         "religion": {
+          "label": "Religion"
+         },
+         "statistics": {
+          "label": "Statistics"
+         },
+         "time": {
+          "label": "Time"
+         },
+         "url": {
+          "label": "URL"
+         },
+         "us_social_security_number": {
+          "label": "US Social Security Number"
+         },
+         "username": {
+          "label": "Username"
+         },
+         "vehicle_id": {
+          "label": "Vehicle ID"
+         },
+         "zodiac_sign": {
+          "label": "Zodiac sign"
+         }
+        }
+       }
+      },
+      "redact_pii_sub": {
+       "oneOf": [
+        {
+         "type": "string",
+         "x-fern-sdk-group-name": "transcripts",
+         "enum": [
+          "entity_name",
+          "hash"
+         ],
+         "x-aai-enum": {
+          "entity_name": {
+           "label": "Entity name"
+          },
+          "hash": {
+           "label": "Hash"
+          }
+         }
+        },
+        {
+         "type": "string",
+         "nullable": true
+        }
+       ],
+       "default": "hash"
+      },
+      "sentiment_analysis": {
+       "type": "boolean",
+       "default": false
+      },
+      "speaker_labels": {
+       "type": "boolean",
+       "default": false
+      },
+      "speaker_options": {
+       "type": "object",
+       "additionalProperties": false,
+       "properties": {
+        "min_speakers_expected": {
+         "type": "integer",
+         "default": 1
+        },
+        "max_speakers_expected": {
+         "type": "integer",
+         "default": 10
+        }
+       }
+      },
+      "speakers_expected": {
+       "type": "integer",
+       "default": null,
+       "nullable": true
+      },
+      "speech_models": {
+       "type": "array",
+       "items": {
+        "type": "string",
+        "x-fern-sdk-group-name": "transcripts"
+       }
+      },
+      "speech_threshold": {
+       "type": "number",
+       "format": "float",
+       "minimum": 0,
+       "maximum": 1,
+       "default": 0,
+       "nullable": true
+      },
+      "speech_understanding": {
+       "type": "object",
+       "properties": {
+        "request": {
+         "oneOf": [
+          {
+           "type": "object",
+           "properties": {
+            "translation": {
+             "type": "object",
+             "properties": {
+              "target_languages": {
+               "type": "array",
+               "items": {
+                "type": "string"
+               }
+              },
+              "formal": {
+               "type": "boolean",
+               "default": true
+              },
+              "match_original_utterance": {
+               "type": "boolean",
+               "default": false
+              }
+             },
+             "required": [
+              "target_languages"
+             ]
+            }
+           },
+           "required": [
+            "translation"
+           ]
+          },
+          {
+           "type": "object",
+           "properties": {
+            "speaker_identification": {
+             "type": "object",
+             "properties": {
+              "speaker_type": {
+               "type": "string",
+               "enum": [
+                "role",
+                "name"
+               ]
+              },
+              "known_values": {
+               "type": "array",
+               "items": {
+                "type": "string"
+               }
+              },
+              "speakers": {
+               "type": "array",
+               "items": {
+                "type": "object",
+                "properties": {
+                 "role": {
+                  "type": "string"
+                 },
+                 "name": {
+                  "type": "string"
+                 }
+                },
+                "additionalProperties": true
+               }
+              }
+             },
+             "required": [
+              "speaker_type"
+             ]
+            }
+           },
+           "required": [
+            "speaker_identification"
+           ]
+          },
+          {
+           "type": "object",
+           "properties": {
+            "custom_formatting": {
+             "type": "object",
+             "properties": {
+              "date": {
+               "type": "string"
+              },
+              "phone_number": {
+               "type": "string"
+              },
+              "email": {
+               "type": "string"
+              }
+             }
+            }
+           },
+           "required": [
+            "custom_formatting"
+           ]
+          }
+         ]
+        }
+       },
+       "required": [
+        "request"
+       ]
+      },
+      "summarization": {
+       "type": "boolean",
+       "default": false
+      },
+      "summary_model": {
+       "type": "string",
+       "x-fern-sdk-group-name": "transcripts",
+       "enum": [
+        "informative",
+        "conversational",
+        "catchy"
+       ],
+       "x-aai-enum": {
+        "informative": {
+         "label": "Informative"
+        },
+        "conversational": {
+         "label": "Conversational"
+        },
+        "catchy": {
+         "label": "Catchy"
+        }
+       }
+      },
+      "summary_type": {
+       "type": "string",
+       "x-fern-sdk-group-name": "transcripts",
+       "enum": [
+        "bullets",
+        "bullets_verbose",
+        "gist",
+        "headline",
+        "paragraph"
+       ],
+       "x-aai-enum": {
+        "bullets": {
+         "label": "Bullets"
+        },
+        "bullets_verbose": {
+         "label": "Bullets verbose"
+        },
+        "gist": {
+         "label": "Gist"
+        },
+        "headline": {
+         "label": "Headline"
+        },
+        "paragraph": {
+         "label": "Paragraph"
+        }
+       }
+      },
+      "temperature": {
+       "type": "number",
+       "minimum": 0,
+       "maximum": 1,
+       "default": 0
+      },
+      "custom_topics": {
+       "type": "boolean",
+       "default": false,
+       "deprecated": true
+      },
+      "speech_model": {
+       "oneOf": [
+        {
+         "type": "string",
+         "x-fern-sdk-group-name": "transcripts"
+        },
+        {
+         "type": "string",
+         "nullable": true
+        }
+       ],
+       "deprecated": true
+      },
+      "topics": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       },
+       "deprecated": true
+      }
+     },
+     "type": "object",
+     "additionalProperties": false,
+     "x-fern-sdk-group-name": "transcripts"
+    },
+    "assembly_ai_v3_streaming": {
+     "type": "object",
+     "properties": {
+      "speech_model": {
+       "type": "string"
+      },
+      "format_turns": {
+       "default": false,
+       "type": "boolean"
+      },
+      "inactivity_timeout": {
+       "default": "None",
+       "format": "s",
+       "type": "integer",
+       "minimum": 5,
+       "maximum": 3600
+      },
+      "keyterms_prompt": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "language_detection": {
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ],
+       "default": "false"
+      },
+      "max_turn_silence": {
+       "type": "integer",
+       "default": 1280
+      },
+      "min_turn_silence": {
+       "type": "integer",
+       "default": 400
+      },
+      "vad_threshold": {
+       "default": 0.4,
+       "type": "number"
+      },
+      "end_of_turn_confidence_threshold": {
+       "deprecated": true,
+       "type": "number",
+       "default": 0.4
+      },
+      "language": {
+       "enum": [
+        "en",
+        "multi"
+       ],
+       "default": "en",
+       "deprecated": true
+      }
+     }
+    },
+    "deepgram_streaming": {
+     "type": "object",
+     "properties": {
+      "diarize": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "dictation": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "endpointing": {
+       "default": "10"
+      },
+      "extra": {},
+      "filler_words": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "interim_results": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "keyterm": {},
+      "keywords": {},
+      "language": {
+       "default": "en",
+       "enum": [
+        "bg",
+        "ca",
+        "cs",
+        "da",
+        "da-DK",
+        "de",
+        "de-CH",
+        "el",
+        "en",
+        "en-AU",
+        "en-GB",
+        "en-IN",
+        "en-NZ",
+        "en-US",
+        "es",
+        "es-419",
+        "es-LATAM",
+        "et",
+        "fi",
+        "fr",
+        "fr-CA",
+        "hi",
+        "hi-Latn",
+        "hu",
+        "id",
+        "it",
+        "ja",
+        "ko",
+        "ko-KR",
+        "lt",
+        "lv",
+        "ms",
+        "multi",
+        "nl",
+        "nl-BE",
+        "no",
+        "pl",
+        "pt",
+        "pt-BR",
+        "pt-PT",
+        "ro",
+        "ru",
+        "sk",
+        "sv",
+        "sv-SE",
+        "taq",
+        "th",
+        "th-TH",
+        "tr",
+        "uk",
+        "vi",
+        "zh",
+        "zh-CN",
+        "zh-HK",
+        "zh-Hans",
+        "zh-Hant",
+        "zh-TW"
+       ]
+      },
+      "mip_opt_out": {
+       "default": "false"
+      },
+      "model": {
+       "enum": [
+        "nova-3",
+        "nova-3-general",
+        "nova-3-medical",
+        "nova-2",
+        "nova-2-general",
+        "nova-2-meeting",
+        "nova-2-finance",
+        "nova-2-conversationalai",
+        "nova-2-voicemail",
+        "nova-2-video",
+        "nova-2-medical",
+        "nova-2-drivethru",
+        "nova-2-automotive",
+        "nova",
+        "nova-general",
+        "nova-phonecall",
+        "nova-medical",
+        "enhanced",
+        "enhanced-general",
+        "enhanced-meeting",
+        "enhanced-phonecall",
+        "enhanced-finance",
+        "base",
+        "meeting",
+        "phonecall",
+        "finance",
+        "conversationalai",
+        "voicemail",
+        "video",
+        "custom"
+       ]
+      },
+      "multichannel": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "numerals": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "profanity_filter": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "punctuate": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "redact": {
+       "default": "false",
+       "oneOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       ]
+      },
+      "replace": {},
+      "search": {},
+      "smart_format": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "tag": {},
+      "utterance_end_ms": {},
+      "vad_events": {
+       "default": "false",
+       "enum": [
+        "true",
+        "false",
+        true,
+        false
+       ]
+      },
+      "version": {
+       "default": "latest"
+      }
+     }
+    },
+    "gladia_v2_streaming": {
+     "type": "object",
+     "properties": {
+      "custom_metadata": {
+       "type": "object"
+      },
+      "model": {
+       "type": "string",
+       "default": "solaria-1",
+       "enum": [
+        "solaria-1"
+       ]
+      },
+      "endpointing": {
+       "type": "number",
+       "default": 0.05,
+       "minimum": 0.01,
+       "maximum": 10
+      },
+      "maximum_duration_without_endpointing": {
+       "type": "number",
+       "default": 5,
+       "minimum": 5,
+       "maximum": 60
+      },
+      "language_config": {
+       "properties": {
+        "languages": {
+         "type": "array",
+         "default": [],
+         "items": {
+          "type": "string",
+          "enum": [
+           "af",
+           "sq",
+           "am",
+           "ar",
+           "hy",
+           "as",
+           "az",
+           "ba",
+           "eu",
+           "be",
+           "bn",
+           "bs",
+           "br",
+           "bg",
+           "ca",
+           "zh",
+           "hr",
+           "cs",
+           "da",
+           "nl",
+           "en",
+           "et",
+           "fo",
+           "fi",
+           "fr",
+           "gl",
+           "ka",
+           "de",
+           "el",
+           "gu",
+           "ht",
+           "ha",
+           "haw",
+           "he",
+           "hi",
+           "hu",
+           "is",
+           "id",
+           "it",
+           "ja",
+           "jv",
+           "kn",
+           "kk",
+           "km",
+           "ko",
+           "lo",
+           "la",
+           "lv",
+           "ln",
+           "lt",
+           "lb",
+           "mk",
+           "mg",
+           "ms",
+           "ml",
+           "mt",
+           "mi",
+           "mr",
+           "mn",
+           "mymr",
+           "ne",
+           "no",
+           "nn",
+           "oc",
+           "ps",
+           "fa",
+           "pl",
+           "pt",
+           "pa",
+           "ro",
+           "ru",
+           "sa",
+           "sr",
+           "sn",
+           "sd",
+           "si",
+           "sk",
+           "sl",
+           "so",
+           "es",
+           "su",
+           "sw",
+           "sv",
+           "tl",
+           "tg",
+           "ta",
+           "tt",
+           "te",
+           "th",
+           "bo",
+           "tr",
+           "tk",
+           "uk",
+           "ur",
+           "uz",
+           "vi",
+           "cy",
+           "yi",
+           "yo",
+           "jp"
+          ]
+         }
+        },
+        "code_switching": {
+         "type": "boolean",
+         "default": false
+        }
+       },
+       "type": "object"
+      },
+      "pre_processing": {
+       "properties": {
+        "audio_enhancer": {
+         "type": "boolean",
+         "default": false
+        },
+        "speech_threshold": {
+         "type": "number",
+         "default": 0.6,
+         "minimum": 0,
+         "maximum": 1
+        }
+       },
+       "type": "object"
+      },
+      "realtime_processing": {
+       "properties": {
+        "custom_vocabulary": {
+         "type": "boolean",
+         "default": false
+        },
+        "custom_vocabulary_config": {
+         "properties": {
+          "vocabulary": {
+           "type": "array",
+           "items": {
+            "oneOf": [
+             {
+              "type": "object",
+              "properties": {
+               "value": {
+                "type": "string"
+               },
+               "intensity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+               },
+               "pronunciations": {
+                "type": "array",
+                "items": {
+                 "type": "string"
+                }
+               },
+               "language": {
+                "type": "string"
+               }
+              },
+              "required": [
+               "value"
+              ]
+             },
+             {
+              "type": "string"
+             }
+            ]
+           }
+          },
+          "default_intensity": {
+           "type": "number",
+           "minimum": 0,
+           "maximum": 1
+          }
+         },
+         "required": [
+          "vocabulary"
+         ],
+         "type": "object"
+        },
+        "custom_spelling": {
+         "type": "boolean",
+         "default": false
+        },
+        "custom_spelling_config": {
+         "properties": {
+          "spelling_dictionary": {
+           "type": "object"
+          }
+         },
+         "required": [
+          "spelling_dictionary"
+         ],
+         "type": "object"
+        },
+        "translation": {
+         "type": "boolean",
+         "default": false
+        },
+        "translation_config": {
+         "properties": {
+          "target_languages": {
+           "type": "array",
+           "minItems": 1,
+           "items": {
+            "type": "string",
+            "enum": [
+             "af",
+             "sq",
+             "am",
+             "ar",
+             "hy",
+             "as",
+             "ast",
+             "az",
+             "ba",
+             "eu",
+             "be",
+             "bn",
+             "bs",
+             "br",
+             "bg",
+             "my",
+             "ca",
+             "ceb",
+             "zh",
+             "hr",
+             "cs",
+             "da",
+             "nl",
+             "en",
+             "et",
+             "fo",
+             "fi",
+             "nl",
+             "fr",
+             "fy",
+             "ff",
+             "gd",
+             "gl",
+             "lg",
+             "ka",
+             "de",
+             "el",
+             "gu",
+             "ht",
+             "ha",
+             "haw",
+             "he",
+             "hi",
+             "hu",
+             "is",
+             "ig",
+             "ilo",
+             "id",
+             "ga",
+             "it",
+             "ja",
+             "jp",
+             "jv",
+             "kn",
+             "kk",
+             "km",
+             "ko",
+             "lo",
+             "la",
+             "lv",
+             "ln",
+             "lt",
+             "lb",
+             "mk",
+             "mg",
+             "ms",
+             "ml",
+             "mt",
+             "mi",
+             "mr",
+             "mo",
+             "mn",
+             "mymr",
+             "ne",
+             "no",
+             "nn",
+             "oc",
+             "or",
+             "pa",
+             "ps",
+             "fa",
+             "pl",
+             "pt",
+             "pa",
+             "ro",
+             "ru",
+             "sa",
+             "sr",
+             "sn",
+             "sd",
+             "si",
+             "sk",
+             "sl",
+             "so",
+             "es",
+             "su",
+             "sw",
+             "ss",
+             "sv",
+             "tl",
+             "tg",
+             "ta",
+             "tt",
+             "te",
+             "th",
+             "bo",
+             "tn",
+             "tr",
+             "tk",
+             "uk",
+             "ur",
+             "uz",
+             "vi",
+             "cy",
+             "wo",
+             "xh",
+             "yi",
+             "yo",
+             "zu"
+            ]
+           }
+          },
+          "model": {
+           "type": "string",
+           "default": "base",
+           "enum": [
+            "base",
+            "enhanced"
+           ]
+          },
+          "match_original_utterances": {
+           "type": "boolean",
+           "default": true
+          },
+          "lipsync": {
+           "type": "boolean",
+           "default": true
+          },
+          "context_adaptation": {
+           "type": "boolean",
+           "default": true
+          },
+          "context": {
+           "type": "string"
+          },
+          "informal": {
+           "type": "boolean",
+           "default": false
+          }
+         },
+         "required": [
+          "target_languages"
+         ],
+         "type": "object"
+        },
+        "named_entity_recognition": {
+         "type": "boolean",
+         "default": false
+        },
+        "sentiment_analysis": {
+         "type": "boolean",
+         "default": false
+        }
+       },
+       "type": "object"
+      },
+      "post_processing": {
+       "properties": {
+        "summarization": {
+         "type": "boolean",
+         "default": false
+        },
+        "summarization_config": {
+         "properties": {
+          "type": {
+           "type": "string",
+           "default": "general",
+           "enum": [
+            "general",
+            "bullet_points",
+            "concise"
+           ]
+          }
+         },
+         "type": "object"
+        },
+        "chapterization": {
+         "type": "boolean",
+         "default": false
+        }
+       },
+       "type": "object"
+      },
+      "messages_config": {
+       "properties": {
+        "receive_final_transcripts": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_speech_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_pre_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_realtime_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_post_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_acknowledgments": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_errors": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_lifecycle_events": {
+         "type": "boolean",
+         "default": false
+        }
+       },
+       "type": "object"
+      },
+      "callback": {
+       "type": "boolean",
+       "default": false
+      },
+      "callback_config": {
+       "properties": {
+        "url": {
+         "type": "string",
+         "format": "uri"
+        },
+        "receive_final_transcripts": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_speech_events": {
+         "type": "boolean",
+         "default": false
+        },
+        "receive_pre_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_realtime_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_post_processing_events": {
+         "type": "boolean",
+         "default": true
+        },
+        "receive_acknowledgments": {
+         "type": "boolean",
+         "default": false
+        },
+        "receive_errors": {
+         "type": "boolean",
+         "default": false
+        },
+        "receive_lifecycle_events": {
+         "type": "boolean",
+         "default": true
+        }
+       },
+       "type": "object"
+      }
+     }
+    },
+    "rev_streaming": {
+     "type": "object",
+     "properties": {
+      "obscure_expletives": {
+       "type": "boolean"
+      },
+      "delete_after": {
+       "type": "string",
+       "format": "date-span"
+      },
+      "audio_options._content_type": {
+       "type": "string"
+      },
+      "audio_options._layout": {
+       "type": "string"
+      },
+      "audio_options._rate": {
+       "type": "integer",
+       "format": "int32"
+      },
+      "audio_options._format": {
+       "type": "string"
+      },
+      "audio_options._channels": {
+       "type": "integer",
+       "format": "int32"
+      },
+      "transcriber": {
+       "enum": [
+        0,
+        1
+       ],
+       "type": "integer",
+       "format": "int32"
+      },
+      "language": {
+       "type": "string"
+      },
+      "metadata": {
+       "maxLength": 512,
+       "minLength": 0,
+       "type": "string"
+      },
+      "filter_profanity": {
+       "type": "boolean"
+      },
+      "remove_disfluencies": {
+       "type": "boolean"
+      },
+      "detailed_partials": {
+       "type": "boolean"
+      },
+      "custom_vocabulary_id": {
+       "type": "string"
+      },
+      "delete_after_seconds": {
+       "type": "integer",
+       "format": "int32"
+      },
+      "max_segment_duration_seconds": {
+       "maximum": 30,
+       "minimum": 5,
+       "type": "integer",
+       "format": "int32"
+      },
+      "max_connection_wait_seconds": {
+       "maximum": 600,
+       "minimum": 60,
+       "type": "integer",
+       "format": "int32"
+      },
+      "allow_interruption": {
+       "type": "boolean"
+      },
+      "enable_speaker_switch": {
+       "type": "boolean"
+      },
+      "start_ts": {
+       "type": "string",
+       "format": "date-span"
+      },
+      "skip_postprocessing": {
+       "type": "boolean"
+      },
+      "priority": {
+       "enum": [
+        0,
+        1
+       ],
+       "type": "integer",
+       "format": "int32"
+      },
+      "user_agent": {
+       "type": "string"
+      }
+     }
+    },
+    "aws_transcribe_streaming": {
+     "type": "object",
+     "properties": {
+      "language_code": {
+       "type": "string"
+      },
+      "vocabulary_filter_method": {
+       "type": "string"
+      },
+      "vocabulary_filter_name": {
+       "type": "string"
+      },
+      "vocabulary_name": {
+       "type": "string"
+      },
+      "region": {
+       "type": "string"
+      },
+      "enable_partial_results_stabilization": {
+       "type": "boolean"
+      },
+      "partial_results_stability": {
+       "type": "string"
+      },
+      "content_identification_type": {
+       "type": "string"
+      },
+      "content_redaction_type": {
+       "type": "string"
+      },
+      "pii_entity_types": {
+       "type": "string"
+      },
+      "language_model_name": {
+       "type": "string"
+      },
+      "identify_language": {
+       "type": "boolean"
+      },
+      "language_options": {
+       "type": "string"
+      },
+      "preferred_language": {
+       "type": "string"
+      },
+      "vocabulary_names": {
+       "type": "string"
+      },
+      "vocabulary_filter_names": {
+       "type": "string"
+      }
+     },
+     "oneOf": [
+      {
+       "required": [
+        "language_code"
+       ]
+      },
+      {
+       "required": [
+        "identify_language",
+        "language_options"
+       ],
+       "properties": {
+        "identify_language": {
+         "type": "boolean",
+         "enum": [
+          true
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "speechmatics_streaming": {
+     "type": "object",
+     "properties": {
+      "language": {
+       "type": "string"
+      },
+      "domain": {
+       "type": "string"
+      },
+      "output_locale": {
+       "type": "string",
+       "minLength": 1
+      },
+      "additional_vocab": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "oneOf": [
+         {
+          "type": "string",
+          "minLength": 1
+         },
+         {
+          "type": "object",
+          "properties": {
+           "content": {
+            "type": "string",
+            "minLength": 1
+           },
+           "sounds_like": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "minLength": 1
+            },
+            "minItems": 1
+           }
+          },
+          "required": [
+           "content"
+          ]
+         }
+        ]
+       }
+      },
+      "diarization": {
+       "type": "string",
+       "enum": [
+        "none",
+        "speaker"
+       ]
+      },
+      "max_delay": {
+       "type": "number",
+       "minimum": 0
+      },
+      "max_delay_mode": {
+       "type": "string",
+       "enum": [
+        "flexible",
+        "fixed"
+       ]
+      },
+      "speaker_diarization_config": {
+       "type": "object",
+       "properties": {
+        "max_speakers": {
+         "type": "number",
+         "format": "integer",
+         "minimum": 2,
+         "maximum": 100
+        },
+        "prefer_current_speaker": {
+         "type": "boolean"
+        },
+        "speaker_sensitivity": {
+         "type": "number",
+         "format": "float",
+         "minimum": 0,
+         "maximum": 1
+        },
+        "get_speakers": {
+         "type": "boolean"
+        },
+        "speakers": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "label": {
+            "type": "string",
+            "minLength": 1
+           },
+           "speaker_identifiers": {
+            "type": "array",
+            "items": {
+             "type": "string",
+             "format": "byte"
+            },
+            "minItems": 1
+           }
+          },
+          "required": [
+           "label",
+           "speaker_identifiers"
+          ]
+         },
+         "maxItems": 50
+        }
+       }
+      },
+      "audio_filtering_config": {
+       "type": "object",
+       "properties": {
+        "volume_threshold": {
+         "type": "number",
+         "format": "float",
+         "minimum": 0,
+         "maximum": 100
+        }
+       }
+      },
+      "transcript_filtering_config": {
+       "type": "object",
+       "properties": {
+        "remove_disfluencies": {
+         "type": "boolean"
+        },
+        "replacements": {
+         "type": "array",
+         "items": {
+          "type": "object",
+          "properties": {
+           "from": {
+            "type": "string"
+           },
+           "to": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "from",
+           "to"
+          ]
+         }
+        }
+       }
+      },
+      "enable_partials": {
+       "type": "boolean",
+       "default": false
+      },
+      "enable_entities": {
+       "type": "boolean",
+       "default": true
+      },
+      "operating_point": {
+       "type": "string",
+       "enum": [
+        "standard",
+        "enhanced"
+       ]
+      },
+      "punctuation_overrides": {
+       "type": "object",
+       "properties": {
+        "permitted_marks": {
+         "type": "array",
+         "items": {
+          "pattern": "^(.|all)$",
+          "type": "string"
+         }
+        },
+        "sensitivity": {
+         "type": "number",
+         "format": "float",
+         "maximum": 1,
+         "minimum": 0
+        }
+       }
+      },
+      "conversation_config": {
+       "type": "object",
+       "properties": {
+        "end_of_utterance_silence_trigger": {
+         "type": "number",
+         "format": "float",
+         "minimum": 0,
+         "maximum": 2,
+         "default": 0
+        }
+       }
+      }
+     },
+     "required": [
+      "language"
+     ]
+    },
+    "elevenlabs_streaming": {
+     "type": "object",
+     "properties": {
+      "model_id": {
+       "type": "string",
+       "default": "eleven_whisper_v2_realtime"
+      },
+      "language_code": {
+       "type": "string"
+      },
+      "previous_text": {
+       "type": "string"
+      }
+     }
+    },
+    "meeting_captions": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/MeetingCaptionsRequest"
+      }
+     ]
+    }
+   }
+  },
+  "RecallaiStreamingTranscriptionRequest": {
+   "type": "object",
+   "properties": {
+    "language_code": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/LanguageCodeC40Enum"
+      }
+     ],
+     "default": "auto"
+    },
+    "spelling": {
+     "type": "array",
+     "items": {
+      "$ref": "#/components/schemas/RecallaiSpellingEntryRequest"
+     }
+    },
+    "key_terms": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    },
+    "filter_profanity": {
+     "type": "boolean",
+     "default": false
+    },
+    "mode": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/RecallaiStreamingTranscriptionModeEnum"
+      }
+     ],
+     "default": "prioritize_accuracy"
+    }
+   }
+  },
+  "LanguageCodeC40Enum": {
+   "enum": [
+    "auto",
+    "bg",
+    "ca",
+    "cs",
+    "da",
+    "de",
+    "el",
+    "en",
+    "en_au",
+    "en_uk",
+    "en_us",
+    "es",
+    "et",
+    "fi",
+    "fr",
+    "he",
+    "hi",
+    "hr",
+    "hu",
+    "id",
+    "it",
+    "ja",
+    "ko",
+    "lt",
+    "lv",
+    "ms",
+    "nl",
+    "no",
+    "pl",
+    "pt",
+    "ro",
+    "ru",
+    "sk",
+    "sv",
+    "th",
+    "tr",
+    "uk",
+    "vi",
+    "zh"
+   ],
+   "type": "string"
+  },
+  "RecallaiSpellingEntryRequest": {
+   "type": "object",
+   "properties": {
+    "find": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    },
+    "replace": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "required": [
+    "find",
+    "replace"
+   ]
+  },
+  "RecallaiStreamingTranscriptionModeEnum": {
+   "enum": [
+    "prioritize_low_latency",
+    "prioritize_accuracy"
+   ],
+   "type": "string"
+  },
+  "MeetingCaptionsRequest": {
+   "type": "object",
+   "properties": {
+    "language_code": {
+     "nullable": true,
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/MeetingCaptionsLanguageCodeEnum"
+      }
+     ]
+    }
+   }
+  },
+  "MeetingCaptionsLanguageCodeEnum": {
+   "enum": [
+    "cs",
+    "de",
+    "en",
+    "es",
+    "fil",
+    "fr",
+    "he",
+    "hi",
+    "it",
+    "ja",
+    "ko",
+    "nl",
+    "pl",
+    "pt",
+    "pt-BR",
+    "ro",
+    "ru",
+    "sv",
+    "th",
+    "tr",
+    "uk",
+    "vi",
+    "zh"
+   ],
+   "type": "string"
+  },
+  "BotRecordingConfigTranscriptDiarizationRequest": {
+   "type": "object",
+   "properties": {
+    "use_separate_streams_when_available": {
+     "type": "boolean"
+    }
+   }
+  },
+  "BotRecordingConfigRealtimeEndpointRequest": {
+   "oneOf": [
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointRtmpRequest"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebsocketRequest"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebhookRequest"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointDesktopSdkCallbackRequest"
+    }
+   ],
+   "discriminator": {
+    "propertyName": "type",
+    "mapping": {
+     "rtmp": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointRtmpRequest",
+     "websocket": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebsocketRequest",
+     "webhook": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebhookRequest",
+     "desktop_sdk_callback": "#/components/schemas/BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointDesktopSdkCallbackRequest"
+    }
+   }
+  },
+  "BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointRtmpRequest": {
+   "allOf": [
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointShared"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointRtmpRequest"
+    }
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointShared": {
+   "type": "object",
+   "properties": {
+    "metadata": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    },
+    "type": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointSharedTypeEnum"
+      }
+     ]
+    }
+   },
+   "required": [
+    "type"
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointSharedTypeEnum": {
+   "enum": [
+    "rtmp",
+    "websocket",
+    "webhook",
+    "desktop_sdk_callback"
+   ],
+   "type": "string"
+  },
+  "BotRecordingConfigRealtimeEndpointRtmpRequest": {
+   "type": "object",
+   "properties": {
+    "url": {
+     "type": "string",
+     "minLength": 1,
+     "format": "uri"
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "video_mixed_flv.data"
+      ]
+     }
+    }
+   },
+   "required": [
+    "events",
+    "url"
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebsocketRequest": {
+   "allOf": [
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointShared"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointWebsocketRequest"
+    }
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointWebsocketRequest": {
+   "type": "object",
+   "properties": {
+    "url": {
+     "type": "string",
+     "minLength": 1,
+     "format": "uri"
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "participant_events.join",
+       "participant_events.leave",
+       "participant_events.update",
+       "participant_events.speech_on",
+       "participant_events.speech_off",
+       "participant_events.webcam_on",
+       "participant_events.webcam_off",
+       "participant_events.microphone_on",
+       "participant_events.microphone_off",
+       "participant_events.screenshare_on",
+       "participant_events.screenshare_off",
+       "participant_events.chat_message",
+       "audio_mixed_raw.data",
+       "transcript.data",
+       "transcript.partial_data",
+       "transcript.provider_data",
+       "audio_separate_raw.data",
+       "video_separate_png.data",
+       "video_separate_h264.data"
+      ]
+     }
+    }
+   },
+   "required": [
+    "events",
+    "url"
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointWebhookRequest": {
+   "allOf": [
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointShared"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointWebhookRequest"
+    }
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointWebhookRequest": {
+   "type": "object",
+   "properties": {
+    "url": {
+     "type": "string",
+     "minLength": 1,
+     "format": "uri"
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "participant_events.join",
+       "participant_events.leave",
+       "participant_events.update",
+       "participant_events.speech_on",
+       "participant_events.speech_off",
+       "participant_events.webcam_on",
+       "participant_events.webcam_off",
+       "participant_events.microphone_on",
+       "participant_events.microphone_off",
+       "participant_events.screenshare_on",
+       "participant_events.screenshare_off",
+       "participant_events.chat_message",
+       "transcript.data",
+       "transcript.partial_data",
+       "transcript.provider_data"
+      ]
+     }
+    }
+   },
+   "required": [
+    "events",
+    "url"
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointBotRecordingConfigRealtimeEndpointDesktopSdkCallbackRequest": {
+   "allOf": [
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointShared"
+    },
+    {
+     "$ref": "#/components/schemas/BotRecordingConfigRealtimeEndpointDesktopSdkCallbackRequest"
+    }
+   ]
+  },
+  "BotRecordingConfigRealtimeEndpointDesktopSdkCallbackRequest": {
+   "type": "object",
+   "properties": {
+    "events": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "participant_events.join",
+       "participant_events.leave",
+       "participant_events.update",
+       "participant_events.speech_on",
+       "participant_events.speech_off",
+       "participant_events.webcam_on",
+       "participant_events.webcam_off",
+       "participant_events.microphone_on",
+       "participant_events.microphone_off",
+       "participant_events.screenshare_on",
+       "participant_events.screenshare_off",
+       "participant_events.chat_message",
+       "transcript.data",
+       "transcript.partial_data",
+       "transcript.provider_data",
+       "video_separate_png.data",
+       "video_separate_h264.data",
+       "audio_mixed_raw.data",
+       "audio_separate_raw.data"
+      ]
+     }
+    }
+   },
+   "required": [
+    "events"
+   ]
+  },
+  "BotRecordingConfigRetentionRequest": {
+   "type": "object",
+   "properties": {
+    "type": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/BotRecordingConfigRetentionSharedTypeEnum"
+      }
+     ]
+    },
+    "hours": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 168
+    }
+   },
+   "required": [
+    "type"
+   ]
+  },
+  "BotRecordingConfigRetentionSharedTypeEnum": {
+   "enum": [
+    "timed",
+    "forever"
+   ],
+   "type": "string"
+  },
+  "VideoMixedLayoutEnum": {
+   "enum": [
+    "speaker_view",
+    "gallery_view",
+    "gallery_view_v2",
+    "audio_only"
+   ],
+   "type": "string"
+  },
+  "BotRecordingConfigBaseArtifactRequest": {
+   "type": "object",
+   "properties": {
+    "metadata": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "VideoMixedParticipantVideoWhenScreenshareEnum": {
+   "enum": [
+    "hide",
+    "beside",
+    "overlap"
+   ],
+   "type": "string"
+  },
+  "StartRecordingOnEnum": {
+   "enum": [
+    "call_join",
+    "participant_join",
+    "participant_speak"
+   ],
+   "type": "string"
+  },
+  "BotIncludeInRecordingRequest": {
+   "type": "object",
+   "properties": {
+    "audio": {
+     "type": "boolean",
+     "default": false
+    }
+   }
+  },
+  "AutomaticLeaveRequest": {
+   "type": "object",
+   "properties": {
+    "waiting_room_timeout": {
+     "type": "integer",
+     "minimum": 30,
+     "default": 1200
+    },
+    "noone_joined_timeout": {
+     "type": "integer",
+     "minimum": 30,
+     "default": 1200
+    },
+    "everyone_left_timeout": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/AutomaticLeaveEveryoneLeftRequest"
+      }
+     ]
+    },
+    "in_call_not_recording_timeout": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 3600
+    },
+    "in_call_recording_timeout": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "recording_permission_denied_timeout": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 30
+    },
+    "silence_detection": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/AutomaticLeaveSilenceDetectionRequest"
+      }
+     ],
+     "default": {
+      "timeout": 3600,
+      "activate_after": 1200
+     }
+    },
+    "bot_detection": {
+     "allOf": [
+      {
+       "$ref": "#/components/schemas/AutomaticLeaveBotDetectionRequest"
+      }
+     ],
+     "default": {
+      "using_participant_events": {
+       "timeout": 600,
+       "activate_after": 1200
+      },
+      "using_participant_names": {
+       "matches": [
+        "notetaker",
+        "recorder",
+        "assistant"
+       ],
+       "timeout": 600,
+       "activate_after": 120
+      }
+     }
+    }
+   }
+  },
+  "AutomaticLeaveEveryoneLeftRequest": {
+   "type": "object",
+   "properties": {
+    "timeout": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 2
+    },
+    "activate_after": {
+     "type": "integer",
+     "minimum": 1,
+     "nullable": true
+    }
+   }
+  },
+  "AutomaticLeaveSilenceDetectionRequest": {
+   "type": "object",
+   "properties": {
+    "timeout": {
+     "type": "integer",
+     "minimum": 10,
+     "default": 3600
+    },
+    "activate_after": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 1200
+    }
+   }
+  },
+  "AutomaticLeaveBotDetectionRequest": {
+   "type": "object",
+   "properties": {
+    "using_participant_events": {
+     "$ref": "#/components/schemas/AutomaticLeaveBotDetectionUsingParticipantEventsRequest"
+    },
+    "using_participant_names": {
+     "$ref": "#/components/schemas/AutomaticLeaveBotDetectionUsingParticipantNamesRequest"
+    }
+   }
+  },
+  "AutomaticLeaveBotDetectionUsingParticipantEventsRequest": {
+   "type": "object",
+   "properties": {
+    "timeout": {
+     "type": "integer",
+     "minimum": 10,
+     "default": 600
+    },
+    "activate_after": {
+     "type": "integer",
+     "minimum": 1,
+     "default": 1200
+    }
+   }
+  },
+  "AutomaticLeaveBotDetectionUsingParticipantNamesRequest": {
+   "type": "object",
+   "properties": {
+    "timeout": {
+     "type": "integer",
+     "minimum": 10
+    },
+    "activate_after": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "matches": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "minLength": 1
+     }
+    }
+   },
+   "required": [
+    "activate_after",
+    "matches",
+    "timeout"
+   ]
+  },
+  "ChatRequest": {
+   "type": "object",
+   "properties": {
+    "on_bot_join": {
+     "$ref": "#/components/schemas/ChatOnBotJoinRequest"
+    },
+    "on_participant_join": {
+     "$ref": "#/components/schemas/ChatOnParticipantJoinRequest"
+    }
+   }
+  },
+  "ChatOnBotJoinRequest": {
+   "type": "object",
+   "properties": {
+    "send_to": {
+     "$ref": "#/components/schemas/SendToEnum"
+    },
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 4096
+    },
+    "pin": {
+     "type": "boolean",
+     "default": false
+    }
+   },
+   "required": [
+    "message",
+    "send_to"
+   ]
+  },
+  "SendToEnum": {
+   "enum": [
+    "host",
+    "everyone",
+    "everyone_except_host"
+   ],
+   "type": "string"
+  },
+  "ChatOnParticipantJoinRequest": {
+   "type": "object",
+   "properties": {
+    "message": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 4096
+    },
+    "exclude_host": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "exclude_host",
+    "message"
+   ]
+  }
+ }
+}

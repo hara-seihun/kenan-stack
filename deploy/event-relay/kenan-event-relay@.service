@@ -1,0 +1,12 @@
+[Unit]
+Description=Kenan event relay %i (one long-lived SSH session following a remote event log into the host event inbox)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/node /usr/local/lib/kenan/event-relay/event-relay.mjs %h/.config/kenan-event-relay/%i.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

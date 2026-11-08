@@ -1,0 +1,7 @@
+#!/bin/sh
+# Mark the shared native module for rebuilding when its source changes on main.
+while read -r old new ref; do
+  [ "$ref" = refs/heads/main ] || continue
+  case $old in 0000000000000000000000000000000000000000) touch /var/cache/kenan-symbolic-search-native/pending 2>/dev/null || true; continue;; esac
+  git diff --quiet "$old" "$new" -- compiler/symbolic-search/native 2>/dev/null || touch /var/cache/kenan-symbolic-search-native/pending 2>/dev/null || true
+done

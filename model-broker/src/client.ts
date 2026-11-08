@@ -1,0 +1,136 @@
+import { codexCredits } from "./codex-resets.js";
+import { ORCHESTRATOR_CATALOG, catalogAgentType, catalogMeter, type PlanDefinition, type PlanMetric } from "./catalog.js";
+import { Store } from "./store.js";
+import { HIGH_WATER_SPAN_MS, SAME_RESET_TOLERANCE_MS } from "./auth/account-selection.js";
+import { type Account, type UsageTotal } from "./domain.js";
+import { personalUsage, personUsage, type PersonalUsage, type PersonUsageWindow } from "./person-usage.js";
+
+export const CACHE_WINDOW_MS=24*3_600_000;
+export interface PlanAccountUsage{
+  readonly accountId:string;
+  readonly accountLabel:string;
+  readonly state:"ready"|"stale"|"unavailable";
+  readonly percentLeft:number|null;
+  readonly usedPercent:number|null;
+  readonly meterId:string|null;
+  readonly windowHours:number|null;
+  readonly readingAt:string|null;
+  readonly resetAt:string|null;
+  /** Rate-limit resets the account has banked, or null where none are reported. */
+  readonly bankedResets:number|null;
+  readonly credits?: { balance: number | null; available: boolean; funded: boolean; at: number | null };
+  /** When that balance was read. */
+  readonly bankedResetsAt:string|null;
+  /** Expiry of the banked reset that perishes first, when the provider dates them. */
+  readonly bankedResetExpiresAt:string|null;
+}
+export interface PlanMetricUsage{readonly percentLeft:number|null;readonly expectedPercentLeft:number|null;readonly paceDelta:number|null;readonly cachePercent:number|null;readonly accounts:readonly PlanAccountUsage[];}
+export interface PlanUsage{readonly state:"ready"|"partial"|"unavailable";readonly metrics:Readonly<Record<string,PlanMetricUsage>>;readonly planCount:number;readonly checkedCount:number;}
+export interface PlanUsageSnapshot{readonly plans:Readonly<Record<string,PlanUsage>>;readonly updatedAt:string;}
+export interface OrchestratorClientOptions{readonly ledgerPath:string;}
+
+const clamp=(value:number)=>Math.max(0,Math.min(100,value));
+const mean=(values:number[]):number|null=>values.length?values.reduce((sum,value)=>sum+value,0)/values.length:null;
+const rounded=(value:number|null)=>value===null?null:Math.round(value);
+const iso=(value:number|undefined):string|null=>value===undefined?null:new Date(value).toISOString();
+
+/**
+ * The share of prompt tokens a model read from its cache instead of sending
+ * again. Output tokens are not part of the prompt, so they stay out of it, and
+ * a model nobody used in the window has no rate to report.
+ */
+export function cachePercent(totals:readonly UsageTotal[],modelId:string,accountIds:ReadonlySet<string>):number|null{
+  const mine=totals.filter((total)=>accountIds.has(total.accountId)&&catalogAgentType(total.model).key===modelId);
+  const tokens=(component:string)=>mine.filter((total)=>total.component===component).reduce((sum,total)=>sum+total.tokens,0);
+  const cacheRead=tokens("cacheRead"),prompt=cacheRead+tokens("input")+tokens("cacheWrite");
+  return prompt>0?clamp(cacheRead*100/prompt):null;
+}
+
+type AccountReading={left:number;expected:number|null;usage:PlanAccountUsage};
+
+function accountReading(store:Store,account:Account,metric:PlanMetric,maxReadingAgeMs:number,now:number):AccountReading{
+  // Banked resets belong to the account, not to one meter, so every reading
+  // this account produces carries the same balance.
+  const credits=store.resetCredits(account.id);
+  const banked={
+    ...(account.provider === "openai-codex" ? { credits: codexCredits(store, account.id, now) } : {}),
+    bankedResets:credits?.available??null,
+    bankedResetsAt:iso(credits?.at),
+    bankedResetExpiresAt:iso(credits?.nextExpiresAt),
+  };
+  const readings=metric.meters.flatMap((meterId)=>{
+    const declared=catalogMeter(meterId),latest=store.latestReading(account.id,meterId);
+    if(!declared||!latest)return[];
+    // Headers and the usage poll round the same usage a point apart; report the higher recent one so the series doesn't flicker.
+    const high=store.meterHighWater(account.id,meterId,latest.resetAt??null,latest.at-HIGH_WATER_SPAN_MS,latest.at,SAME_RESET_TOLERANCE_MS);
+    const reading={...latest,usedPercent:Math.max(latest.usedPercent,high?.used_percent??0)};
+    const left=clamp(100-reading.usedPercent);
+    const windowMs=declared.windowHours*3_600_000,shortWindow=declared.windowHours<24;
+    const current=now-reading.at<=Math.min(maxReadingAgeMs,shortWindow?windowMs:Infinity)
+      &&(!shortWindow||reading.resetAt===undefined||reading.resetAt>now);
+    const expected=reading.resetAt&&reading.resetAt>now?clamp((reading.resetAt-now)*100/(declared.windowHours*3_600_000)):null;
+    return[{left,expected,at:reading.at,current,usage:{
+      accountId:account.id,
+      accountLabel:account.label?.trim()||account.id,
+      state:"ready" as const,
+      percentLeft:left,
+      usedPercent:clamp(reading.usedPercent),
+      meterId,
+      windowHours:declared.windowHours,
+      readingAt:iso(reading.at),
+      resetAt:iso(reading.resetAt),
+      ...banked,
+    }}];
+  });
+  const eligible=readings.filter((reading)=>reading.at<=now+60_000);
+  const fresh=eligible.filter((reading)=>reading.current);
+  if((!metric.requireAllMeters||fresh.length===metric.meters.length)&&fresh.length){
+    return fresh.sort((a,b)=>a.left-b.left)[0]!;
+  }
+  if((!metric.requireAllMeters||eligible.length===metric.meters.length)&&eligible.length){
+    const stale=eligible.sort((a,b)=>a.left-b.left)[0]!;
+    return{...stale,expected:null,usage:{...stale.usage,state:"stale"}};
+  }
+  return{left:0,expected:null,usage:{accountId:account.id,accountLabel:account.label?.trim()||account.id,state:"unavailable",percentLeft:null,usedPercent:null,meterId:null,windowHours:null,readingAt:null,resetAt:null,...banked}};
+}
+
+function plan(store:Store,definition:PlanDefinition,totals:readonly UsageTotal[],now:number,visible:(account:Account)=>boolean=()=>true):PlanUsage{
+  const accounts=store.accounts().filter((account)=>account.provider===definition.provider&&account.enabled&&visible(account)),coverage:number[]=[];
+  const accountIds=new Set(accounts.map((account)=>account.id));
+  const metrics=Object.fromEntries(definition.metrics.map((metric)=>{
+    const weeklyMetric=metric.meters.every(id=>(catalogMeter(id)?.windowHours??24)<24)
+      ? definition.metrics.find(other=>other.model===metric.model&&other.meters.every(id=>(catalogMeter(id)?.windowHours??0)>=24)) : undefined;
+    const accountReadings=accounts.map(account=>{
+      const reading=accountReading(store,account,metric,definition.maxReadingAgeMs,now);
+      if(!weeklyMetric)return reading;
+      const weekly=accountReading(store,account,weeklyMetric,definition.maxReadingAgeMs,now);
+      // Short-window headroom cannot be spent after the account's weekly allowance is gone.
+      // Keep the binding meter and reset time, rather than implying that the short reset frees it.
+      return weekly.usage.state==="ready"&&(weekly.left===0||reading.usage.state==="ready"&&weekly.left<=reading.left)?weekly:reading;
+    });
+    const values=accountReadings.filter((reading)=>reading.usage.state==="ready");
+    coverage.push(values.length);
+    const timed=values.filter((value):value is AccountReading&{expected:number}=>value.expected!==null),left=mean(values.map((value)=>value.left)),expected=mean(timed.map((value)=>value.expected));
+    return[metric.id,{percentLeft:rounded(left),expectedPercentLeft:rounded(expected),paceDelta:left===null||expected===null?null:rounded(left-expected),cachePercent:rounded(cachePercent(totals,metric.model,accountIds)),accounts:accountReadings.map((reading)=>reading.usage)}];
+  }));
+  const checked=coverage.length?Math.min(...coverage):0;return{state:accounts.length>0&&checked===accounts.length?"ready":checked>0?"partial":"unavailable",metrics,planCount:accounts.length,checkedCount:checked};
+}
+
+/** Plan meters for the enabled accounts `visible` admits. */
+export function planUsage(store:Store,definitions:readonly PlanDefinition[]=ORCHESTRATOR_CATALOG.plans,now=Date.now(),visible?:(account:Account)=>boolean):PlanUsageSnapshot{
+  const totals=store.usageSince(now-CACHE_WINDOW_MS);
+  return{plans:Object.fromEntries(definitions.map((definition)=>[definition.id,plan(store,definition,totals,now,visible)])),updatedAt:new Date(now).toISOString()};
+}
+
+export class OrchestratorClient{
+  private readonly store:Store;
+  constructor(options:OrchestratorClientOptions){this.store=Store.open(options.ledgerPath);}
+  accounts(provider?:string){return this.store.accounts().filter((account)=>!provider||account.provider===provider);}
+  plans(definitions:readonly PlanDefinition[]=ORCHESTRATOR_CATALOG.plans,now=Date.now()):PlanUsageSnapshot{return planUsage(this.store,definitions,now);}
+  /** What the ledger's own owner spent of each plan's subscriptions in the last day and week. */
+  ownUsage(now=Date.now()):PersonalUsage{return personalUsage(this.store,null,now);}
+  /** Each person's share of this ledger over the hour buckets of the last `windowMs`. */
+  personUsage(windowMs:number,now=Date.now()):PersonUsageWindow{return personUsage(this.store,now-windowMs,now);}
+  async refreshPlanFacts(_agentDir:string):Promise<void>{}
+  close():void{this.store.close();}
+}

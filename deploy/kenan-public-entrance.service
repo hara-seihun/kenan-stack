@@ -1,0 +1,19 @@
+[Unit]
+Description=Kenan public entrance: Google sign-in for acme.example and the app at kenan.acme.example/pi-stack/
+After=network-online.target kenan-enroll.service
+Wants=network-online.target kenan-enroll.service
+[Service]
+Type=exec
+User=pi2-gateway
+Group=pi2-gateway
+ExecStart=/usr/local/bin/node /opt/kenan-entrance/current/entrance-main.js
+LoadCredential=configuration:/etc/kenan/entrance.json
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+{
+  "ledgerPath": "/var/lib/kenan/model-broker/ledger.sqlite3",
+  "authPath": "/var/lib/kenan/model-broker/auth.json",
+  "listeners": [
+    {
+      "principal": "operator",
+      "port": 2465,
+      "accounts": ["codex-main", "claude-main", "grok-main"],
+      "models": [
+        "openai-codex/gpt-6.1-sol",
+        "anthropic/claude-sonnet-5-5",
+        "xai/grok-4.7"
+      ],
+      "maxInFlight": 32
+    }
+  ],
+  "codexAutoReset": false
+}

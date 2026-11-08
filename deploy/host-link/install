@@ -1,0 +1,13 @@
+#!/bin/sh
+# Install files only; do not create connections or alter any application's topology.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+[ "$(id -u)" -eq 0 ] || { echo 'Run as root' >&2; exit 1; }
+install -d -m 0700 /etc/kenan/link-forward
+install -d -m 0755 /usr/local/libexec
+install -m 0755 "$here/forward" /usr/local/libexec/kenan-link-forward
+# Reload only when the unit changed: every channel deploy runs this, and a reload stalls the system manager for seconds.
+if ! cmp -s "$here/kenan-link-forward@.service" /etc/systemd/system/kenan-link-forward@.service; then
+	install -m 0644 "$here/kenan-link-forward@.service" /etc/systemd/system/
+	systemctl daemon-reload
+fi

@@ -1,0 +1,32 @@
+[Unit]
+Description=Kenan rewrite %i
+# Wants, not Requires: a failed postgres start must not make the app's start job fail for good (2026-10-19, acme-host
+# stayed down 21:15-23:47Z after postgres recovered). The app retries until postgres answers, and postgres pulls it in.
+Wants=kenan-postgres.service
+After=kenan-postgres.service network.target kenan@%i.socket
+# The channel's socket (kenan@.socket) is held by systemd and passed in, so restarts never refuse a request.
+Requires=kenan@%i.socket
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+WorkingDirectory=/srv/kenan/%i
+# V8's default old-space limit on this host is 4 GiB; Beta's dozens of live agent sessions came near it and the channel
+# stalled in garbage collection for minutes (2026-10-29 17:24-17:36Z). The host has 61 GiB.
+# File reads, DNS and crypto share libuv's thread pool, 4 threads by default; with ~200 live agents every file tool waited
+# seconds behind it (2026-10-30).
+Environment=UV_THREADPOOL_SIZE=64
+# The server's heap is never swapped: a major garbage collection walks all of it, and with parts swapped out (2026-10-31:
+# 2 GiB heap, 1 GiB resident, swappiness 100) each pause paged it back in while every agent waited.
+MemorySwapMax=0
+ExecStart=/usr/local/bin/node --max-old-space-size=12288 /srv/kenan/%i/dist/server/main.js /etc/kenan/%i.json
+ExecReload=/usr/local/bin/node /usr/local/lib/kenan/runtime-reload.mjs %i
+Restart=always
+RestartSec=2
+RestartSteps=8
+RestartMaxDelaySec=60
+RuntimeDirectory=kenan
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+UMask=0022
+[Install]
+WantedBy=multi-user.target kenan-postgres.service

@@ -1,0 +1,10 @@
+[Unit]
+Description=Bring the phone edge's finished call logs and recordings home every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,336 @@
+#!/bin/bash
+# Root operations for household operators who aren't administrators (the kenan-operators group; machine/user-access.md).
+# Installed root-owned at /usr/local/sbin/kenan-operator by deploy/operator/install.sh; sudoers admits exactly this program.
+# Everything it runs as root comes from root-owned code or from commits already pushed to the shared repositories (kenan.git, model-broker.git).
+set -euo pipefail
+repo=/home/kenan/work/repos/kenan.git
+usage() {
+ cat >&2 <<'EOF'
+Usage: sudo kenan-operator COMMAND ...
+  deploy beta|production forward|rollback COMMIT [--wait]
+      Deploy a commit pushed to /home/kenan/work/repos/kenan.git (deploy/deploy.sh calls this for you).
+  android-release beta|production COMMIT
+      Build, sign and publish the channel's next APK from a pushed commit (android/release.sh calls this for you).
+      Runs detached as kenan in unit kenan-android-release-CHANNEL; the result arrives as host event android-release:CHANNEL.
+  broker-install COMMIT
+      Test, build and switch the model broker to a commit pushed to /home/kenan/work/repos/model-broker.git.
+      Runs release/test.sh, builds /srv/kenan/broker/COMMIT12-UTCSTAMP with release/make-release.sh, points `current`
+      at it and reloads kenan-model-broker; if the reload or the health probe fails, the previous release is restored.
+  broker-select RELEASE
+      Switch the broker to an existing release folder under /srv/kenan/broker (rollback), with the same health check.
+  broker-config KEY JSON|unset
+      Set or remove one operator-tunable top-level key of /etc/kenan/model-broker.json (backgroundRouting, servedModelAlertDir, codexAutoReset); the broker
+      hot-reloads it. The file stays root-owned (the broker refuses grants anyone else can write), so this is the way in.
+  broker-releases
+      List broker release folders with their commits; the current one is marked *.
+  broker-restart
+      Replace the broker's supervisor process (after a supervisor change) without refusing a call: a bridge supervisor
+      starts on the same ports, the old one drains, kenan-model-broker starts again and the bridge drains. Runs detached
+      as unit kenan-model-broker-restart (journalctl -fu kenan-model-broker-restart); minutes while old streams finish.
+      kenan-model-broker refuses systemctl stop and restart; config and release changes only need systemctl reload.
+  move-self FROM TO [--check]
+      Move your own person (the one whose unixUser you are) between beta and production with deploy/move-person.py from
+      Beta's live commit. --check rehearses the copy in a rolled-back transaction and prints the row counts. Without it,
+      both channels stop for about a minute: the move runs detached in unit kenan-move-PERSON and its result arrives as
+      host event move-person:PERSON {result: done|failed, detail, work} on the channel that hosts you afterwards.
+  compact beta|production AGENT_ID
+      Compact one agent's conversation at its next model request, exactly as the automatic compaction at 600k tokens
+      does, though it is below that (server/agents/context-budget.ts). Nothing is deleted: the checkpoint is appended to
+      the session journal, marked "requested": "operator". An idle agent compacts when its next turn starts.
+  systemctl start|stop|restart|reload|try-restart|reset-failed|enable|disable|status UNIT...
+      Kenan units only (names starting with "kenan").
+  systemctl daemon-reload
+  apt update
+  apt install|reinstall|remove PACKAGE...
+      Ubuntu archive packages by name (optionally NAME=VERSION).
+EOF
+ exit 64
+}
+fail() { echo "$1: $2" >&2; exit "${3:-1}"; }
+# A commit argument may be abbreviated (4-40 hex); it resolves to the one full id it names in GITDIR, or fails.
+full_commit() {
+  [[ $2 =~ ^[0-9a-f]{4,40}$ ]] || fail operator_usage "commit must be a hex commit id, got $2" 64
+  GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$1" rev-parse --quiet --verify "$2^{commit}" 2>/dev/null \
+    || fail operator_usage "$2 names no single commit in $1; push it first or give more digits" 64
+}
+(( EUID == 0 )) || fail operator_not_root 'run through sudo: sudo kenan-operator ...' 77
+(( $# >= 1 )) || usage
+command=$1; shift
+broker_repo=/home/kenan/work/repos/model-broker.git
+broker_root=/srv/kenan/broker
+broker_lock() {
+ exec 9>/run/lock/kenan-operator-broker
+ flock -n 9 || fail broker_switch_in_progress 'another broker-install or broker-select is running' 75
+}
+# Every listener in the broker config must answer its usage route; that is the same path every client's usage tool reads.
+broker_healthy() {
+ local port
+ for port in $(python3 -I -c 'import json; print(" ".join(str(l["port"]) for l in json.load(open("/etc/kenan/model-broker.json"))["listeners"]))'); do
+  curl -fsS -m 15 -o /dev/null "http://127.0.0.1:$port/v1/usage" || { echo "broker_unhealthy: port $port did not answer /v1/usage" >&2; return 1; }
+ done
+}
+broker_serving() {
+ python3 -I -c 'import json,sys; s=json.load(open("/run/kenan-model-broker/state.json")); sys.exit(0 if s["current"]["release"]==sys.argv[1] else 1)' "$1"
+}
+broker_point() {
+ ln -sfn "$1" "$broker_root/current.new"
+ mv -T "$broker_root/current.new" "$broker_root/current"
+}
+broker_command=(/usr/local/bin/node /usr/local/lib/kenan/model-broker-supervisor.mjs run --release "$broker_root/current" --entry dist/cli.js --ports /etc/kenan/model-broker.json)
+broker_ready() { # STATE_DIR NOT_PID: the supervisor writing STATE_DIR serves a generation and isn't NOT_PID
+ python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1]+"/state.json")); sys.exit(0 if s.get("current") and str(s["pid"])!=sys.argv[2] else 1)' "$1" "$2" 2>/dev/null
+}
+broker_wait() { # SECONDS COMMAND...
+ local deadline=$((SECONDS + $1)); shift
+ until "$@"; do (( SECONDS < deadline )) || return 1; sleep 0.2; done
+}
+# The detached half of broker-restart, run as unit kenan-model-broker-restart.
+broker_restart_run() {
+ local bridge=kenan-model-broker-bridge main_pid
+ main_pid=$(systemctl show -P MainPID kenan-model-broker)
+ systemctl reset-failed "$bridge" 2>/dev/null || true
+ rm -f /run/kenan-model-broker-bridge/state.json
+ systemd-run --quiet --unit="$bridge" --description='Kenan model broker (bridge during broker-restart)' \
+  -p User=kenan -p Group=kenan -p WorkingDirectory=/home/kenan -p RuntimeDirectory=kenan-model-broker-bridge -p UMask=0077 \
+  -p NoNewPrivileges=yes -p KillMode=mixed -p TimeoutStopSec=30min -p CPUWeight=1000 -p IOWeight=1000 -p MemoryLow=512M \
+  --setenv=HOME=/home/kenan --setenv=PATH=/usr/local/bin:/usr/bin:/bin \
+  "${broker_command[@]}" --state /run/kenan-model-broker-bridge -- model-broker /etc/kenan/model-broker.json
+ # A release with SO_REUSEPORT sockets lets the bridge listen beside the old supervisor; from one without, the bridge
+ # keeps retrying the bind and takes the ports the moment the old supervisor lets go of them.
+ broker_wait 5 broker_ready /run/kenan-model-broker-bridge 0 || echo "broker_restart: bridge waits for the old supervisor's ports"
+ echo "broker_restart: stopping supervisor $main_pid; it drains its open streams"
+ systemctl kill --kill-whom=main --signal=SIGTERM kenan-model-broker
+ broker_wait 100 broker_ready /run/kenan-model-broker-bridge 0 || echo "broker_restart_bridge_failed: the bridge never served; kenan-model-broker restarts as soon as the old supervisor has drained" >&2
+ broker_wait 1900 bash -c '! systemctl is-active --quiet kenan-model-broker'
+ systemctl reset-failed kenan-model-broker 2>/dev/null || true
+ systemctl start kenan-model-broker
+ broker_wait 100 broker_ready /run/kenan-model-broker "$main_pid" || fail broker_restart_failed "kenan-model-broker did not serve again; the bridge keeps serving (journalctl -u kenan-model-broker)" 1
+ broker_healthy || fail broker_restart_failed "kenan-model-broker restarted but a listener is unhealthy; the bridge keeps serving" 1
+ echo "broker_restart: kenan-model-broker serves again (supervisor $(systemctl show -P MainPID kenan-model-broker)); the bridge drains and stops"
+ systemctl kill --kill-whom=main --signal=SIGTERM "$bridge"
+}
+broker_switch() {
+ local target=$broker_root/$1 previous
+ previous=$(readlink -f "$broker_root/current")
+ [[ $previous != "$target" ]] || fail broker_release_current "$1 is already the current release" 65
+ broker_point "$target"
+ if systemctl reload kenan-model-broker && broker_serving "$target" && broker_healthy; then
+  echo "broker_switched: kenan-model-broker serves ${target##*/} ($(cat "$target/.broker-commit")); previous ${previous##*/}"
+  echo "Roll back with: sudo kenan-operator broker-select ${previous##*/}"
+  return 0
+ fi
+ echo "broker_switch_failed: ${target##*/} did not come up healthy; returning to ${previous##*/}" >&2
+ broker_point "$previous"
+ systemctl reload kenan-model-broker && broker_serving "$previous" && broker_healthy || fail broker_rollback_failed "returning to ${previous##*/} also failed; journalctl -u kenan-model-broker" 1
+ fail broker_switch_failed "${target##*/} was rolled back; ${previous##*/} is serving (journalctl -u kenan-model-broker for why)" 1
+}
+
+case $command in
+ deploy)
+  (( $# == 3 || $# == 4 )) || usage
+  channel=$1 mode=$2 commit=$3
+  wait_args=()
+  if (( $# == 4 )); then [[ $4 == --wait ]] || usage; wait_args=(--wait); fi
+  [[ $channel == beta || $channel == production ]] || fail operator_usage "channel must be beta or production, got $channel" 64
+  [[ $mode == forward || $mode == rollback ]] || fail operator_usage "mode must be forward or rollback, got $mode" 64
+  [[ -f /etc/kenan/$channel.json ]] || fail deploy_channel_not_configured "/etc/kenan/$channel.json is missing; this host does not host $channel" 10
+  commit=$(full_commit "$repo" "$commit") || exit
+  shared() { GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$repo" "$@"; }
+  shared cat-file -e "$commit^{commit}" 2>/dev/null || fail deploy_commit_unpublished "${commit:0:8} is not in $repo; push it first" 5
+  [[ -n $(shared for-each-ref --count=1 --contains "$commit" refs/heads) ]] || fail deploy_commit_unpublished "${commit:0:8} is not on any branch of $repo; push it first" 5
+  running=$(systemctl list-units --plain --no-legend --state=activating,active "kenan-deploy-$channel-*" | awk '{print $1}')
+  [[ -z $running ]] || fail deploy_in_progress "$running is still deploying $channel; inspect it with journalctl -u ${running%% *}" 75
+  # One root-owned checkout per channel keeps node_modules between deploys; the detached deploy unit builds from it.
+  checkout=/var/lib/kenan/operator-deploy/$channel
+  if [[ ! -d $checkout/.git ]]; then
+   install -d -m 0755 /var/lib/kenan/operator-deploy
+   git -c safe.directory='*' clone --quiet --no-checkout "$repo" "$checkout"
+  fi
+  git -c safe.directory='*' -C "$checkout" fetch --quiet origin
+  git -c safe.directory='*' -C "$checkout" checkout --quiet --force --detach "$commit"
+  git -c safe.directory='*' -C "$checkout" clean -fdxq -e node_modules
+  cd "$checkout"
+  if [[ $mode == rollback ]]; then exec /bin/bash deploy/deploy.sh "$channel" --rollback "${wait_args[@]}"; fi
+  exec /bin/bash deploy/deploy.sh "$channel" "${wait_args[@]}"
+  ;;
+ move-self)
+  (( $# == 2 || $# == 3 )) || usage
+  from=$1 to=$2 check=${3-}
+  [[ -z $check || $check == --check ]] || usage
+  declare -A app_url=([beta]=https://kenan.example.com [production]=https://kenan.example.com)
+  [[ ( $from == beta && $to == production ) || ( $from == production && $to == beta ) ]] || fail operator_usage "FROM and TO must be beta and production, one each" 64
+  [[ -n ${SUDO_USER-} ]] || fail operator_usage 'run through sudo as yourself' 64
+  person=$(jq -er --arg u "$SUDO_USER" '[.people[] | select(.unixUser == $u) | .id] | if length == 1 then .[0] else error("operator_person_missing: \($u) is not exactly one person") end' "/etc/kenan/$from.json") || exit 1
+  commit=$(cat /srv/kenan/beta/source-commit)
+  script=$(mktemp /run/kenan-move-self.XXXXXX.py)
+  GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$repo" show "$commit:deploy/move-person.py" > "$script"
+  if [[ -n $check ]]; then
+   python3 -I "$script" "$person" "$from" "$to" "${app_url[$to]}" --check || status=$?; rm -f "$script"; exit "${status:-0}"
+  fi
+  unit=kenan-move-$person
+  ! systemctl is-active --quiet "$unit" || fail move_in_progress "$unit is still running; journalctl -u $unit" 75
+  systemctl reset-failed "$unit" 2>/dev/null || true
+  systemd-run --quiet --unit="$unit" --collect --description="Move $person from $from to $to" \
+   -p ExecStopPost="/bin/rm -f $script" \
+   python3 -I "$script" "$person" "$from" "$to" "${app_url[$to]}" --notify-uid "$(id -u "$SUDO_USER")" --notify-topic "move-person:$person"
+  echo "move_started: unit $unit moves $person from $from to $to (${commit:0:8}); journalctl -u $unit; result as host event move-person:$person"
+  ;;
+ android-release)
+  (( $# == 2 )) || usage
+  channel=$1 commit=$2
+  [[ $channel == beta || $channel == production ]] || fail operator_usage "channel must be beta or production, got $channel" 64
+  commit=$(full_commit "$repo" "$commit") || exit
+  [[ -d /var/lib/kenan/android/$channel ]] || fail android_release_unavailable "this host publishes no $channel APK (/var/lib/kenan/android/$channel is missing)" 69
+  shared() { GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$repo" "$@"; }
+  shared cat-file -e "$commit^{commit}" 2>/dev/null || fail android_release_commit_unpublished "${commit:0:8} is not in $repo; push it first" 5
+  [[ -n $(shared for-each-ref --count=1 --contains "$commit" refs/heads) ]] || fail android_release_commit_unpublished "${commit:0:8} is not on any branch of $repo; push it first" 5
+  unit=kenan-android-release-$channel
+  ! systemctl is-active --quiet "$unit" || fail android_release_in_progress "$unit is still releasing $channel; follow it with journalctl -fu $unit" 75
+  systemctl reset-failed "$unit" 2>/dev/null || true
+  # The build needs kenan's Gradle cache and signing custody (android/build.sh), so the checkout and build belong to kenan.
+  checkout=/var/lib/kenan/operator-android/$channel
+  install -d -m 0755 /var/lib/kenan/operator-android
+  install -d -m 0755 -o kenan -g kenan "$checkout"
+  as_kenan() { /usr/sbin/runuser -u kenan -- env HOME=/home/kenan "$@"; }
+  [[ -d $checkout/.git ]] || as_kenan git clone --quiet --no-checkout "$repo" "$checkout"
+  as_kenan git -C "$checkout" fetch --quiet origin
+  as_kenan git -C "$checkout" checkout --quiet --force --detach "$commit"
+  as_kenan git -C "$checkout" clean -fdxq
+  caller=${SUDO_UID:-1000}
+  systemd-run --quiet --unit="$unit" --uid=kenan --gid=kenan --property=WorkingDirectory="$checkout" \
+   --setenv=HOME=/home/kenan --setenv=PATH=/usr/local/bin:/usr/bin:/bin \
+   --property=ExecStopPost="+/usr/local/libexec/kenan-android-release-notify $channel $commit $caller" \
+   /bin/bash android/release.sh "$channel"
+  echo "android_release_started: $unit is building $channel from ${commit:0:8}; follow it with journalctl -fu $unit."
+  echo "When it ends, host event android-release:$channel {channel, commit, result, versionCode} reaches uid $caller's agents (wake on: event)."
+  ;;
+ broker-install)
+  (( $# == 1 )) || usage
+  commit=$1
+  commit=$(full_commit "$broker_repo" "$commit") || exit
+  broker_shared() { GIT_OPTIONAL_LOCKS=0 git -c safe.directory='*' --git-dir="$broker_repo" "$@"; }
+  broker_shared cat-file -e "$commit^{commit}" 2>/dev/null || fail broker_commit_unpublished "${commit:0:8} is not in $broker_repo; push it first" 5
+  [[ -n $(broker_shared for-each-ref --count=1 --contains "$commit" refs/heads) ]] || fail broker_commit_unpublished "${commit:0:8} is not on any branch of $broker_repo; push it first" 5
+  broker_lock
+  checkout=/var/lib/kenan/operator-broker
+  if [[ ! -d $checkout/.git ]]; then
+   install -d -m 0755 /var/lib/kenan
+   git -c safe.directory='*' clone --quiet --no-checkout "$broker_repo" "$checkout"
+  fi
+  git -c safe.directory='*' -C "$checkout" fetch --quiet origin
+  git -c safe.directory='*' -C "$checkout" checkout --quiet --force --detach "$commit"
+  git -c safe.directory='*' -C "$checkout" clean -fdxq
+  for script in release/test.sh release/make-release.sh; do
+   [[ -f $checkout/$script ]] || fail broker_commit_unbuildable "${commit:0:8} has no $script; rebase it onto main of $broker_repo" 65
+  done
+  echo "broker_test: release/test.sh at ${commit:0:8}"
+  (cd "$checkout" && /bin/bash release/test.sh) || fail broker_test_failed "release/test.sh failed at ${commit:0:8}; nothing was installed" 1
+  name=${commit:0:12}-$(date -u +%Y%m%dT%H%M%SZ)
+  (cd "$checkout" && BROKER_RELEASES=$broker_root /bin/bash release/make-release.sh "$commit" "$name") >/dev/null || fail broker_build_failed "release/make-release.sh failed at ${commit:0:8}" 1
+  broker_switch "$name"
+  ;;
+ broker-select)
+  (( $# == 1 )) || usage
+  name=$1
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $name != current && $name != *.new ]] || fail operator_usage "release must be a folder name under $broker_root, got $name" 64
+  [[ -f $broker_root/$name/dist/cli.js ]] || fail broker_release_missing "$broker_root/$name/dist/cli.js does not exist; see broker-releases" 66
+  broker_lock
+  broker_switch "$name"
+  ;;
+ broker-config)
+  (( $# == 2 )) || usage
+  key=$1 value=$2
+  # Listeners carry each person's account grants; only routing tunables are open to operators.
+  [[ $key == backgroundRouting || $key == servedModelAlertDir || $key == codexAutoReset ]] || fail broker_config_key_refused "$key: operators may set backgroundRouting, servedModelAlertDir or codexAutoReset only" 77
+  broker_lock
+  config=/etc/kenan/model-broker.json
+  staged=$(mktemp /etc/kenan/.model-broker.json.XXXXXX)
+  trap 'rm -f "$staged"' EXIT
+  python3 -I - "$config" "$staged" "$key" "$value" <<'PY' || fail broker_config_invalid "$key: value must be JSON (or unset)" 65
+import json, sys
+path, staged, key, value = sys.argv[1:]
+config = json.load(open(path))
+if value == "unset":
+    config.pop(key, None)
+else:
+    config[key] = json.loads(value)
+with open(staged, "w") as out:
+    json.dump(config, out, indent=2)
+    out.write("\n")
+PY
+  chown root:root "$staged"; chmod 0644 "$staged"
+  node --input-type=module -e 'import { loadBrokerConfig } from "/srv/kenan/broker/current/dist/model-broker.js"; loadBrokerConfig(process.argv[1]);' "$staged" \
+   || fail broker_config_invalid "the current broker release rejects the new configuration; nothing changed" 65
+  mv -f "$staged" "$config"
+  trap - EXIT
+  python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); print("broker_config_set:", sys.argv[2], "=", json.dumps(c.get(sys.argv[2], "unset")))' "$config" "$key"
+  ;;
+ broker-restart)
+  (( $# == 0 )) || usage
+  for unit in kenan-model-broker-restart kenan-model-broker-bridge; do
+   ! systemctl is-active --quiet "$unit" || fail broker_restart_in_progress "$unit is still running from an earlier broker-restart; follow it with journalctl -fu $unit" 75
+  done
+  systemctl reset-failed kenan-model-broker-restart 2>/dev/null || true
+  systemd-run --quiet --unit=kenan-model-broker-restart --description='Kenan model broker supervisor replacement' /usr/local/sbin/kenan-operator broker-restart-run
+  echo "broker_restart_started: follow it with journalctl -fu kenan-model-broker-restart (ends once the old supervisor has drained)."
+  ;;
+ broker-restart-run)
+  [[ $# == 0 && -n ${INVOCATION_ID:-} ]] || fail operator_usage "broker-restart-run runs only inside kenan-model-broker-restart; use broker-restart" 64
+  broker_lock
+  broker_restart_run
+  ;;
+ broker-releases)
+  (( $# == 0 )) || usage
+  current=$(readlink -f "$broker_root/current")
+  for dir in $(ls -1dtr "$broker_root"/*/); do
+   dir=${dir%/}
+   [[ -L $dir ]] && continue
+   mark=' '; [[ $dir == "$current" ]] && mark='*'
+   commit=$(cat "$dir/.broker-commit" 2>/dev/null || echo unknown)
+   printf '%s %s %s %s\n' "$mark" "$(date -u -r "$dir" +%Y-%m-%dT%H:%MZ)" "${commit:0:12}" "${dir##*/}"
+  done
+  ;;
+ compact)
+  (( $# == 2 )) || usage
+  channel=$1 agent=$2
+  [[ $channel == beta || $channel == production ]] || fail operator_usage "channel must be beta or production, got $channel" 64
+  [[ $agent =~ ^[A-Za-z0-9][A-Za-z0-9:_-]{0,199}$ ]] || fail operator_usage "agent id must be letters, digits, : _ -, got $agent" 64
+  dir=/var/lib/kenan/$channel/agent-config/${agent//:/-}
+  [[ -d $dir ]] || fail agent_unknown "$agent has no conversation on $channel ($dir is missing)" 66
+  : >"$dir/compact-now"
+  echo "$agent on $channel compacts at its next model request; its session journal then has a compaction entry with \"requested\": \"operator\"."
+  ;;
+ systemctl)
+  (( $# >= 1 )) || usage
+  verb=$1; shift
+  case $verb in
+   daemon-reload) (( $# == 0 )) || usage; exec systemctl daemon-reload;;
+   start|stop|restart|reload|try-restart|reset-failed|enable|disable|status) ;;
+   *) fail operator_usage "systemctl verb $verb is not one of start stop restart reload try-restart reset-failed enable disable status daemon-reload" 64;;
+  esac
+  (( $# >= 1 )) || usage
+  for unit in "$@"; do
+   [[ $unit =~ ^kenan[A-Za-z0-9@_.:-]*$ ]] || fail operator_unit_refused "$unit: only units whose names start with kenan" 77
+   [[ ! ( $verb =~ ^(stop|restart|try-restart)$ && ${unit%.service} == kenan-model-broker ) ]] \
+    || fail broker_stop_refused "kenan-model-broker never stops (every agent on the host runs through it): config and release changes take systemctl reload kenan-model-broker, a supervisor change takes kenan-operator broker-restart" 77
+  done
+  exec systemctl --no-pager "$verb" -- "$@"
+  ;;
+ apt)
+  (( $# >= 1 )) || usage
+  verb=$1; shift
+  export DEBIAN_FRONTEND=noninteractive
+  case $verb in
+   update) (( $# == 0 )) || usage; exec apt-get update;;
+   install|reinstall|remove) ;;
+   *) fail operator_usage "apt verb $verb is not one of update install reinstall remove" 64;;
+  esac
+  (( $# >= 1 )) || usage
+  for package in "$@"; do
+   [[ $package =~ ^[a-z0-9][a-z0-9+.-]*(:[a-z0-9]+)?(=[A-Za-z0-9.+:~-]+)?$ ]] || fail operator_package_refused "$package: a package name from the configured archives (no paths or options)" 77
+  done
+  exec apt-get -y "$verb" -- "$@"
+  ;;
+ -h|--help|help) usage;;
+ *) fail operator_usage "unknown command $command" 64;;
+esac

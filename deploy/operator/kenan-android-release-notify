@@ -1,0 +1,15 @@
+#!/bin/bash
+# ExecStopPost of kenan-android-release-CHANNEL (kenan-operator android-release): tells the caller's agents how it ended.
+# Usage: kenan-android-release-notify CHANNEL COMMIT UID  (systemd provides SERVICE_RESULT, EXIT_STATUS, INVOCATION_ID)
+set -euo pipefail
+channel=$1 commit=$2 uid=$3
+manifest=/var/lib/kenan/android/$channel/manifest.json
+version=$(jq -r .versionCode "$manifest")
+revision=$(jq -r .release.revision "/var/lib/kenan/android-channels/$channel/legacy.json")
+if [[ $SERVICE_RESULT == success && $revision == "$commit" ]]; then result=published; else result=failed; fi
+jq -n --arg channel "$channel" --arg commit "$commit" --arg result "$result" --argjson versionCode "$version" \
+ --arg serviceResult "$SERVICE_RESULT" --arg exitStatus "${EXIT_STATUS-}" --arg unit "kenan-android-release-$channel" \
+ '{channel: $channel, commit: $commit, result: $result, versionCode: (if $result == "published" then $versionCode else null end),
+   liveVersionCode: $versionCode, serviceResult: $serviceResult, exitStatus: $exitStatus,
+   log: ("journalctl -u " + $unit + " _SYSTEMD_INVOCATION_ID=" + env.INVOCATION_ID)}' |
+ /usr/local/bin/kenan-event --uid "$uid" --id "android-release-$INVOCATION_ID" "android-release:$channel"

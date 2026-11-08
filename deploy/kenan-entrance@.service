@@ -1,0 +1,28 @@
+[Unit]
+Description=Kenan %i HTTP entrance
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+DynamicUser=yes
+User=kenan-entrance
+RuntimeDirectory=kenan-web
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/usr/sbin/nginx -t -q -c /etc/kenan/entrance-%i.conf
+ExecStart=/usr/sbin/nginx -c /etc/kenan/entrance-%i.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -c /etc/kenan/entrance-%i.conf -s reload
+Restart=always
+RestartSec=1s
+TimeoutStopSec=40s
+KillSignal=SIGQUIT
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

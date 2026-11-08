@@ -1,0 +1,69 @@
+/* The 🌀 bubble and quick panel (web/organized/Bubble.tsx), mockups design/mic A3, B3, C2, D2, E2, F, H. */
+.bq{font-family:Roboto,"Segoe UI",system-ui,sans-serif;color:#e8e8ea}
+.bq button{font:inherit;-webkit-tap-highlight-color:transparent}
+.bq-bubble,.bq-pill{position:fixed;z-index:16;display:flex;align-items:center;justify-content:center;padding:0;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:pointer}
+.bq-bubble{width:40px;height:40px;min-height:0;border-radius:20px;background:#232523;border:1px solid #3d403d;box-shadow:0 6px 18px #000c;font-size:20px;line-height:1;transition:left .18s ease-out,top .18s ease-out,opacity .2s,background .15s,border-color .15s}
+.bq-bubble.held{z-index:18;transition:opacity .2s;box-shadow:0 10px 26px #000e;cursor:grabbing}
+.bq-bubble.faint{opacity:.45}
+.bq-bubble.rec{background:#2a3320;border-color:#7fa538;box-shadow:0 0 0 3px #7fa53833,0 6px 18px #000c}
+.bq-bubble.on{background:#4d6123;border-color:#7fa538}
+.bq-bubble.busy{border-color:#7fa538}
+.bq-wave{display:flex;align-items:center;gap:2px;height:20px;--lv:0}
+.bq-wave i{display:block;width:2px;border-radius:1px;background:#b9dd7a;height:clamp(3px,calc(var(--h) * (.35 + var(--lv) * 1.5)),20px);transition:height 60ms linear}
+.bq-dots{display:inline-flex;gap:4px;align-items:center;height:16px}
+.bq-dots i{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.35;animation:bq-dot 1s infinite}
+.bq-dots i:nth-child(2){animation-delay:.15s}.bq-dots i:nth-child(3){animation-delay:.3s}
+.bq-bubble .bq-dots{color:#b9dd7a}
+@keyframes bq-dot{40%{opacity:1}}
+.bq-chip{position:fixed;z-index:16;background:#232523ee;border:1px solid #3d403d;border-radius:14px;padding:4px 9px;font-size:12px;color:#c9cbc9;white-space:nowrap;opacity:.9;pointer-events:none;font-variant-numeric:tabular-nums}
+.bq-note{white-space:normal;max-width:min(300px,calc(100vw - 32px));opacity:1}
+.bq-pill{width:40px;height:24px;min-height:0;border-radius:12px;background:#1b1d1b;border:1px solid #3d403d;font-size:13px}
+.bq-pill span{opacity:.7}
+.bq-x{position:fixed;z-index:17;width:48px;height:48px;border-radius:50%;border:1.5px solid #9a9d9a;color:#d0d2d0;background:#1b1d1bcc;display:flex;align-items:center;justify-content:center;pointer-events:none;transition:transform .12s,border-color .12s,background .12s}
+.bq-x.hot{border-color:#e4e6e4;color:#fff;background:#2c2f2ccc;transform:scale(1.1)}
+.bq-scrim{position:fixed;left:0;right:0;top:0;z-index:14;background:#0007;border:0;border-radius:0;padding:0;min-height:0}
+.bq-panel{position:fixed;left:0;right:0;z-index:15;display:flex;flex-direction:column;background:#262826;border-top:1px solid #454845;border-radius:18px 18px 0 0;box-shadow:0 -10px 30px #000d;overflow:hidden;transition:height .2s ease-out}
+.bq-panel.held{transition:none}
+.bq-drawer{left:auto;border:1px solid #454845;border-radius:16px;box-shadow:0 12px 40px #000d;transition:none}
+.bq-handle{flex-shrink:0;touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab}
+.bq-drawer .bq-handle{cursor:default}
+.bq-grip{display:block;width:40px;height:4px;border-radius:2px;background:#555;margin:8px auto 2px}
+.bq-head{display:flex;align-items:center;gap:8px;padding:2px 8px 4px 14px;font-weight:700;font-size:15px;min-height:34px}
+.bq-drawer .bq-head{padding:10px 10px 6px 16px;font-size:16px}
+.bq-open,.bq-close{margin-left:auto;background:transparent;border:0;color:#8d8d95;min-height:0;width:36px;height:36px;padding:0;display:flex;align-items:center;justify-content:center;border-radius:18px}
+.bq-close{margin-left:0}
+.bq-open:hover,.bq-close:hover{color:#d0d2d0;background:#232523}
+.bq-msgs{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y;padding:4px 12px;display:flex;flex-direction:column;gap:8px;font-size:15px;line-height:1.35}
+.bq-drawer .bq-msgs{padding:4px 16px}
+.bq-row{display:flex;flex-direction:column;gap:8px}
+.bq-me{align-self:flex-end;max-width:80%;background:#4d6123;border:1px solid #7fa538;border-radius:14px 14px 4px 14px;padding:8px 12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.bq-k{align-self:flex-start;max-width:85%;background:#1b1d1b;border:1px solid #454845;border-radius:14px 14px 14px 4px;padding:8px 12px;overflow-wrap:anywhere}
+.bq-k>:first-child{margin-top:0}.bq-k>:last-child{margin-bottom:0}
+.bq-k p{margin:0 0 6px}
+.bq-k pre{white-space:pre-wrap;font-size:13px}
+.bq-pending{opacity:.75}
+.bq-on-way{gap:2px}
+.bq-state{align-self:flex-end;margin:0 4px;font-size:12px;color:#b9c99a}
+.bq-time{align-self:center;font-size:11px;color:#7d807d;margin:2px 0}
+.bq-thinking{align-self:flex-start;margin:0 2px;font-size:13px;color:#9a9d9a}
+.bq-busy{font-size:15px}
+.bq-quiet{align-self:center;color:#8d8d95;font-size:14px;margin:0}
+.bq-problem{margin:0 12px;font-size:13px;color:#e8b4a8}
+.bq-input{position:relative;display:flex;gap:8px;align-items:center;padding:8px 10px 10px;flex-shrink:0}
+.bq-drawer .bq-input{padding:10px 14px 14px}
+.bq-input input{flex:1;min-width:0;background:#151715;border:1px solid #454845;border-radius:22px;padding:10px 14px;color:#e8e8ea;font-size:16px;outline:none}
+.bq-input input:focus{border-color:#6b706b}
+.bq-input input::placeholder{color:#8d8d95}
+.bq-mic{width:42px;height:42px;min-height:0;padding:0;border-radius:21px;background:#151715;border:1px solid #454845;display:flex;align-items:center;justify-content:center;color:#d0d2d0;flex-shrink:0}
+.bq-mic.rec{background:#2a3320;box-shadow:0 0 0 3px #7fa53833}
+.bq-mic:disabled{opacity:.6}
+.bq-chip.bq-chip-send{pointer-events:auto;cursor:pointer;min-height:0;font:inherit;font-size:12px;line-height:1.4;color:#c9cbc9}
+.bq-chip.bq-chip-send::before{content:"";position:absolute;inset:-12px -10px}
+.bq-recbar{flex:1;min-width:0;display:flex;align-items:center;gap:10px;background:#1b2210;border:1px solid #55702a;border-radius:22px;padding:0 6px 0 14px;height:42px;color:#c9d98f;font-size:13px;font-variant-numeric:tabular-nums}
+.bq-recbar>span:nth-child(2){flex:1}
+.bq-recbar button{width:32px;height:32px;min-height:0;padding:0;border-radius:16px;background:transparent;border:0;color:#c9d98f}
+.bq-mic.bq-send-live{background:#fff;border-color:#fff;color:#000;box-shadow:0 0 0 3px #ffffff38}
+.bq-problem button{margin-left:8px;padding:3px 10px;min-height:0;font-size:12px}
+.bq-stop{display:block;width:10px;height:10px;margin:auto;border-radius:2px;background:currentColor}
+/* Earlier-history insertion restores its own row anchor. */
+.bq-msgs{overflow-anchor:none}

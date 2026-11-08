@@ -1,0 +1,25 @@
+#!/bin/bash
+# kenan-notify [--uid UID] TITLE normal|urgent < BODY
+# Queues a phone notification in the durable outbox of the person whose /var/lib/kenan/notify/PERSON directory the
+# uid owns (default: the caller's). The Kenan channel hosting that person's manager delivers it, now or when it next
+# starts, so an alert raised while Kenan restarts is delivered late rather than lost. Prints the queued file.
+set -euo pipefail
+uid=$(id -u)
+if [[ ${1-} == --uid ]]; then uid=${2:?--uid needs a uid}; shift 2; fi
+(( $# == 2 )) || { echo 'usage: kenan-notify [--uid UID] TITLE normal|urgent < BODY' >&2; exit 2; }
+title=$1 level=$2
+[[ $level == normal || $level == urgent ]] || { echo "notify_invalid: level must be normal or urgent, got '$level'" >&2; exit 2; }
+body=$(cat)
+for dir in /var/lib/kenan/notify/*/; do
+ [[ -d $dir && $(stat -c %u "$dir") == "$uid" ]] || continue
+ tmp=$(mktemp -p "$dir" .enqueue.XXXXXX)
+ trap 'rm -f "$tmp"' EXIT
+ jq -n --arg title "$title" --arg body "$body" --arg level "$level" '{title: $title, body: $body, level: $level}' >"$tmp"
+ file="$dir$(date +%s%N)-$$.json"
+ mv "$tmp" "$file"
+ trap - EXIT
+ echo "$file"
+ exit 0
+done
+echo "notify_unqueued: no notify outbox in /var/lib/kenan/notify is owned by uid $uid" >&2
+exit 1

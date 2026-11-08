@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Acme source exports once a minute
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=1s
+Unit=kenan-ResearchCo-intake.service
+
+[Install]
+WantedBy=timers.target

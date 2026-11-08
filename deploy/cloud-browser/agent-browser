@@ -1,0 +1,4 @@
+#!/bin/sh
+AGENT_BROWSER_BINARY="$(dirname "$(readlink -f "$0")")/agent-browser-linux-x64"
+export AGENT_BROWSER_BINARY
+exec python3 /usr/local/lib/kenan/browser-use/agent-browser.py "$@"

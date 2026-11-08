@@ -1,0 +1,15 @@
+#!/bin/sh
+# Run by the root-owned systemd unit; each instance has its own configuration.
+set -eu
+: "${REMOTE_HOST:?}" "${REMOTE_SOCKET:?}" "${LOCAL_SOCKET:?}" "${IDENTITY_FILE:?}"
+case "$REMOTE_HOST" in *[!a-zA-Z0-9.:-]*|'') echo 'invalid REMOTE_HOST' >&2; exit 2;; esac
+case "$LOCAL_SOCKET" in /run/kenan-link/*.sock) ;; *) echo 'LOCAL_SOCKET must be under /run/kenan-link' >&2; exit 2;; esac
+case "${LOCAL_SOCKET#/run/kenan-link/}" in */*|.*) echo 'invalid LOCAL_SOCKET' >&2; exit 2;; esac
+case "$REMOTE_SOCKET" in /*.sock) ;; *) echo 'REMOTE_SOCKET must be an absolute socket path' >&2; exit 2;; esac
+case "$REMOTE_SOCKET" in *[!a-zA-Z0-9_./-]*) echo 'invalid REMOTE_SOCKET' >&2; exit 2;; esac
+umask 077
+exec /usr/bin/ssh -NT -i "$IDENTITY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 \
+  -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -L "$LOCAL_SOCKET:$REMOTE_SOCKET" "root@$REMOTE_HOST"

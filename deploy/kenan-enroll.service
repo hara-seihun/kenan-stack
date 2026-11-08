@@ -1,0 +1,15 @@
+[Unit]
+Description=Kenan enrollment of verified ACME Google identities (socket for the public entrance only)
+Requires=kenan-people-firewall.service
+After=kenan-people-firewall.service
+[Service]
+Type=exec
+User=root
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/kenan-enroll serve
+RuntimeDirectory=kenan-enroll
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+UMask=0077
+[Install]
+WantedBy=multi-user.target

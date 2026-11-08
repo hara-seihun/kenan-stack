@@ -1,0 +1,10 @@
+/* A question card's answers (web/Question.tsx): in a chat under Kenaznia's question, and on Home's "Waiting on you". */
+.question-options{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}
+.question-options button{min-height:40px;padding:6px 16px;border-radius:20px;border:1px solid #6f7871;background:#1d211e;color:var(--text);font-size:15px;cursor:pointer}
+.question-options button:not(:disabled):hover{background:#2a302b}
+.question-options button.chosen{background:#d8f36a;border-color:#d8f36a;color:#111}
+.question-options button:disabled:not(.chosen){opacity:.45;cursor:default}
+.question-options small{color:#a3aba5}
+.question-options button.dismiss{background:transparent;border-style:dashed;color:#a3aba5}
+
+.post-review{width:100%;text-align:left}.post-review[hidden]{display:none}.post-review article{border-top:1px solid #6f7871;padding:8px 0}.post-review pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.post-review img,.post-review video{max-width:100%;max-height:360px;object-fit:contain}.post-review figure{margin:8px 0}.post-review figcaption{font-size:13px;color:#a3aba5}

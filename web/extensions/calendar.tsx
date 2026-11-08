@@ -1,0 +1,15 @@
+import { useEffect, useState } from 'react';
+import { api } from '../client.js';
+import { formatDate } from '../dates.js';
+import { isOver } from './calendarMath.js';
+interface Event { id: string; title: string; start: string | number; end: string | number; allDay?: boolean; notes?: string; location?: string; zone?: string; subscriptionId?: string | null; recurrence?: string | null; seriesId?: string; occurrence?: string }
+const PAST_DAYS = 14, FUTURE_DAYS = 180;
+const display = (value: string | number, allDay?: boolean) => { const date = new Date(typeof value === 'string' && allDay ? `${value.slice(0, 10)}T00:00:00` : value); return Number.isNaN(date.valueOf()) ? String(value) : formatDate(date, allDay ? { year: 'numeric', month: 'numeric', day: 'numeric' } : { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }); };
+const repeats = (rule: string) => { const freq = /FREQ=(\w+)/.exec(rule)?.[1], interval = Number(/INTERVAL=(\d+)/.exec(rule)?.[1] ?? 1); const unit = { DAILY: 'day', WEEKLY: 'week', MONTHLY: 'month', YEARLY: 'year' }[freq ?? ''] ?? null; return unit === null ? `Repeats (${rule})` : interval === 1 ? `Repeats every ${unit}` : `Repeats every ${interval} ${unit}s`; };
+export function Calendar() {
+  const [events,setEvents]=useState<Event[]>([]), [error,setError]=useState(''), [loading,setLoading]=useState(true);
+  async function refresh(){ const now=Date.now(), from=new Date(now-PAST_DAYS*86_400_000).toISOString(), to=new Date(now+FUTURE_DAYS*86_400_000).toISOString(); try{setEvents((await api<Event[]>(`/ext/calendar/?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)).filter(e=>!isOver(e,Date.now())));setError('');}catch(e){setError(String(e));}finally{setLoading(false);} }
+  useEffect(()=>{const ready=()=>{void refresh();};ready();window.addEventListener('kenan-refresh',ready);return()=>window.removeEventListener('kenan-refresh',ready);},[]);
+  const remove=(id:string,question:string)=>{if(confirm(question))void api(`/ext/calendar/${encodeURIComponent(id)}`,'DELETE').then(refresh).catch(e=>setError(String(e)));};
+  return <div className="panel calendar"><h2>Calendar</h2>{error&&<p role="alert">{error}</p>}{loading&&<p>Loading…</p>}{!loading&&!events.length&&<p>No calendar events.</p>}{events.map(event=><section key={event.id}><h3>{event.title}</h3><p>{display(event.start,event.allDay)} – {display(event.end,event.allDay)}{event.zone?` · ${event.zone}`:''}</p>{event.recurrence&&<p><small>{repeats(event.recurrence)}</small></p>}{event.location&&<p>{event.location}</p>}{event.notes&&<p className="plain-text">{event.notes}</p>}{event.seriesId?<><button onClick={()=>remove(event.id,`Skip “${event.title}” on ${display(event.start,event.allDay)}?`)}>Skip this one</button> <button onClick={()=>remove(event.seriesId!,`Delete every “${event.title}”?`)}>Delete series</button></>:<button onClick={()=>remove(event.id,`Delete “${event.title}”?`)}>Delete</button>}</section>)}</div>;
+}

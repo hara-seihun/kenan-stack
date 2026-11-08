@@ -1,0 +1,359 @@
+#!/bin/bash
+# kenan-bg [--keep] NAME [--env VARIABLE]... [--] CMD [ARGS...]
+# Runs CMD in the background as its own transient service in the caller's systemd user manager, so it outlives the
+# agent's tool call and Kenan restarts, and returns at once. Output goes to the printed log. When CMD ends, a host event
+# `job:$KENAN_AGENT:NAME` is queued with {name, unit, exitCode, outcome (success|failed|oom), log, startedAt, endedAt, tail}; it is addressed to the
+# agent but fires only a wake on its topic (`wake on: "event" topic: "job:<agent id>:NAME"`) or an `on: "any"` wake, never
+# the agent's other wakes; with none waiting, a failure reaches the agent anyway (server/agents/wakes.ts listensTo).
+# The command runs in the current directory with basic process settings and exports added or changed by the calling shell; --env NAME also selects unchanged exports. On ResearchCo each job has a 32 GiB hard memory cap and no swap, without a CPU quota.
+# user.slice also limits all agent commands and jobs together to physical RAM minus 32 GiB. Shell wrappers inherit that shared limit.
+# Every agent's jobs share a low-weight slice (deploy/priority/user-agents-kenanbg.slice.d).
+# Acme retains its own 8 GiB / 2 CPU limits and heavy-work admission.
+# kenan-bg status NAME | kenan-bg stop NAME   (the caller agent's own job of that name). status of an ended job gives its
+# exitCode and outcome from the log's last line, `[kenan-bg] end {...}`, else from systemd's record of a failed unit, else
+# outcome "unknown". An event whose job log could not be written to the end (disk or quota full) carries logIncomplete.
+# Native stop returns state "already-inactive" with stopRequested:false when no live job remains. Otherwise it
+# reports stopped/stopping, stopRequested (whether systemd accepted a stop or a process was signalled), and
+# liveProcessesFound. The saved log and known exitCode/outcome/endedAt are included; priorOutcome is the terminal
+# result known before stopping, or null. "stopped" means no survivors, not proof the stop caused the job to end.
+# A NAME is busy while its job runs (another command under it is refused). Once the job ended, a different command
+# may reuse it; the identical command is not run twice, since that is how a retry after a lost reply looks: it prints
+# state "ended" with the original log. A call cut off by its tool timeout is settled by running the same command
+# again: it reports the job if it started, or starts it exactly once (with the first log) if it never did.
+# A job killed by a host reboot raises its event with reason "killed: host reboot" (a hard reset: from the next boot's
+# kenan-bg-recover.service), and a --keep job so killed is started again after boot with the same command, environment
+# and directory (an exit by itself or a kenan-bg stop is never restarted).
+# A job stopped or killed from outside (kenan-bg stop, a SIGKILL, the unit's own limits) still raises its event, from the
+# unit's ExecStopPost, with outcome stopped (or oom) and exit 128+signal.
+set -euo pipefail
+usage() {
+ cat <<'HELP'
+usage: kenan-bg [--keep] NAME [--env VARIABLE]... -- CMD [ARGS...]
+       kenan-bg status|stop NAME
+Unwatched jobs stop within one minute after their worker is archived or stopped.
+Pending job wakes and handed-off triggers keep jobs running.
+Use --keep for a job intended to outlive its owner.
+Runs in the current directory. Basic process settings (PATH, HOME, USER, LOGNAME,
+LANG, LC_*, TZ, TMPDIR, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS) are inherited.
+Exports added or changed from the calling tool's original environment are also
+inherited, including inline assignments and exports made in nested shells:
+  GRK_K=4 GR_NORETRY=1 kenan-bg fit -- python3 x.py
+Use --env VARIABLE (repeat for more names) to select an unchanged custom export
+from the tool's original environment. An unset or unexported requested variable
+is an error. Unchanged unrelated exports and internal tool settings are not copied. Values travel through the launch socket/stdin and process environment,
+never command arguments or launch logs. The job can still print its own values;
+keep secrets out of CMD arguments and output. Retrying an identical command and
+selected environment under the same NAME returns its original job, not a rerun.
+HELP
+}
+if [[ ${1-} == --help || ${1-} == -h ]]; then usage; exit 0; fi
+agent=${KENAN_AGENT:-}
+[[ -n $agent ]] || { echo 'bg_no_agent: KENAN_AGENT is unset; kenan-bg is for agent tool calls, whose completion event is addressed to that agent' >&2; exit 2; }
+# The authenticated root launcher is installed with kenan-bg.
+native_launcher=/usr/local/lib/kenan/kenan-bg-native/background-launch.mjs
+launch_socket=/run/kenan-bg-launch.sock
+native=0
+[[ $agent =~ ^([a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}|manager:[a-z][a-z0-9-]{0,63})$ && -f $native_launcher ]] && native=1
+unit_of() { if (( native )); then printf 'kenan-bg-%s-%s' "$agent" "$1"; else printf 'kenan-bg-%s-%s' "${agent:0:8}" "$1"; fi; }
+# The launch path is a few small processes and no interpreter of its own: under a CPU-starved agent slice every extra
+# process start costs up to a second, and the caller's tool call has a timeout (2026-10-30).
+native_control() {
+ jq -cn --arg name "$2" --arg cwd "$(pwd -P)" '{agentId: $ENV.KENAN_AGENT, name: $name, argv: ["/usr/bin/true"], cwd: $cwd, env: [], umask: "077", after: "/usr/bin/true"}' \
+  | /usr/bin/sudo -n /usr/local/bin/node "$native_launcher" "$1"
+}
+# Status uses the same authenticated socket as launch. Its single response contains
+# systemd state, the saved owner log, the terminal outcome and a bounded log tail.
+native_status() {
+ local out
+ if [[ -S $launch_socket ]]; then
+  out=$(printf '{"action":"status","agentId":"%s","name":"%s","argv":[],"after":"","cwd":"/","env":[],"umask":"077"}\n' "$agent" "$1" \
+   | /usr/bin/socat -t 10 - "UNIX-CONNECT:$launch_socket" 2>/dev/null || true)
+  if [[ ${out##*$'\n'} == '{"ok":true,'* || ${out##*$'\n'} == '{"ok":false,'* ]]; then printf '%s\n' "${out##*$'\n'}"; return; fi
+ fi
+ native_control status "$1"
+}
+# The last line of every job's log: `[kenan-bg] end {"exitCode":N,"outcome":"...","endedAt":"..."}`. status reads it back.
+end_mark='[kenan-bg] end'
+end_record() { jq -cn --argjson code "$1" --arg outcome "$2" --arg e "$3" --arg reason "${4-}" '{exitCode: $code, outcome: $outcome, endedAt: $e} + (if $reason == "" then {} else {reason: $reason} end)'; }
+# A job ended because the host is rebooting or powering off says so, and a --keep job so ended is started again after boot
+# (deploy/kenan-bg-native/recover.mjs). A hard reset leaves no end line at all; recover.mjs writes one with this same reason.
+host_reason='killed: host reboot'
+shutting_down() { [[ $(systemctl is-system-running 2>/dev/null || true) == stopping ]]; }
+# Events summarize the log, not replay it. The full output stays at `log`.
+# Control characters other than newline, tab and carriage return never go into an event (NUL breaks the database).
+event_output() { event_output_raw "$@" | tr -d '\000-\010\013\014\016-\037'; }
+event_output_raw() {
+ local file=$1 outcome=$2 size
+ if [[ $outcome == success ]]; then
+  tail -c 8192 "$file" 2>/dev/null | sed '/^\[kenan-bg\] end /d; /^[[:space:]]*$/d' | tail -n 8 | tail -c 1024
+ else
+  size=$(stat -Lc %s "$file" 2>/dev/null || echo 0)
+  if (( size <= 8192 )); then cat "$file" 2>/dev/null; else
+   head -c 3072 "$file" 2>/dev/null
+   printf '\n[kenan-bg: middle omitted; full output in log]\n'
+   tail -c 5000 "$file" 2>/dev/null
+  fi
+ fi
+}
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._-]{1,60}$ ]] || { echo "bg_invalid: NAME must be 1-60 of A-Z a-z 0-9 . _ -, got '$1'" >&2; exit 2; }; }
+
+case ${1-} in
+ status) valid_name "${2:?usage: kenan-bg status NAME}"
+  if (( native )); then
+   native_status "$2" | jq -er 'if .ok then
+    ({unit: (.unit | rtrimstr(".service")), state: (if .state == "inactive" or (.state == "unknown" and .terminal.source == "log") then "ended" else .state end), log} + (.terminal // {}) | tojson),
+    (.tail | select(length > 0))
+    else error(.error.code // .code) end'
+   exit
+  fi
+  unit=$(unit_of "$2"); last=$(ls -t /var/tmp/kenan-bg/"$(id -un)"/"$2"-*.log 2>/dev/null | head -1 || true)
+  state=$(systemctl --user is-active "$unit.service" 2>/dev/null || true)
+  # not-started: the last launch was cut off before systemd answered and never ran; the same command starts it once.
+  # unknown: the state could not be read; it stays unknown unless the log's end line shows the job ended.
+  [[ $state == active || $state == not-started || $state == unknown ]] || state=ended
+  # An ended job says how it ended: from its log's end line, else from systemd's record of the unit (kept while it
+  # failed), else outcome "unknown". Never a bare "ended" that reads as finished (2026-10-31: a job whose log could
+  # not be written past 4096 bytes showed only "ended").
+  end=null
+  if [[ $state == ended || $state == unknown ]]; then
+   # The end line is the log's last line: read only the last 64 KiB, never a whole multi-gigabyte log.
+   line=$([[ -z $last ]] || tail -c 65536 "$last" 2>/dev/null | awk -v m="$end_mark {" 'index($0, m) == 1 {l = $0} END {print l}' 2>/dev/null || true)
+   if [[ -n $line ]]; then end=$(jq -c '. + {source: "log"}' <<<"${line#"$end_mark "}" 2>/dev/null || echo null); fi
+   if [[ $state == unknown ]]; then
+    if [[ $end == null ]]; then end='{"note": "the job state could not be read and its log has no end line; it may still be running"}'; else state=ended; fi
+   elif [[ $end == null ]]; then
+    shown=$(systemctl --user show "$unit.service" -p LoadState,Result,ExecMainCode,ExecMainStatus,ExecMainExitTimestamp 2>/dev/null || true)
+    end=$(jq -Rn '(reduce (inputs | capture("^(?<k>[^=]+)=(?<v>.*)$")) as $p ({}; .[$p.k] = $p.v)) as $u
+     | if $u.LoadState != "loaded" or ($u.Result // "") == "" then
+        {outcome: "unknown", note: "no end line in the log and systemd no longer has the unit; the job:AGENT:NAME event, if it arrived, has the outcome"}
+       else ($u.ExecMainStatus | tonumber) as $s
+        | (if $u.ExecMainCode == "1" then $s else 128 + $s end) as $code
+        | {exitCode: $code, outcome: (if $u.Result == "success" then "success" elif $u.Result == "oom-kill" then "oom" elif $u.ExecMainCode == "1" then "failed" else "stopped" end),
+           endedAt: $u.ExecMainExitTimestamp, source: "systemd", note: "the log has no end line, so it is probably incomplete"} end' <<<"$shown")
+   fi
+  fi
+  jq -n --arg unit "$unit" --arg state "$state" --arg log "$last" --argjson terminal "$end" '{unit: $unit, state: $state, log: (if $log == "" then null else $log end)} + ($terminal // {})'
+  [[ -z $last ]] || tail -n 20 "$last"
+  exit 0;;
+ stop) valid_name "${2:?usage: kenan-bg stop NAME}"; if (( native )); then native_control stop "$2"; exit; fi; exec systemctl --user stop "$(unit_of "$2").service";;
+ --run) shift
+  name=$1 log=$2; shift 2
+  # This tracked service outlives its submitting foreground shell. Its deadline is not ours.
+  unset KENAN_BASH_DEADLINE_UNIX_MS
+  export KENAN_TRACKED_BACKGROUND=1
+  started=$(date -u +%FT%TZ)
+  cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/memory.events
+  kills() { sed -n 's/^oom_kill //p' "$cg" 2>/dev/null || true; }
+  kills_before=$(kills)
+  # Hold the log open for the whole job and read it back through that descriptor, so a log deleted
+  # while the job runs (the 2026-10-26 /var/tmp wipe) still yields its tail and a correct event.
+  mkdir -p -m 0700 "${log%/*}" 2>/dev/null || true
+  exec 3>>"$log"
+  out=/proc/$$/fd/3
+  set +e; "$@" >&3 2>&3 <"${KENAN_BG_STDIN:-/dev/null}"; code=$?
+  # Nothing after the job may change its exit code or skip its end event, so no set -e from here on (2026-10-31: the
+  # research quota was full, jq could not write the event file, set -e ended the wrapper with jq's own status 2, and
+  # the ExecStopPost fallback failed the same way: the job's exit code and its end event were both lost).
+  ended=$(date -u +%FT%TZ)
+  # Admitted units are collected after exit. Consume the terminal marker emitted
+  # from their durable ExecStopPost receipt, not systemctl's unloaded defaults.
+  outcome=$(jq -Rnr 'reduce inputs as $line (""; if ($line | try (fromjson | .kind == "acme-host-slot-terminal" and .outcome == "oom") catch false) then "oom" else . end)' "$out" 2>/dev/null || true)
+  # A kill by this unit's own MemoryMax shows in its cgroup's oom_kill count.
+  kills_after=$(kills)
+  if [[ -z $outcome && $code != 0 && -n $kills_before && -n $kills_after ]] && (( kills_after > kills_before )); then outcome=oom; fi
+  if [[ $outcome == oom && $code == 0 ]]; then code=137; fi
+  [[ -n $outcome ]] || { if (( code == 0 )); then outcome=success; else outcome=failed; fi; }
+  reason=
+  if [[ $outcome != success ]] && shutting_down; then outcome=stopped; reason=$host_reason; fi
+  end=$(end_record "$code" "$outcome" "$ended" "$reason")
+  # The end line is what `kenan-bg status` reads. When even it can't be written (disk or quota full), the job's own
+  # output was probably cut short too, and the event says so instead of passing a truncated log off as complete.
+  log_error=$({ printf '%s %s\n' "$end_mark" "$end" >&3; } 2>&1) && log_error=
+  jq -n --arg outcome "$outcome" --arg name "$name" --arg unit "$(unit_of "$name")" --argjson code "$code" --arg log "$log" --arg s "$started" --arg e "$ended" \
+   --arg tail "$(event_output "$out" "$outcome")" --arg logError "$log_error" --arg reason "$reason" \
+   '{name: $name, unit: $unit, exitCode: $code, outcome: $outcome, log: $log, startedAt: $s, endedAt: $e, tail: $tail}
+    + (if $reason == "" then {} else {reason: $reason} end)
+    + (if $logError == "" then {} else {logIncomplete: true, logError: ("the log could not be written to the end: " + $logError)} end)' \
+   | kenan-event --id "$(unit_of "$name")-$started" "job:$agent:$name" >/dev/null
+  if (( ${PIPESTATUS[1]} == 0 )); then
+   mkdir -p -m 0700 "${log%/*}" 2>/dev/null; : >"$log.emitted"
+  else
+   echo "kenan-bg: the end event for $name could not be queued; ExecStopPost raises it with exit code $code" >&2
+  fi
+  exit "$code";;
+ --after) shift
+  # ExecStopPost: runs however the unit ended. The wrapper marks the events it raised; anything unmarked ended from outside.
+  name=$1 log=$2
+  if [[ -e $log.emitted ]]; then rm -f -- "$log.emitted"; exit 0; fi
+  ended=$(date -u +%FT%TZ)
+  status=${EXIT_STATUS:-}
+  note=
+  case ${EXIT_CODE:-} in
+   killed|dumped) signal=$(kill -l "$status" 2>/dev/null || true); [[ $signal =~ ^[0-9]+$ ]] && code=$((128 + signal)) || code=137
+    if [[ ${SERVICE_RESULT:-} == oom-kill ]]; then outcome=oom; else outcome=stopped; fi;;
+   # The wrapper ran to its end and exited with the job's own code, but could not queue the event itself.
+   exited) [[ $status =~ ^[0-9]+$ ]] && code=$status || code=1
+    if [[ ${SERVICE_RESULT:-} == oom-kill ]]; then outcome=oom; elif (( code == 0 )); then outcome=success; else outcome=failed; fi
+    note='the job ended by itself but its wrapper could not queue this event (see the unit journal); raised by ExecStopPost';;
+   *) code=137; outcome=stopped;;
+  esac
+  [[ $outcome != stopped ]] || (( code != 0 )) || code=143
+  reason=
+  if [[ $outcome != success ]] && shutting_down; then outcome=stopped; reason=$host_reason; fi
+  printf '%s %s\n' "$end_mark" "$(end_record "$code" "$outcome" "$ended" "$reason")" 2>/dev/null >>"$log" || true
+  jq -n --arg outcome "$outcome" --arg name "$name" --arg unit "$(unit_of "$name")" --argjson code "$code" --arg log "$log" --arg e "$ended" \
+   --arg result "${SERVICE_RESULT:-}" --arg tail "$(event_output "$log" "$outcome")" --arg note "$note" --arg reason "$reason" \
+   '{name: $name, unit: $unit, exitCode: $code, outcome: $outcome, serviceResult: $result, log: $log, startedAt: null, endedAt: $e, tail: $tail}
+    + (if $reason == "" then {} else {reason: $reason} end)
+    + (if $note == "" then {} else {note: $note} end)' \
+   | kenan-event --id "$(unit_of "$name")-after-$ended" "job:$agent:$name" >/dev/null
+  exit 0;;
+esac
+
+keep=false
+if [[ ${1-} == --keep ]]; then keep=true; shift; fi
+(( $# >= 2 )) || { usage >&2; exit 2; }
+name=$1; shift; valid_name "$name"
+# Select names only. Do not copy the tool process's unchanged unrelated credentials.
+env_names=(KENAN_AGENT)
+while IFS= read -r key; do
+ case $key in PATH|HOME|USER|LOGNAME|LANG|LC_*|TZ|TMPDIR|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS) env_names+=("$key");; esac
+done < <(compgen -e)
+while [[ ${1-} == --env ]]; do
+ key=${2-}
+ [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo 'bg_invalid_env: --env needs a variable name, not an assignment' >&2; exit 2; }
+ case $key in BASH_FUNC_*|KENAN_TOOL_CALL_ID|KENAN_BASH_DEADLINE_UNIX_MS|KENAN_TRACKED_BACKGROUND|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|KENAN_BG_*) echo "bg_invalid_env: $key is reserved" >&2; exit 2;; esac
+ printenv "$key" >/dev/null || { echo "bg_invalid_env: $key must be exported before launch" >&2; exit 2; }
+ env_names+=("$key"); shift 2
+done
+# Find the original tool environment, not just the immediate shell: a nested
+# `FOO=1 bash -c 'kenan-bg ...'` must retain FOO too. Linux exposes each process's
+# initial environment, so shell exports do not overwrite this baseline. Stop at
+# the first different tool/agent or unreadable parent. Values never enter argv.
+inherit_shell_exports() {
+ local pid=$PPID fd entry key stat state rest found=0
+ local -A candidate=() baseline=() selected=()
+ local -a missing=()
+ for key in "${env_names[@]}"; do selected[$key]=1; done
+ while (( pid > 1 )); do
+  if ! { exec {fd}<"/proc/$pid/environ"; } 2>/dev/null; then break; fi
+  candidate=()
+  while IFS= read -r -d '' entry <&"$fd"; do
+   key=${entry%%=*}; candidate["$key"]=${entry#*=}
+  done
+  exec {fd}<&-
+  [[ ${candidate[KENAN_AGENT]-} == "$agent" && ${candidate[KENAN_TOOL_CALL_ID]-} == "${KENAN_TOOL_CALL_ID-}" ]] || break
+  found=1; baseline=()
+  for key in "${!candidate[@]}"; do baseline[$key]=${candidate[$key]}; done
+  IFS= read -r stat <"/proc/$pid/stat" 2>/dev/null || break
+  read -r state pid rest <<<"${stat##*) }"
+ done
+ while IFS= read -r key; do
+  [[ -z ${selected[$key]-} ]] || continue
+  case $key in
+   BASH_FUNC_*|KENAN_TOOL_CALL_ID|KENAN_BASH_DEADLINE_UNIX_MS|KENAN_TRACKED_BACKGROUND|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|KENAN_BG_*|PWD|OLDPWD|SHLVL|_) continue;;
+  esac
+  if (( ! found )); then missing+=("$key"); continue; fi
+  if [[ ! -v baseline[$key] || ${baseline[$key]} != "${!key}" ]]; then env_names+=("$key"); fi
+ done < <(compgen -e)
+ if (( ${#missing[@]} )); then
+  printf 'bg_env_baseline_unavailable: cannot read the calling tool environment; select these exported variables with --env VARIABLE: %s\n' "${missing[*]}" >&2
+  exit 2
+ fi
+}
+inherit_shell_exports
+[[ ${1-} == -- ]] && shift
+(( $# >= 1 )) || { echo 'bg_invalid: no command given' >&2; exit 2; }
+# Resolve before log creation/detachment. Capture a real executable path (never a
+# shell function/builtin); keep every subsequent argv byte and caller PATH intact.
+if [[ $1 == */* ]]; then executable=$1; else executable=$(type -P -- "$1" || true); fi
+if [[ -z $executable || ! -f $executable || ! -x $executable ]]; then
+ hint='Install/repair the owning executable or use an existing supported route; no job was detached.'
+ if [[ $1 == cpu-slot ]] && type -P acme-heavy-slot >/dev/null; then
+  hint='Small bounded runs (≤6 GiB, ≤900 s, ≤2 CPUs): acme-host-slot --owner YOU --memory 4G --priority optional --work-class worker-bounded --runtime-seconds 600 -- CMD (runtime owner defaults to --owner). Heavy work: acme-heavy-slot reserve/launch, through the release publisher.'
+ fi
+ jq -n --arg command "$1" --arg hint "$hint" '{ok:false,error:{code:"bg_executable_missing",command:$command,detail:$hint},detached:false}' >&2
+ exit 127
+fi
+# Convert a relative PATH result to an absolute path before systemd resolves it.
+[[ $executable == /* ]] || executable=$PWD/$executable
+shift
+set -- "$executable" "$@"
+unit=$(unit_of "$name")
+self=$(readlink -f "$0")
+user=$(id -un)
+if (( ! native )) && systemctl --user is-active --quiet "$unit.service"; then echo "bg_running: $unit is still running; pick another NAME or kenan-bg stop $name" >&2; exit 1; fi
+if (( ! native )); then systemctl --user reset-failed "$unit.service" 2>/dev/null || true; fi
+# Shared by every household user: whoever creates it makes it sticky and world-writable like /tmp, each user owning their own subdirectory.
+[[ -d /var/tmp/kenan-bg ]] || mkdir -m 1777 /var/tmp/kenan-bg 2>/dev/null || [[ -d /var/tmp/kenan-bg ]]
+dir=/var/tmp/kenan-bg/$user
+[[ -d $dir ]] || mkdir -p -m 0700 "$dir"
+# Nanoseconds: an ended NAME may run a different command within the same second, and two jobs must never share a log
+# (the first one's end line would read as the second one's ending).
+log=$dir/$name-$(date -u +%Y%m%dT%H%M%S.%NZ).log
+[[ $self$log != *[[:space:]\$%\\\"\']* ]] || { echo "bg_invalid: the script or log path has a character systemd's ExecStopPost can't carry: $self $log" >&2; exit 2; }
+if (( ! native )); then : >"$log"; fi
+# A here-document or pipe given to kenan-bg feeds the job (python3 -, bash -s): keep it in a file beside the log.
+# Only a pipe or a file is read. An agent tool call's own stdin is a socket that may never close, and reading it held
+# every launch for 5 s; a tool timeout then cut the launch off and left an empty .stdin with no job (2026-10-31).
+# Until the launch has succeeded, a cut-off or failed launch takes its .stdin with it.
+unset KENAN_BG_STDIN
+if [[ -p /dev/stdin || -f /dev/stdin ]]; then
+ trap 'rm -f -- "$log.stdin"' EXIT
+ trap 'exit 143' TERM HUP INT
+ timeout 5 cat >"$log.stdin" 2>/dev/null || true
+ if [[ -s $log.stdin ]]; then export KENAN_BG_STDIN=$log.stdin; else rm -f "$log.stdin"; fi
+fi
+[[ -z ${KENAN_BG_STDIN:-} ]] || env_names+=(KENAN_BG_STDIN)
+# Names are safe to put in argv; values are read by jq from its environment.
+if (( native )); then
+ # Every argument gets an x prefix, stripped in jq, so none can look like a jq option.
+ argv=("$self" --run "$name" "$log" "$@")
+ request=$(jq -cn --arg name "$name" --arg cwd "$(pwd -P)" --arg umask "$(umask)" --arg after "$self --after $name $log" --argjson keep "$keep" --arg envNames "${env_names[*]}" '
+  ($envNames | split(" ") | unique) as $envKeys | {keep: $keep, agentId: $ENV.KENAN_AGENT, name: $name, cwd: $cwd, umask: $umask, argv: [$ARGS.positional[] | .[1:]], after: $after,
+   env: [$ENV | to_entries[] | .key as $key | select($envKeys | index($key) != null) | "\(.key)=\(.value)"]}' \
+  --args "${argv[@]/#/x}")
+ # The launcher prints one JSON line last: the result, or the error on failure. Nothing is written beside the log, so a
+ # call cut off by its tool timeout leaves no stray file; the same command then reports or starts the job exactly once.
+ # The launch socket runs the launcher in system.slice: only socat starts in this (often CPU-starved) tool scope.
+ # A missing socket or connect(2) refusal means no request reached the launcher: use the same authenticated helper
+ # directly. Never fall back after a connection was established: a lost reply may already have started the job.
+ direct=1
+ if [[ -S $launch_socket ]]; then
+  set +e; out=$(LC_ALL=C /usr/bin/socat -t 60 - "UNIX-CONNECT:$launch_socket" <<<"$request" 2>&1); code=$?; set -e
+  direct=0
+  if (( code )) && [[ $out == *' E connect('* && ( $out == *': Connection refused' || $out == *': No such file or directory' ) ]]; then direct=1; fi
+  body=${out##*$'\n'}
+  if [[ -z $body ]]; then
+   out='{"ok":false,"error":{"code":"background_launch_outcome_unknown","detail":"The launch socket closed without a response. Inspect the exact named unit and the kenan-bg-launch service journal before retrying; no fallback command was submitted."}}'
+   body=$out; code=75
+  fi
+  if (( ! code )); then case $body in '{"ok":true'*) ;; *'"code":"background_launch_outcome_unknown"'*) code=75;; *) code=2;; esac; fi
+ fi
+ if (( direct )); then
+  set +e; out=$(/usr/bin/sudo -n /usr/local/bin/node "$native_launcher" launch <<<"$request" 2>&1); code=$?; set -e
+  body=${out##*$'\n'}
+ fi
+ if (( code )); then
+  printf '%s\n' "$out" >&2
+  # A systemd timer, cron or other detached process has no agent tool scope, so the job could never report to an agent.
+  if [[ $out == *background_native_caller_required* ]]; then echo 'kenan-bg starts only from an agent tool call, which binds its end event to that agent. Systemd timers, cron and other detached processes cannot start it. For a later start, schedule a wake (with a clock reason or an event) and run kenan-bg when it fires.' >&2; fi
+  exit "$code"
+ fi
+ trap - EXIT
+ jq -cn --argjson body "$body" --arg log "$log" --arg topic "job:$agent:$name" '{started: ($body.unit | rtrimstr(".service")), log: ($body.log // $log), event: $topic, reused: ($body.reused // false), state: ($body.state // "running")}'
+ if [[ $body == *'"state":"ended"'* ]]; then echo "kenan-bg: this exact command already ran under the name $name and has ended (its end event was raised then); nothing new started. To run it again, use a new NAME." >&2; fi
+ exit 0
+else
+env_args=()
+for key in "${env_names[@]}"; do env_args+=("--setenv=$key"); done
+bg_oom_priority=()
+[[ $(hostname) != ResearchCo ]] || bg_oom_priority=(--property=OOMScoreAdjust=500)
+bg_memory_limit=()
+[[ $(hostname) != acme-host ]] || bg_memory_limit=(--property=MemoryMax=8G)
+systemd-run --user --quiet --collect --expand-environment=no --unit="$unit" --working-directory="$PWD" \
+ "${bg_memory_limit[@]}" "${bg_oom_priority[@]}" --property=MemorySwapMax=0 --property=OOMPolicy=continue --property=UMask="$(umask)" \
+ --description="kenan-bg $name for agent $agent" --property=ExecStopPost="$self --after $name $log" "${env_args[@]}" -- "$self" --run "$name" "$log" "$@"
+trap - EXIT
+fi
+jq -n --arg unit "$unit" --arg log "$log" --arg topic "job:$agent:$name" '{started: $unit, log: $log, event: $topic}'

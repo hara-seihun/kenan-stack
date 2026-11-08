@@ -1,0 +1,10 @@
+.composer-controls .voice,.composer-controls .voice-mute{display:grid;place-items:center;width:44px;height:44px;min-height:44px;padding:0;border-radius:50%;background:#151515;border:1px solid #363636;color:#cfcfcf;flex-shrink:0}
+.composer-controls .voice:hover,.composer-controls .voice-mute:hover{background:#1e1e1e}
+.composer-controls .voice.connecting{color:#8fd0a8;border-color:#2f6a46;animation:voice-ring 1.2s ease-out infinite}
+.composer-controls .voice-mute.muted{color:#f0b4a8;border-color:#7a3a30;background:#2a1612}
+.composer-controls .voice-end{display:flex;align-items:center;gap:6px;height:44px;min-height:44px;padding:0 13px 0 11px;border-radius:22px;background:#b3261e;border-color:#b3261e;color:#fff;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;flex-shrink:0}
+.composer-controls .voice-end:hover{background:#c9352c}
+.voice-dot{width:8px;height:8px;border-radius:50%;background:#7ef0a6;box-shadow:0 0 0 0 #7ef0a6aa;animation:voice-pulse 1.6s ease-out infinite}
+@keyframes voice-pulse{0%{box-shadow:0 0 0 0 #7ef0a6aa}70%{box-shadow:0 0 0 7px #7ef0a600}100%{box-shadow:0 0 0 0 #7ef0a600}}
+@keyframes voice-ring{0%{box-shadow:0 0 0 0 #8fd0a866}80%{box-shadow:0 0 0 9px #8fd0a800}100%{box-shadow:0 0 0 0 #8fd0a800}}
+@media(prefers-reduced-motion:reduce){.voice-dot,.composer-controls .voice.connecting{animation:none}}

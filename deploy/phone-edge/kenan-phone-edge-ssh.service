@@ -1,0 +1,15 @@
+[Unit]
+Description=Standing SSH connection to the phone edge, so starting a call's bridge there costs one round trip, not a handshake
+After=tailscaled-mesh.service
+Wants=tailscaled-mesh.service
+
+[Service]
+# The server's ssh calls (server/extensions/phone-host.ts) use the same ControlPath and ride this connection.
+# A cold connection took 2.2 s, which an inbound caller would hear as ringing.
+EnvironmentFile=/etc/kenan/phone-edge.env
+ExecStart=/usr/bin/ssh -N -M -i /etc/kenan/phone-edge/ssh_key -o UserKnownHostsFile=/etc/kenan/phone-edge/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ControlMaster=yes -o ControlPath=/run/kenan/phone-edge-%%C -o ControlPersist=no root@${EDGE}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

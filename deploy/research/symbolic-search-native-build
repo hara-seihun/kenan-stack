@@ -1,0 +1,45 @@
+#!/bin/bash
+# symbolic-search-native-build: build the symbolic-search native module (ResearchCo compiler/symbolic-search/native) and
+# install it as the one shared copy every agent loads: /usr/local/lib/kenan/symbolic-search-native/symbolic-search-native.node
+#
+#   symbolic-search-native-build                 build the live research tree (what symbolic-search-native.service runs)
+#   symbolic-search-native-build --from DIR      build a checkout's native/ folder instead (DIR is .../compiler/symbolic-search/native)
+#
+# Runs as kenan. The source is copied into one persistent build tree with rsync --checksum, so unchanged files keep
+# their mtimes and Cargo's own incremental build decides what to recompile. The build is the folder's own build.sh,
+# run directly. The result is copied beside the installed file and renamed over it: a process that already
+# loaded the old module keeps its mapping, and nothing ever sees a half-written file. A canonical main without the
+# native folder is not an error: there is nothing to build yet.
+set -euo pipefail
+cache=${SYMBOLIC_NATIVE_CACHE:-/var/cache/kenan-symbolic-search-native}
+dest=${SYMBOLIC_NATIVE_DEST:-/usr/local/lib/kenan/symbolic-search-native/symbolic-search-native.node}
+folder=compiler/symbolic-search/native
+from=
+case ${1-} in
+  --from) from=$(realpath -e -- "${2:?--from needs the native folder of a checkout}");;
+  '') ;;
+  *) echo "usage: symbolic-search-native-build [--from CHECKOUT/compiler/symbolic-search/native]" >&2; exit 2;;
+esac
+src=$cache/src
+mkdir -p "$src"
+alert=/var/lib/machine-alerts/inbox/symbolic-search-native-build.md
+exec 9>"$cache/lock"
+flock 9
+from=${from:-/home/kenan/alice/ResearchCo/$folder}
+[[ -f $from/build.sh && -f $from/Cargo.toml ]] || { echo "symbolic_native_not_a_source: $from has no build.sh and Cargo.toml" >&2; exit 2; }
+rm -f "$cache/pending"
+rsync -a --checksum --delete --exclude=/target "$from/" "$src/"
+label="$from"
+# A failed build of main leaves the installed module as it was and raises a host alert, cleared by the next good build.
+if ! out=$(bash "$src/build.sh" 2>&1); then
+  printf '%s\n' "$out" >&2
+  printf '# symbolic-search native module: build of %s failed\n\nThe shared module (%s) still holds the last good build. Fix the Rust sources on main; the next push that changes %s rebuilds it (or run `symbolic-search-native-build`).\n\n```\n%s\n```\n' "$label" "$dest" "$folder" "$(printf '%s\n' "$out" | tail -40)" >"$alert" 2>/dev/null || true
+  exit 1
+fi
+rm -f "$alert"
+built=$src/target/release/symbolic_search_native.node
+[[ -s $built ]] || { echo "symbolic_native_build_missing: $built was not produced" >&2; exit 1; }
+if cmp -s "$built" "$dest"; then echo "$dest unchanged ($label)"; exit 0; fi
+tmp=$(mktemp "$dest.new.XXXXXX")
+cp "$built" "$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$dest"
+echo "$dest installed from $label"

@@ -1,0 +1,13 @@
+# Host background work that no one is waiting on in the moment: backups, snapshots, cold-tier moves, disk census and
+# cleanup. A top-level slice beside system.slice (400), heavy.slice (200, every account's cpu-slot jobs) and user.slice
+# (100), at weight 10, so it yields to every service, every agent command and every cpu-slot job when the host is busy,
+# and still uses every idle CPU (2026-10-31, load 100: at 50 it took 2-2.4 CPUs while short cpu-slot builds got 0.2). In
+# system.slice these services outranked agent commands whatever their own CPUWeight said (2026-10-30: two kenan-snap
+# restic processes and a cold-tier rsync took 3 CPUs at load 100 while agents' git commands got 3% of a core).
+# Its own slice, not user.slice, so it stays out of the shared job memory budget. Policy: deploy/README.md "Compute priority".
+[Unit]
+Description=Host background work (backups, snapshots, cold-tier moves, disk cleanup)
+
+[Slice]
+CPUWeight=10
+IOWeight=10

@@ -1,0 +1,16 @@
+#!/usr/sbin/nft -f
+# Tools of people enrolled through the public entrance (deploy/kenan-enroll.py) run as uids 30000-30999. They reach the
+# public internet and DNS, never this host's own services, the VPC, other private ranges or the metadata server (whose
+# token is the host's Google service account). Applied by kenan-people-firewall.service; replacing the table is atomic.
+table inet kenan_people_tools
+delete table inet kenan_people_tools
+table inet kenan_people_tools {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid 30000-30999 ip daddr { 127.0.0.53, 127.0.0.54, 169.254.169.254 } udp dport 53 accept
+		meta skuid 30000-30999 ip daddr { 127.0.0.53, 127.0.0.54, 169.254.169.254 } tcp dport 53 accept
+		meta skuid 30000-30999 fib daddr type local counter reject
+		meta skuid 30000-30999 ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 } counter reject
+		meta skuid 30000-30999 ip6 daddr { ::/128, ::1/128, ::ffff:0:0/96, fc00::/7, fe80::/10, ff00::/8 } counter reject
+	}
+}

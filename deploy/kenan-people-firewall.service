@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep enrolled people's tools (uids 30000-30999) off local, private and metadata addresses
+Before=kenan@beta.service kenan@production.service kenan-enroll.service
+After=nftables.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/kenan/people-firewall.nft
+ExecStop=/usr/sbin/nft delete table inet kenan_people_tools
+[Install]
+WantedBy=multi-user.target

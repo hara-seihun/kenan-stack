@@ -1,0 +1,63 @@
+#!/bin/bash
+# Pre-receive hook for research remotes. Ordinary Git files are limited to 32 MiB,
+# generated inventory/status/card text to 256 MiB, and new content per push to 1 GiB.
+# Raw data belongs in the external data store, not Git.
+set -u
+max_file=32 max_generated=256 max_push=1024
+generated='^(research/receiver-relative/engineering/hardware/model/inventory/|compiler/symbolic-search/measure/STATUS[.]md$|compiler/symbolic-search/model/cards/.+[.]json$|research/receiver-relative/engineering/hardware/model/cards/[^/]+[.]structure[.]json$)'
+zero=0000000000000000000000000000000000000000
+news=()
+while read -r old new ref; do [ "$new" = "$zero" ] || news+=("$new"); done
+(( ${#news[@]} )) || exit 0
+# The blobs this push adds as "OID PATH" lines (only regular files have paths; refs and symlinks do not), listed
+# once for both checks below. Read from the push's quarantine: its blobs are exactly the new objects, and each one's path
+# comes from diffing the new commits against their parents. `rev-list NEW --not --all` found the same set by marking
+# all of main's tree (595,000 entries in ResearchCo.git) and loading 71,000 refs, 0.4-0.8 CPU-seconds per walk, twice per
+# push (2026-11-02). Outside a quarantine (git before 2.11, or a direct call) it is still the rev-list walk.
+new_blobs() {
+  if [[ -n ${GIT_QUARANTINE_PATH-} ]] && python3 - "${news[@]}" >"$listing" <<'PY'
+import os, subprocess, sys
+quarantine = dict(os.environ, GIT_OBJECT_DIRECTORY=os.environ["GIT_QUARANTINE_PATH"])
+quarantine.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+rows = subprocess.run(["git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+                      env=quarantine, capture_output=True, text=True, check=True).stdout.split()
+new = dict(zip(rows[0::2], rows[1::2]))
+commits = [oid for oid, kind in new.items() if kind == "commit"]
+paths = {}
+if commits:
+    raw = subprocess.run(["git", "diff-tree", "--stdin", "--no-commit-id", "-r", "-m", "--root", "--no-renames", "-z"],
+                         input="\n".join(commits) + "\n", capture_output=True, text=True, check=True,
+                         errors="surrogateescape").stdout.split("\0")
+    for meta, path in zip(raw[0::2], raw[1::2]):
+        fields = meta.split() if meta.startswith(":") else []
+        oid = fields[3] if fields else ""
+        if new.get(oid) == "blob" and fields[1] in ("100644", "100755"):
+            paths.setdefault(oid, set()).add(path)
+out = sys.stdout.buffer
+for oid, kind in new.items():
+    if kind == "blob":
+        for path in sorted(paths.get(oid, {""})):
+            out.write((oid + (" " + path if path else "") + "\n").encode("utf-8", "surrogateescape"))
+PY
+  then cat "$listing"
+  else ResearchCo-data push-objects "${news[@]}" --not --all
+  fi
+}
+listing=$(mktemp); trap 'rm -f "$listing"' EXIT
+objects=$(mktemp); trap 'rm -f "$listing" "$objects"' EXIT
+new_blobs >"$objects" || exit 1
+# A remote with its own data store (ResearchCo.git: git config kenan.dataStore true) keeps data files out of git as pointers;
+# ResearchCo-data refuses a push that stores one as raw bytes or points at an object the store lacks, and says how to fix it.
+if [[ $(git config --bool --get kenan.dataStore || true) == true ]]; then
+  ResearchCo-data check-push --stdin <"$objects" || exit 1
+fi
+git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize) %(rest)' <"$objects" \
+  | awk -v mf="$max_file" -v mg="$max_generated" -v gen="$generated" -v mp="$max_push" -v repo="$(basename "$PWD")" '
+    $2 == "blob" { if (!seen[$1]++) total += $3; path = (NF > 3 ? substr($0, index($0, $4)) : ""); cap = (path ~ gen ? mg : mf)
+                   if ($3 > cap * 1048576) { big++; if (big <= 10) list = list sprintf("  %s (%.0f MiB, limit %d MiB)\n", path, $3 / 1048576, cap) } }
+    END {
+      if (!big && total <= mp * 1048576) exit 0
+      printf "research_push_too_large: this push to %s adds %.0f MiB of new files (limit %d MiB per push) and %d files over their limit (%d MiB; %d MiB for regenerated and card files)\n%s", repo, total / 1048576, mp, big, mf, mg, list > "/dev/stderr"
+      printf "Raw evidence does not go in git. Keep it in its own folder /var/tmp/kenan-research/<campaign>-raw/ (after 6 idle hours it moves to the Storage Box and stays readable at the same path; kenan-cold restore PATH before writing to it again) and commit only what reviewers need: summaries, zstd-compressed samples, and a one-line note saying where the raw files live. Then amend your local commit and push again.\n" > "/dev/stderr"
+      exit 1
+    }'

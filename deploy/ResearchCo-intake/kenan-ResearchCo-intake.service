@@ -1,0 +1,17 @@
+[Unit]
+Description=Merge Acme source and deploy ResearchCo Beta
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kenan
+Group=kenan
+Environment=HOME=/home/kenan
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GIT_TERMINAL_PROMPT=0
+Environment=PATH=/home/kenan/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /home/kenan/.local/lib/kenan-ResearchCo-intake/intake.py
+TimeoutStartSec=0
+# Independent of both applications: stopping Beta must not stop its source importer.
+KillMode=control-group

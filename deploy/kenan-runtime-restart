@@ -1,0 +1,26 @@
+#!/bin/bash
+# Independent system-manager transaction: never bound to the caller's tool scope.
+set -euo pipefail
+channel=${1:?Usage: kenan-runtime-restart beta|production [--replace]}
+[[ $channel == beta || $channel == production ]] || exit 2
+replace=false
+if (( $# == 2 )) && [[ $2 == --replace ]]; then replace=true; elif (( $# != 1 )); then exit 2; fi
+if (( EUID != 0 )); then exec sudo -n /usr/local/sbin/kenan-runtime-restart "$@"; fi
+# A config the installed server can't load would leave the channel crash-looping, so the running server stays up
+# instead (Beta, 2026-11-02: a hand edit gave a person a platform without a channel mode). Media settings the extensions
+# can't read are refused too (Acme, 2026-11-02: a leftover meeting setting switched meeting voice off).
+config=/etc/kenan/$channel.json
+if ! problem=$(cd /tmp && /usr/local/bin/node --input-type=module -e 'const { checkChannelConfig } = await import(process.argv[1]); checkChannelConfig(process.argv[2]);' "/srv/kenan/$channel/dist/server/config-check.js" "$config" 2>&1); then
+ echo "restart_refused_config_invalid: $config can't be loaded, so kenan@$channel keeps running; fix it and restart again:" >&2
+ grep -m1 -E '^Error' <<<"$problem" >&2 || printf '%s\n' "$problem" | tail -3 >&2
+ exit 3
+fi
+# Normal code/config changes never terminate the process or its running Pi sessions.
+if ! $replace && /usr/bin/systemctl is-active --quiet "kenan@$channel.service"; then
+ status=0
+ /usr/local/bin/node /usr/local/lib/kenan/runtime-reload.mjs "$channel" || status=$?
+ if (( status == 0 )); then exit 0; fi
+ if (( status != 75 )); then exit "$status"; fi
+ # One installation from a build without live upgrades needs the original stop/start.
+fi
+exec /usr/bin/systemd-run --quiet --wait --collect --unit="kenan-runtime-restart-${channel}-$(date +%s%N)" --property=Type=oneshot --property=TimeoutStartSec=240s --property="ExecStopPost=/usr/bin/systemctl start kenan@${channel}.service" /usr/bin/systemctl restart "kenan@${channel}.service"

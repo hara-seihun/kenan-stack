@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop background jobs of archived or stopped Kenan workers
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/kenan/kenan-bg-native/reap.py
+TimeoutStartSec=120
+CPUWeight=10

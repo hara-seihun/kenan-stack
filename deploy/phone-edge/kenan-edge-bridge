@@ -1,0 +1,24 @@
+#!/bin/bash
+# On the phone edge: start, stop or query one call's bridge unit for assistant-host (server/extensions/phone-host.ts).
+# start reads the call's spec on stdin and keeps it in /run (RAM) for the bridge, which deletes it once read.
+set -euo pipefail
+usage='usage: kenan-edge-bridge start beta|production CALL_ID < spec.json | stop CALL_ID | state CALL_ID'
+id_ok() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "invalid call id: $1" >&2; exit 2; }; }
+case ${1-} in
+ start)
+  channel=${2-}; id=${3-}
+  [[ $channel == beta || $channel == production ]] || { echo "$usage" >&2; exit 2; }
+  id_ok "$id"
+  bridge=/opt/kenan-edge/$channel/dist/server/extensions/phone-bridge.js
+  [[ -f $bridge ]] || { echo "no $channel release on the edge: $bridge" >&2; exit 3; }
+  install -d -m 700 /run/kenan-edge
+  spec=/run/kenan-edge/$id.json
+  (umask 077; cat > "$spec")
+  [[ -s $spec ]] || { rm -f "$spec"; echo 'empty spec' >&2; exit 2; }
+  if ! systemd-run --expand-environment=no --collect --quiet --property=KillMode=mixed --property=TimeoutStopSec=15 --unit "kenan-call-$id" /usr/local/bin/node "$bridge" "$spec"; then
+   rm -f "$spec"; exit 4
+  fi;;
+ stop) id_ok "${2-}"; systemctl stop "kenan-call-$2";;
+ state) id_ok "${2-}"; systemctl is-active "kenan-call-$2" || true;;
+ *) echo "$usage" >&2; exit 2;;
+esac

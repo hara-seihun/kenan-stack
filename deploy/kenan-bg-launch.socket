@@ -1,0 +1,12 @@
+# One warm root launcher accepts Unix connections and reads SO_PEERCRED itself.
+[Unit]
+Description=kenan-bg launch socket
+
+[Socket]
+ListenStream=/run/kenan-bg-launch.sock
+Accept=no
+SocketMode=0666
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
